@@ -45,8 +45,34 @@ ebur128 = "0.1.10"
 crossbeam-channel = "0.5.16"
 symphonia = { version = "0.6.1", features = ["aac", "alac", "isomp4", "mp3", "aiff", "caf"] }
 
+# Model provisioning (overview.md 3.5). `stream` is the feature that makes the download
+# resumable: without it `reqwest` only yields a whole body, and materializing a whole
+# 200 MB body is precisely what this download must never do.
+reqwest = { version = "0.13.4", default-features = false, features = [
+  "rustls",
+  "http2",
+  "system-proxy",
+  "stream",
+] }
+sha2 = "0.11.0"
+futures-util = { version = "0.3.31", default-features = false, features = ["std"] }
+# Tauri already depends on tokio; naming it here is about features, not about the version.
+# `fs` for the async file handle the download writes through, `io-util` for `write_all`,
+# `time` for the progress throttle, `rt`/`sync` so the download can be driven from a test
+# without an `AppHandle`.
+tokio = { version = "1.49.0", features = ["fs", "io-util", "rt", "sync", "time"] }
+
+# Inference (overview.md 3.4). **Pinned exactly** -- cross-cutting rule 7. `ort` is a
+# release candidate whose API moves between rcs, which is why `model/session.rs` is the
+# only file in the crate permitted to name an `ort` type: an upgrade has one blast radius.
+ort = { version = "=2.0.0-rc.13", features = ["coreml"] }
+
 [dev-dependencies]
 tempfile = "3.27.0"
+# `macros` for `#[tokio::test]`, which the download tests need in order to drive an async
+# `ensure` to completion. The HTTP server they run against is `std::net` on a plain thread
+# -- see `model::download`'s tests for why it is hand-rolled.
+tokio = { version = "1.49.0", features = ["fs", "io-util", "macros", "rt", "sync", "time"] }
 
 [profile.release]
 codegen-units = 1

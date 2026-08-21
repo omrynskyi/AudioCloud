@@ -15,7 +15,7 @@ pub mod protocol;
 
 use tauri::Manager;
 
-use crate::db::Database;
+use crate::{db::Database, model::Model};
 
 /// Dimensionality of a CLAP audio-tower embedding (`overview.md` §3.4).
 ///
@@ -36,6 +36,9 @@ fn dev_commands() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         commands::dev::dev_add_root,
         commands::dev::dev_list_roots,
         commands::dev::dev_scan,
+        commands::dev::dev_model_status,
+        commands::dev::dev_download_model,
+        commands::dev::dev_session_info,
     ]
 }
 
@@ -69,6 +72,13 @@ pub fn run() {
             let data_dir = app.path().app_data_dir()?;
             let db = Database::open(&data_dir, EMBEDDING_DIM)?;
             app.manage(db);
+
+            // Path joins and an empty cell. The model is not read, the network is not
+            // touched, and no `ort` session is built -- `overview.md` §7 budgets cold start
+            // to interactive at under two seconds *excluding* ML session init, which is
+            // only honest if init genuinely happens somewhere else. See
+            // `model::session::LazySession`.
+            app.manage(Model::new(&data_dir));
             Ok(())
         })
         .build(tauri::generate_context!())

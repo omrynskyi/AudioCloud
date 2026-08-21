@@ -9,6 +9,8 @@
 
 #![allow(dead_code, clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+pub mod fixtures;
+
 use std::{f32::consts::TAU, io::Write, path::Path};
 
 /// Sample formats the fixture writer can emit, so tests can cover more than one decode path.

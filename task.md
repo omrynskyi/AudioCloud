@@ -117,34 +117,91 @@ throughput **≥ 400 samples/s**; peak RSS during scan stays flat as the file co
 *Goal: a verified CLAP ONNX model on disk and a warm `ort` session — with proof the mel
 front-end matches the graph.*
 
-- [ ] Write `scripts/export_clap_onnx.py` — **one-time, offline, developer-only.** Loads
+- [x] Write `scripts/export_clap_onnx.py` — **one-time, offline, developer-only.** Loads
       LAION CLAP, exports the **audio tower only** (the text tower is dead weight), fixed
       or dynamic batch axis, opset pinned. Document exact package versions used.
+      > Written, with versions pinned in its docstring and a `--recipes-only` mode that
+        needs neither torch nor the checkpoint. Batch is dynamic; the mel and frame axes
+        are fixed, so a graph that would accept the wrong front-end cannot load at all.
 - [ ] Run the export once. Record the SHA-256. Publish the `.onnx` as a release asset.
       Do not commit a 200 MB binary to git.
+      > **Open, and it is the phase's blocker.** Needs a machine with `torch` and
+        `laion-clap`. Until it is run, `ModelRelease::CURRENT.sha256` is the `UNPINNED`
+        sentinel and `Downloader::ensure` refuses to open a socket — fail-closed, so there
+        is no state in which 200 MB arrives unverifiable.
 - [ ] **Record reference outputs**: run 20 diverse fixture wavs through Python CLAP and
       commit the resulting embeddings as a test fixture. This is the parity oracle.
-- [ ] Add `reqwest` (0.13, streaming), `sha2` (0.11), `ort` (**pinned exactly**
+      > Half done. The 20 fixtures exist as committed *recipes* rather than 19 MB of wavs
+        (`src-tauri/tests/fixtures/clap/fixtures.json`), generated identically in Python
+        and Rust, each carrying a waveform probe so a drift between the two generators
+        reports itself rather than arriving disguised as a parity failure. The embeddings
+        wait on the export above.
+- [x] Add `reqwest` (0.13, streaming), `sha2` (0.11), `ort` (**pinned exactly**
       `2.0.0-rc.13`)
-- [ ] `model/download.rs`: resumable streaming download with `Range`, incremental SHA-256
+- [x] `model/download.rs`: resumable streaming download with `Range`, incremental SHA-256
       over the stream, atomic rename from `.partial` only after verification, `fsync`
       before rename
-- [ ] Distinct handling for: no network / hash mismatch / disk full / interrupted-resumable
-- [ ] `model/session.rs`: session init with CoreML EP, **verified** CPU fallback; log which
+      > Plus a `fsync` of the *directory* after the rename: without it the rename is
+        metadata that a power loss can lose even though the data was durable. Resume
+        re-hashes the existing partial from disk, since a `Sha256` state cannot cross a
+        process restart.
+- [x] Distinct handling for: no network / hash mismatch / disk full / interrupted-resumable
+      > Six variants, not four: `Http` (a 404 means the asset moved and no retry fixes it),
+        `Cancelled`, and `ReleaseNotPinned` also have distinct recoveries. `is_resumable()`
+        is what the first-run screen will branch on. A hash mismatch **deletes** the
+        partial — resuming into bytes that are already wrong would wedge the app in a loop.
+- [x] `model/session.rs`: session init with CoreML EP, **verified** CPU fallback; log which
       EP actually bound; warmup run on a zero tensor to pay first-inference cost off the
       user's critical path
-- [ ] Lazy init — session construction must not be on the cold-start path
+      > The warmup *is* the verification: a session is not returned until a real `run()` has
+        succeeded on it, so CoreML registering and then rejecting the graph on first
+        inference falls back at init instead of halfway into a 50,000-file scan.
+        `AUDIOBANK_FORCE_CPU=1` forces the CPU path without a rebuild.
+- [x] Lazy init — session construction must not be on the cold-start path
       (`overview.md` §7)
+      > `LazySession`, `.manage()`d during setup; construction is two path joins and an
+        empty cell, asserted by a test. A failed attempt is deliberately not cached: init
+        fails for reasons that get fixed while the app is running.
 - [ ] **Parity gate:** the mel front-end from Phase 2 feeding this session must reproduce
       the committed reference embeddings at **cosine similarity > 0.999**. Commit this as
       a regression test, not a one-time check.
-- [ ] Isolate every `ort` type behind `model/session.rs` so an rc upgrade touches one file
+      > The test is committed (`src-tauri/tests/parity.rs`) and skips with a printed reason
+        until the oracle exists. `the_parity_gate_is_not_silently_disabled` fails the build
+        if the release is ever pinned without a committed oracle, so the skip cannot become
+        permanent by accident.
+      > The front-end itself was not Phase 2's — `features.rs` left the filterbank to this
+        phase — and is now `pipeline/mel.rs`. Pending the real oracle it is cross-checked
+        against an independent NumPy implementation of `librosa.filters.mel` and the whole
+        STFT chain: the filterbank agrees to 5e-8, and the log-mel to 2e-5 dB for every bin
+        within 40 dB of the peak. That is not the gate, and it is not nothing.
+- [x] Isolate every `ort` type behind `model/session.rs` so an rc upgrade touches one file
 
 **Exit criteria:** model downloads, verifies, survives a kill -9 mid-download and resumes;
 session initializes on both CoreML and forced-CPU; **the parity test passes at > 0.999**.
 
 > If parity fails, stop. Do not proceed to Phase 4. Every embedding produced by a
 > mismatched front-end is silently wrong and the map will look completely plausible.
+
+**Status: not met.** Resume-after-interruption is tested against a server that truncates
+mid-body, and the resumed request asks for the exact byte offset — but against a synthetic
+release, not the real asset, and the parity test has nothing to compare against. The gate
+is blocked on the export, and nothing downstream should start until it is green.
+
+**Two findings from this phase that change later ones:**
+
+1. **`ort` sessions cannot run concurrently.** `overview.md` §3.4 prescribes `Arc<Session>`
+   across `rayon` workers on the grounds that ONNX Runtime is thread-safe for concurrent
+   `run()`. It is not; `ort` 2.0.0-rc.13 takes `&mut self` precisely because earlier
+   versions that allowed it "often saw crashes and memory corruption". The session is still
+   built once and shared as an `Arc`, with inference serialized behind a `Mutex` — which is
+   affordable only because §3.4 also prescribes batching. **Phase 4's batch-size tuning is
+   now load-bearing rather than an optimization**, and if the throughput target is missed
+   the fix is one session per worker thread, not concurrent `run()`.
+2. **ONNX Runtime links statically.** `otool -L` on the built binary shows
+   `CoreML.framework` and no `libonnxruntime`. **Phase 11's §8.1 problem is smaller than
+   written**: both approaches it proposes are about merging two ONNX Runtime *dylibs*, and
+   there is no dylib to merge. The `lipo -info` sweep over the bundle stays; there is simply
+   less in it.
 
 ---
 

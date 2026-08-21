@@ -6,11 +6,19 @@ A spatial browser for large sample libraries. Samples are embedded with CLAP, pr
 - [`overview.md`](overview.md) — the architecture.
 - [`task.md`](task.md) — the implementation roadmap, phase by phase.
 
-**Status: Phase 2 complete.** An empty window builds and launches, and behind it the ingest
-pipeline is real: point it at a folder of audio and it walks, hashes, deduplicates, decodes,
-analyzes, and writes rows with DSP features. No ML is involved yet — the CLAP model and the
-embeddings it produces are Phases 3 and 4, and until then `samples.status` stops at
-`decoded`.
+**Status: Phase 3 implemented, its gate not yet passed.** An empty window builds and
+launches, and behind it the ingest pipeline is real: point it at a folder of audio and it
+walks, hashes, deduplicates, decodes, analyzes, and writes rows with DSP features. Phase 3
+adds the model side — the CLAP mel front-end, a resumable and SHA-256-verified downloader,
+and a lazily-built `ort` session with a CoreML-then-CPU fallback that is proved by a warmup
+run rather than assumed.
+
+What is **not** done is the one thing Phase 3 is actually for. Exporting the ONNX file and
+recording the reference embeddings requires running LAION-CLAP under PyTorch, which is a
+one-time offline step on a machine with that toolchain; it has not been run, so
+`ModelRelease::CURRENT` carries the `UNPINNED` sentinel, no `.onnx` exists to download, and
+the parity gate skips. See [Phase 3 status](#phase-3-status) for exactly what remains and
+what stops it from being forgotten.
 
 Measured numbers live in [`BENCHMARKS.md`](BENCHMARKS.md).
 
@@ -69,12 +77,68 @@ await invoke('dev_scan'); // walks, decodes, analyzes, and returns counts
 many were deduplicated, and the totals in the database afterwards. Run it twice: the second
 run should report everything skipped and finish in a fraction of the time.
 
+### Model provisioning
+
+Three more debug-only commands cover Phase 3. They do nothing useful until the model has
+been exported and pinned (see [Phase 3 status](#phase-3-status)), and `dev_model_status`
+will say so.
+
+```js
+await invoke('dev_model_status'); // installed / downloadable / unpinned, and partial bytes
+await invoke('dev_download_model'); // resumable, verified, atomic install
+await invoke('dev_session_info'); // forces the lazy session; reports the bound provider
+```
+
+`AUDIOBANK_FORCE_CPU=1` skips CoreML, which is how the "verified CPU fallback" half of the
+Phase 3 exit criteria gets exercised without a machine that lacks a Neural Engine.
+
 Benchmarks are `#[ignore]`d, so they compile on every `cargo test` and run only on request:
 
 ```sh
 cargo test --manifest-path src-tauri/Cargo.toml --profile perf --test benchmarks \
     -- --ignored --nocapture --test-threads=1
 ```
+
+## Phase 3 status
+
+The Rust side is complete and tested; the offline export is not. The split matters because
+`task.md` Phase 3 says that if parity fails, stop — and "parity was never checked" must not
+be able to masquerade as "parity passed".
+
+**Done and under test.** The mel front-end
+([`mel.rs`](src-tauri/src/pipeline/mel.rs)) is a transcription of what LAION-CLAP does to a
+waveform before its first convolution: 1024/480 framing shared with the Phase 2 DSP pass,
+`center=true` reflect padding to 1001 frames, a power spectrogram, a Slaney-scale
+Slaney-normalized 64-band filterbank from 50 Hz to 14 kHz, and `10·log10` with no `top_db`
+clamp. Cross-checked against an independent NumPy implementation of `librosa.filters.mel`
+and of the whole STFT chain: the filterbank agrees to 5·10⁻⁸, and the log-mel agrees to
+2·10⁻⁵ dB for every bin within 40 dB of the peak. (The remaining ~0.16 dB differences are
+all at −97 dB, where they are f32 FFT noise against an f64 reference.)
+
+The downloader and the session are covered by real tests, including a kill-mid-transfer that
+resumes from the exact byte offset, a server that ignores `Range` and forces a clean
+restart, a hash mismatch that installs nothing and discards the poisoned partial, and a
+cancel that keeps what it had.
+
+**Not done.** Running `scripts/export_clap_onnx.py` — a one-time, offline, developer-only
+step needing `torch` and `laion-clap` — to produce the `.onnx`, publish it as a release
+asset, pin its SHA-256 in `ModelRelease::CURRENT`, and commit the twenty reference
+embeddings that are the parity oracle. Until then the gate in
+[`parity.rs`](src-tauri/tests/parity.rs) skips with a printed reason.
+
+**What stops that from being forgotten.** Three interlocks, all of which run on every
+`cargo test`:
+
+1. `ModelRelease::CURRENT.sha256` is the `UNPINNED` sentinel, and `Downloader::ensure`
+   refuses to open a socket without a real digest. There is no way to download 200 MB that
+   cannot be verified.
+2. `the_parity_gate_is_not_silently_disabled` fails the build if the release is pinned and
+   the oracle is not committed. Publishing a model without recording what it produces is
+   unreachable by accident.
+3. `the_two_fixture_generators_agree` runs today. The twenty fixtures are recipes, generated
+   in both Python and Rust rather than committed as 19 MB of wavs, and each carries a
+   waveform probe — so a drift between the two generators reports itself instead of arriving
+   later disguised as a parity failure.
 
 ## Builds
 
@@ -100,8 +164,9 @@ CI runs all of these plus both target builds on every push.
 
 ## Layout
 
-The tree follows `overview.md` §9. [`src-tauri/src/db/`](src-tauri/src/db/) and
-[`src-tauri/src/pipeline/`](src-tauri/src/pipeline/) are implemented; every other
+The tree follows `overview.md` §9. [`src-tauri/src/db/`](src-tauri/src/db/),
+[`src-tauri/src/pipeline/`](src-tauri/src/pipeline/) and
+[`src-tauri/src/model/`](src-tauri/src/model/) are implemented; every other
 `src-tauri/` module still holds only a `//!` doc comment stating its responsibility and the
 phase that fills it in — the skeleton is there so that later phases add code to a named place
 rather than inventing structure under deadline.
@@ -118,6 +183,11 @@ down**. The walk thread owns the only `DiscoveredFile` sender, so finishing the 
 decode stage, which drops the only `Analyzed` sender, which ends the persist stage. There is
 no separate shutdown protocol, and adding one would give the pipeline a second way to
 terminate that the first way does not know about.
+
+`model/session.rs` is the **only** file in the crate permitted to name an `ort` type
+(cross-cutting rule 7). `ort` is pinned to an exact release candidate whose API moves
+between rcs; keeping it behind one file means an upgrade has one blast radius. What leaves
+that module is `f32`, a `Provider`, and a `SessionError`.
 
 ## Notes on deviations from the roadmap
 
@@ -156,5 +226,30 @@ terminate that the first way does not know about.
   root and no mode, and reporting a coin-flip major/minor for it would put half a library's
   bass hits on the wrong side of Phase 9's key filter. The schema makes the two columns
   separately nullable, which is what makes this expressible.
+- **`ort` sessions are not concurrently runnable**, against `overview.md` §3.4, which
+  prescribes an `Arc<Session>` shared across `rayon` workers on the grounds that ONNX
+  Runtime is thread-safe for concurrent `run()`. It is not, and `ort` 2.0.0-rc.13 says so
+  in as many words: `Session::run` takes `&mut self` because earlier versions that allowed
+  concurrent inference "often saw crashes and memory corruption". So the session is still
+  built once and shared as an `Arc` — the expensive thing still happens exactly once — but
+  inference is serialized behind a `Mutex`. §3.4's other prescription is what makes this
+  cheap: the embed stage batches 16–32 spectrograms per `run()`, so the parallelism lives in
+  decode and mel, and the serialized region is one large matmul per batch. Phase 4's
+  throughput number decides whether that holds; if it does not, the fix is one session per
+  worker thread, not concurrent `run()`.
+- **ONNX Runtime links statically**, which is worth knowing before Phase 11. `ort`'s
+  `download-binaries` produces a static library, not a dylib: `otool -L` on the built binary
+  shows `CoreML.framework` and no `libonnxruntime`. `overview.md` §8.1's universal-binary
+  problem is stated in terms of merging two ONNX Runtime _dylibs_, and there is no dylib to
+  merge — which removes the second half of both approaches it proposes. The `lipo`
+  verification stays; there is simply less to verify.
+- **The graph takes log-mel, not a waveform**, so `overview.md` §3.3's shared STFT actually
+  saves a transform. The cost is that the front-end becomes AudioBank's responsibility
+  rather than the checkpoint's, which is what the parity gate exists to police. The tensor
+  layout is read off the graph at session init rather than assumed: §3.4 writes the input as
+  `[B, 1, 64, T]` and HTSAT's own layout is `[B, 1, T, 64]`, and rather than pick a winner on
+  paper, `model::session::layout_of` accepts either and transposes if needed — while
+  rejecting any graph with a dynamic mel or frame axis, because a graph that will accept the
+  wrong number of mel bins will accept the wrong number of mel bins.
 - **`rust-version` moved from 1.77 to 1.88**, which is what `ignore` 0.4.33, `rubato` 5.0 and
   `rayon` 1.12 — the versions `task.md` Phase 2 pins — require. CI builds on stable.

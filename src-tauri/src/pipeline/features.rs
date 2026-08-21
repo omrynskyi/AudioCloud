@@ -274,9 +274,29 @@ impl Analyzer {
 
     /// The power spectrum of the most recently transformed frame.
     ///
-    /// Exposed for Phase 3's mel filterbank, which is a weighted sum over exactly these
-    /// bins and has no business recomputing the transform.
+    /// Exposed for the mel filterbank, which is a weighted sum over exactly these bins and
+    /// has no business recomputing the transform.
     pub fn power(&self) -> &[f32] {
+        &self.power
+    }
+
+    /// Windows and transforms one [`FRAME_SIZE`] frame, returning its power spectrum.
+    ///
+    /// The mel front-end ([`super::mel`]) frames the signal differently -- it centers, so
+    /// its first frame starts half a window before the signal does -- but the window, the
+    /// transform and the hop are identical, so it drives this rather than planning a second
+    /// 1024-point FFT to compute the same numbers.
+    ///
+    /// `samples` must be exactly [`FRAME_SIZE`] long. A short slice would leave the tail of
+    /// the windowed frame holding the previous call's audio rather than failing, so the
+    /// contract is checked in debug builds and the front-end pads to guarantee it.
+    pub fn transform_frame(&mut self, samples: &[f32]) -> &[f32] {
+        debug_assert_eq!(
+            samples.len(),
+            FRAME_SIZE,
+            "transform_frame wants a whole frame"
+        );
+        self.transform(samples);
         &self.power
     }
 

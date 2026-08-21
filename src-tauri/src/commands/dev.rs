@@ -20,6 +20,7 @@ use tauri::State;
 
 use crate::{
     db::{queries, Database, SampleStatus},
+    model::{Model, ModelStatus},
     pipeline::{scan_all_roots, CancellationToken, ScanReport},
 };
 
@@ -97,5 +98,71 @@ pub async fn dev_scan(db: State<'_, Database>) -> Result<DevScanSummary, String>
         &reports,
         &db,
         started.elapsed().as_millis(),
+    ))
+}
+
+/// What the app knows about the model without touching the network or the graph.
+#[derive(Debug, Serialize)]
+pub struct DevModelStatus {
+    pub version: String,
+    pub status: String,
+    pub installed_path: String,
+    pub partial_bytes: Option<u64>,
+    pub session_initialized: bool,
+}
+
+/// Reports model provisioning state. Cheap enough to call on every keystroke.
+#[tauri::command]
+pub fn dev_model_status(model: State<'_, Model>) -> DevModelStatus {
+    DevModelStatus {
+        version: model.release().version.to_string(),
+        status: match model.status() {
+            ModelStatus::Installed => "installed",
+            ModelStatus::Downloadable => "downloadable",
+            ModelStatus::Unpinned => "unpinned",
+        }
+        .to_string(),
+        installed_path: model.paths().installed().display().to_string(),
+        partial_bytes: std::fs::metadata(model.paths().partial())
+            .ok()
+            .map(|m| m.len()),
+        session_initialized: model.session().is_initialized(),
+    }
+}
+
+/// Downloads and verifies the model, logging progress rather than streaming it.
+///
+/// Phase 6 replaces the `tracing` calls with a throttled `Channel<DownloadProgress>`; the
+/// throttle itself already lives in `model::download` and does not move.
+#[tauri::command]
+pub async fn dev_download_model(
+    db: State<'_, Database>,
+    model: State<'_, Model>,
+) -> Result<String, String> {
+    let downloader = model.downloader(db.data_dir()).map_err(|e| e.to_string())?;
+    let path = downloader
+        .ensure(&CancellationToken::new(), |p| {
+            tracing::info!(
+                downloaded = p.downloaded,
+                total = p.total,
+                "model download progress"
+            );
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(path.display().to_string())
+}
+
+/// Forces the lazy session to build and reports which execution provider it bound.
+///
+/// Blocking (session construction is hundreds of milliseconds plus a warmup), hence
+/// `async`: cross-cutting rule 1.
+#[tauri::command]
+pub async fn dev_session_info(model: State<'_, Model>) -> Result<String, String> {
+    let session = model.session().get().map_err(|e| e.to_string())?;
+    Ok(format!(
+        "provider={} embedding_dim={}",
+        session.provider().as_str(),
+        session.embedding_dim()
     ))
 }

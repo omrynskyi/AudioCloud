@@ -17,6 +17,7 @@
 pub mod decode;
 pub mod embed;
 pub mod features;
+pub mod mel;
 pub mod progress;
 pub mod walk;
 
