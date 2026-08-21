@@ -23,6 +23,16 @@ src-tauri/gen/
 /appdata
 /Application Support
 
+# Data layer artifacts (Phase 1). The real ones live in
+# ~/Library/Application Support/<bundle-id>/; these patterns exist so a copy pulled into
+# the tree for debugging cannot be committed by accident. Every byte of them is derived
+# from the user's own files.
+*.db
+*.db-wal
+*.db-shm
+embeddings.bin
+embeddings.bin.compacting
+
 # macOS
 .DS_Store
 
