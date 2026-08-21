@@ -7,6 +7,8 @@
 //!
 //! Extended through Phases 5-9.
 
+use std::collections::HashMap;
+
 use rusqlite::Connection;
 
 use super::{DbError, EmbeddingLoc, SampleFeatures, SampleStatus};
@@ -97,8 +99,80 @@ pub fn sample_stamp(
     Ok(found)
 }
 
+/// Every `(rel_path -> stamp)` under one root, for the discovery fast-skip.
+///
+/// One query instead of one per file. With four pooled read connections and a walker thread
+/// per core, per-entry lookups spend most of a scan queued on `r2d2`; this takes the pool
+/// out of the walk entirely. At 50,000 rows the map costs a few megabytes and is dropped
+/// when the scan ends.
+pub fn sample_stamps_for_root(
+    conn: &Connection,
+    root_id: i64,
+) -> Result<HashMap<String, SampleStamp>, DbError> {
+    let mut stmt = conn.prepare(
+        "SELECT rel_path, id, mtime, size_bytes, status FROM samples WHERE root_id = ?1",
+    )?;
+    let rows = stmt.query_map([root_id], |r| {
+        let rel_path: String = r.get(0)?;
+        let status: String = r.get(4)?;
+        Ok((
+            rel_path,
+            SampleStamp {
+                id: r.get(1)?,
+                mtime: r.get(2)?,
+                size_bytes: r.get(3)?,
+                status: SampleStatus::parse(&status).unwrap_or(SampleStatus::Pending),
+            },
+        ))
+    })?;
+    rows.collect::<rusqlite::Result<HashMap<_, _>>>()
+        .map_err(DbError::from)
+}
+
+/// What a previously processed sample determined about its own audio.
+///
+/// A matching content hash means byte-identical audio, so these values are exactly what
+/// decoding the duplicate would produce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodedMetadata {
+    pub duration_ms: Option<i64>,
+    pub sample_rate: Option<i64>,
+    pub channels: Option<i64>,
+}
+
+/// Finds an already-decoded sample with the same content, so a duplicate file can copy its
+/// analysis instead of paying for a decode again (`overview.md` §3.1).
+///
+/// Restricted to rows that actually reached the decoder: a `pending` row has nothing to
+/// copy, and a `decode_failed` one has nothing worth copying -- the duplicate must fail on
+/// its own terms so its `error` column says what went wrong with *it*.
+pub fn processed_sample_by_hash(
+    conn: &Connection,
+    content_hash: &[u8],
+) -> Result<Option<(i64, DecodedMetadata)>, DbError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, duration_ms, sample_rate, channels FROM samples
+         WHERE content_hash = ?1 AND status IN ('decoded', 'embedded')
+         LIMIT 1",
+    )?;
+    let found = stmt
+        .query_row([content_hash], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                DecodedMetadata {
+                    duration_ms: r.get(1)?,
+                    sample_rate: r.get(2)?,
+                    channels: r.get(3)?,
+                },
+            ))
+        })
+        .map(Some)
+        .or_else(no_rows_is_none)?;
+    Ok(found)
+}
+
 /// Finds an already-embedded sample with the same content, so a duplicate file can borrow
-/// its vector instead of paying for inference again (Phase 2 dedup).
+/// its vector instead of paying for inference again (Phase 4 dedup).
 pub fn embedded_sample_by_hash(
     conn: &Connection,
     content_hash: &[u8],

@@ -24,6 +24,26 @@ use crate::db::Database;
 /// two agree.
 pub const EMBEDDING_DIM: usize = 512;
 
+/// The command surface.
+///
+/// Empty in release: Phase 2's only commands are the development scan triggers in
+/// [`commands::dev`], and the real surface (`overview.md` §6.1) is Phase 6. Shipping a
+/// release build with no commands is correct for a phase whose frontend is still an empty
+/// window.
+#[cfg(debug_assertions)]
+fn dev_commands() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static {
+    tauri::generate_handler![
+        commands::dev::dev_add_root,
+        commands::dev::dev_list_roots,
+        commands::dev::dev_scan,
+    ]
+}
+
+#[cfg(not(debug_assertions))]
+fn dev_commands() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static {
+    tauri::generate_handler![]
+}
+
 /// Builds and runs the desktop application.
 ///
 /// # Panics
@@ -43,6 +63,7 @@ pub fn run() {
     #[allow(clippy::expect_used)]
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .invoke_handler(dev_commands())
         .setup(|app| {
             // ~/Library/Application Support/<bundle-id>/, created on first run.
             let data_dir = app.path().app_data_dir()?;

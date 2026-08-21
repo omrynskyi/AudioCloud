@@ -111,6 +111,18 @@ impl SampleStatus {
         }
     }
 
+    /// Whether this row has been through the decode and feature stages.
+    ///
+    /// The discovery fast-skip consults this: an unchanged file whose row is still
+    /// `pending` was never actually read -- the last scan died before reaching it -- so
+    /// "unchanged" says nothing useful and the file has to be processed. `DecodeFailed` and
+    /// `Missing` count as processed, because retrying a corrupt file on every scan is a
+    /// cost with no upside; a user who fixes the file changes its mtime, which is what
+    /// brings it back.
+    pub fn is_processed(self) -> bool {
+        !matches!(self, SampleStatus::Pending)
+    }
+
     pub fn parse(s: &str) -> Option<Self> {
         Some(match s {
             "pending" => SampleStatus::Pending,

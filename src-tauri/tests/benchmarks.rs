@@ -1,4 +1,4 @@
-//! Phase 1 benchmarks (`task.md`, cross-cutting rule 9).
+//! Phase 1 and 2 benchmarks (`task.md`, cross-cutting rule 9).
 //!
 //! These are `#[ignore]`d because they are only meaningful in an optimized build, and because
 //! a 50,000-row insert has no business running on every `cargo test`. CI compiles them --
@@ -18,11 +18,15 @@
 
 use std::time::Instant;
 
+mod support;
+
 use audiobank_lib::{
     db::{queries, Database, EmbeddingStore, NewSample, SampleFeatures, SampleStatus},
+    pipeline::{features::Analyzer, scan_root, CancellationToken},
     EMBEDDING_DIM,
 };
 use half::f16;
+use support::{noise, sine, write_wav, WavFormat};
 
 /// The corpus size every §7 target is stated against.
 const CORPUS: usize = 50_000;
@@ -269,5 +273,265 @@ fn append_and_mmap_50k_embeddings() {
         "mapping and sampling {SPARSE_ROWS} rows cost {:.1} MiB of RSS; this path is \
          supposed to page in only what it touches",
         mib(rss_sparse.saturating_sub(rss_before))
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// Phase 2 -- discovery and decode
+// ---------------------------------------------------------------------------------------
+
+/// Files in the synthetic library. Two orders of magnitude below the 5,000-file target in
+/// `task.md`, because these are *generated* -- writing 5,000 WAVs to a temp directory
+/// measures the temp directory. The throughput figure is per-file and scales; the recorded
+/// number against a real library lives in `BENCHMARKS.md`.
+const LIBRARY_FILES: usize = 400;
+
+/// Builds a synthetic sample library on disk: mixed formats, mixed sample rates, mixed
+/// lengths, and a realistic proportion of exact duplicates.
+///
+/// Duplicates matter to the measurement, not just to the dedup test. A real library is
+/// perhaps 10% redundant, and a throughput number taken on 400 unique files overstates what
+/// the pipeline does on 400 real ones.
+fn write_library(root: &std::path::Path) -> (usize, usize) {
+    let mut unique = 0usize;
+    let mut duplicates = 0usize;
+
+    for i in 0..LIBRARY_FILES {
+        let name = format!("bank{:02}/HIT_{i:04}_Distorted-{:02}.wav", i % 16, i % 97);
+        let path = root.join(&name);
+
+        // Every tenth file is a byte-exact copy of the one before it.
+        if i % 10 == 9 {
+            let previous = root.join(format!(
+                "bank{:02}/HIT_{:04}_Distorted-{:02}.wav",
+                (i - 1) % 16,
+                i - 1,
+                (i - 1) % 97
+            ));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::copy(&previous, &path).unwrap();
+            duplicates += 1;
+            continue;
+        }
+
+        // A spread of source rates, so the resampler is on the measured path for most files
+        // exactly as it is in a real library.
+        let (format, rate) = match i % 4 {
+            0 => (WavFormat::Pcm16, 44_100u32),
+            1 => (WavFormat::Pcm16, 48_000),
+            2 => (WavFormat::Float32, 44_100),
+            _ => (WavFormat::Pcm16, 96_000),
+        };
+
+        // Lengths a drum library actually has: mostly short one-shots, some loops, a few
+        // long enough to exercise the 10 s decode cap.
+        let seconds = match i % 20 {
+            0 => 12.0,
+            1..=3 => 4.0,
+            _ => 0.8,
+        };
+
+        // The frequency is a function of `i` alone, so no two generated files are
+        // byte-identical by accident. An earlier version derived it from `i % 40`, which
+        // silently made 60% of the corpus duplicates and turned a decode benchmark into a
+        // measurement of the dedup table.
+        let audio = if i % 3 == 0 {
+            noise(i as u64 + 1, (rate as f32 * seconds) as usize)
+        } else {
+            sine(80.0 + i as f32 * 2.7, 0.7, seconds, rate)
+        };
+
+        write_wav(&path, format, rate, 1, &audio);
+        unique += 1;
+    }
+
+    (unique, duplicates)
+}
+
+/// Exit criteria: decode+DSP throughput >= 400 samples/s, a rescan of an unchanged folder
+/// completes in < 5% of the original time, and peak RSS stays flat.
+#[test]
+#[ignore = "benchmark; run under --profile perf"]
+fn scan_a_synthetic_library() {
+    let data = tempfile::tempdir().unwrap();
+    let library = tempfile::tempdir().unwrap();
+
+    let (unique, duplicates) = write_library(library.path());
+    let bytes: u64 = walk_size(library.path());
+
+    let db = Database::open(data.path(), EMBEDDING_DIM).unwrap();
+    let root = db
+        .writer()
+        .add_root(library.path().to_str().unwrap(), None)
+        .unwrap();
+
+    let rss_before = rss_bytes();
+    let started = Instant::now();
+    let cold_report = scan_root(&db, root, &CancellationToken::new()).unwrap();
+    let cold = started.elapsed();
+    let rss_after_cold = rss_bytes();
+
+    let started = Instant::now();
+    let warm_report = scan_root(&db, root, &CancellationToken::new()).unwrap();
+    let warm = started.elapsed();
+    let rss_after_warm = rss_bytes();
+
+    // Files actually decoded, not files seen. The exit criterion is about decode+DSP
+    // throughput, and a deduplicated file passes through neither.
+    let throughput = cold_report.processed as f64 / cold.as_secs_f64();
+    let ratio = warm.as_secs_f64() / cold.as_secs_f64();
+
+    println!("\n-- scan {LIBRARY_FILES} files ({unique} unique, {duplicates} duplicates) --");
+    println!("  on disk        {:>8.1} MiB", mib(bytes));
+    println!("  cold scan      {:>8.0} ms", cold.as_secs_f64() * 1000.0);
+    println!(
+        "  decoded        {:>8}  ({throughput:.0} samples/s)",
+        cold_report.processed
+    );
+    println!("  deduplicated   {:>8}", cold_report.deduped);
+    println!(
+        "  rescan         {:>8.0} ms  ({:.1}% of cold)",
+        warm.as_secs_f64() * 1000.0,
+        ratio * 100.0
+    );
+    println!("  skipped        {:>8}", warm_report.counts.files_skipped);
+    println!(
+        "  RSS after cold {:>8.1} MiB",
+        mib(rss_after_cold.saturating_sub(rss_before))
+    );
+    println!(
+        "  RSS after warm {:>8.1} MiB",
+        mib(rss_after_warm.saturating_sub(rss_before))
+    );
+
+    let conn = db.read().unwrap();
+    assert_eq!(queries::count_samples(&conn).unwrap(), LIBRARY_FILES as i64);
+    assert_eq!(cold_report.counts.files_failed, 0);
+    // The generator's duplicates are the only duplicates: a throughput figure inflated by
+    // files the decoder never touched is not a throughput figure.
+    assert_eq!(cold_report.deduped as usize, duplicates);
+    assert_eq!(cold_report.processed as usize, unique);
+    assert_eq!(warm_report.counts.files_skipped, LIBRARY_FILES as i64);
+
+    assert!(
+        throughput >= 400.0,
+        "decode+DSP throughput was {throughput:.0} files/s, target >= 400"
+    );
+    assert!(
+        ratio < 0.05,
+        "rescan took {:.1}% of the cold scan, target < 5%",
+        ratio * 100.0
+    );
+}
+
+/// The DSP stage on its own, so a regression can be attributed to it rather than to decode.
+///
+/// One 10 s buffer is 1000 frames of 1024-point FFT for the descriptors plus 116 frames of
+/// 8192-point FFT for chroma. `overview.md` §3.3 shares the first transform across the
+/// descriptors precisely so this number stays small next to decode.
+#[test]
+#[ignore = "benchmark; run under --profile perf"]
+fn analyze_a_full_window() {
+    const ITERATIONS: usize = 200;
+
+    let samples = sine(440.0, 0.7, 10.0, 48_000);
+    let mut analyzer = Analyzer::new();
+
+    // One pass to pay the FFT planning and first-touch costs off the measurement.
+    analyzer.analyze(&samples);
+
+    let started = Instant::now();
+    for _ in 0..ITERATIONS {
+        std::hint::black_box(analyzer.analyze(std::hint::black_box(&samples)));
+    }
+    let elapsed = started.elapsed();
+
+    let per_call = elapsed.as_secs_f64() * 1000.0 / ITERATIONS as f64;
+    println!("\n-- analyze one 10 s window --");
+    println!("  per window     {per_call:>8.2} ms");
+    println!(
+        "  throughput     {:>8.0} windows/s",
+        ITERATIONS as f64 / elapsed.as_secs_f64()
+    );
+}
+
+/// Recursive size of a directory tree.
+fn walk_size(root: &std::path::Path) -> u64 {
+    let mut total = 0;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+            let meta = entry.metadata().unwrap();
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else {
+                total += meta.len();
+            }
+        }
+    }
+    total
+}
+
+/// Exit criterion: peak RSS during a scan stays flat as the file count grows.
+///
+/// The falsifiable form of "backpressure is the memory strategy" (`overview.md` §3). Scan a
+/// library, then scan one four times the size in a fresh database, and compare the resident
+/// memory each cost. Bounded queues times bounded payloads is a constant, so the second
+/// number must not be four times the first -- if it is, some stage is accumulating instead
+/// of streaming, and that is a bug that only shows up on a library nobody tested against.
+#[test]
+#[ignore = "benchmark; run under --profile perf"]
+fn scan_memory_is_flat_as_the_library_grows() {
+    fn scan_n(files: usize) -> u64 {
+        let data = tempfile::tempdir().unwrap();
+        let library = tempfile::tempdir().unwrap();
+
+        for i in 0..files {
+            write_wav(
+                &library
+                    .path()
+                    .join(format!("bank{:02}/hit_{i:05}.wav", i % 32)),
+                WavFormat::Pcm16,
+                48_000,
+                1,
+                &sine(80.0 + i as f32 * 1.3, 0.7, 1.0, 48_000),
+            );
+        }
+
+        let db = Database::open(data.path(), EMBEDDING_DIM).unwrap();
+        let root = db
+            .writer()
+            .add_root(library.path().to_str().unwrap(), None)
+            .unwrap();
+
+        let before = rss_bytes();
+        let report = scan_root(&db, root, &CancellationToken::new()).unwrap();
+        let after = rss_bytes();
+
+        assert_eq!(report.processed as usize, files);
+        after.saturating_sub(before)
+    }
+
+    // Small first, so the allocator's high-water mark from the large scan cannot be what the
+    // small one is measured against.
+    let small = scan_n(250);
+    let large = scan_n(1000);
+
+    println!("\n-- scan memory against library size --");
+    println!("  250 files      {:>8.1} MiB", mib(small));
+    println!("  1000 files     {:>8.1} MiB", mib(large));
+    println!(
+        "  growth         {:>8.2}x for 4x the files",
+        large as f64 / small.max(1) as f64
+    );
+
+    // Generous, deliberately. What is being falsified is linear growth -- a stage that
+    // accumulates would show 4x here. Page-cache and allocator noise between two runs in one
+    // process is worth a good deal more slack than the margin to 2x.
+    assert!(
+        large < small.max(1024 * 1024) * 2,
+        "scanning 4x the files cost {:.1} MiB against {:.1} MiB: memory is tracking file count",
+        mib(large),
+        mib(small)
     );
 }

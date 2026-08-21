@@ -4,4 +4,7 @@
 //! Business logic in a `#[tauri::command]` function is logic that cannot be unit-tested
 //! without an `AppHandle`.
 //!
-//! Populated in Phase 6.
+//! The real command surface is Phase 6. What is here now is [`dev`], the temporary trigger
+//! Phase 2 needs to point the pipeline at a folder.
+
+pub mod dev;

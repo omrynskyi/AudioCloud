@@ -22,23 +22,23 @@ exact versions and commit `Cargo.lock`.
 
 *Goal: an empty window that builds and launches on both architectures.*
 
-- [ ] Install Rust stable; add both targets:
+- [x] Install Rust stable; add both targets:
       `rustup target add aarch64-apple-darwin x86_64-apple-darwin`
-- [ ] Install Xcode Command Line Tools; verify `lipo`, `codesign`, `xcrun notarytool`
-- [ ] Install Node LTS (build-time only — see `overview.md` §1); pin in `.nvmrc`
-- [ ] Install the Tauri v2 CLI (`cargo install tauri-cli --version "^2"`)
-- [ ] Scaffold: `cargo create-tauri-app` → React + TypeScript + Vite
-- [ ] Add Tailwind, configure `content` globs for `src/**/*.{ts,tsx}`
-- [ ] Add `three`, `@react-three/fiber`, `@react-three/drei`, `zustand`
-- [ ] Establish `src-tauri/` module skeleton per `overview.md` §9 — empty modules with
+- [x] Install Xcode Command Line Tools; verify `lipo`, `codesign`, `xcrun notarytool`
+- [x] Install Node LTS (build-time only — see `overview.md` §1); pin in `.nvmrc`
+- [x] Install the Tauri v2 CLI (`cargo install tauri-cli --version "^2"`)
+- [x] Scaffold: `cargo create-tauri-app` → React + TypeScript + Vite
+- [x] Add Tailwind, configure `content` globs for `src/**/*.{ts,tsx}`
+- [x] Add `three`, `@react-three/fiber`, `@react-three/drei`, `zustand`
+- [x] Establish `src-tauri/` module skeleton per `overview.md` §9 — empty modules with
       `//!` doc comments stating each one's responsibility
-- [ ] `.gitignore`: `target/`, `node_modules/`, `dist/`, `*.onnx`, `*.dmg`,
+- [x] `.gitignore`: `target/`, `node_modules/`, `dist/`, `*.onnx`, `*.dmg`,
       `src-tauri/gen/`, and the local app-data dir if it is ever symlinked in
-- [ ] `rustfmt.toml`, `clippy.toml`; ESLint + Prettier for the frontend
-- [ ] `cargo tauri dev` launches a window
-- [ ] `cargo tauri build --target aarch64-apple-darwin` and
+- [x] `rustfmt.toml`, `clippy.toml`; ESLint + Prettier for the frontend
+- [x] `cargo tauri dev` launches a window
+- [x] `cargo tauri build --target aarch64-apple-darwin` and
       `--target x86_64-apple-darwin` both succeed (unsigned is fine here)
-- [ ] CI skeleton: fmt, clippy, `cargo test`, `tsc --noEmit`, both target builds
+- [x] CI skeleton: fmt, clippy, `cargo test`, `tsc --noEmit`, both target builds
 
 **Exit criteria:** an empty window renders via `cargo tauri dev`; both single-arch release
 builds succeed in CI; `cargo clippy -- -D warnings` is clean.
@@ -52,24 +52,24 @@ builds succeed in CI; `cargo clippy -- -D warnings` is clean.
 Building this first is deliberate. A pipeline written before its sink grows an ad-hoc
 in-memory store that has to be torn out later.
 
-- [ ] Add `rusqlite` (0.40, `bundled` feature), `r2d2`, `r2d2_sqlite` (0.35),
+- [x] Add `rusqlite` (0.40, `bundled` feature), `r2d2`, `r2d2_sqlite` (0.35),
       `refinery` (0.9)
-- [ ] Resolve and create the app data dir (`~/Library/Application Support/<bundle-id>/`);
+- [x] Resolve and create the app data dir (`~/Library/Application Support/<bundle-id>/`);
       create on first run with correct permissions
-- [ ] Write `V1__initial.sql` — the full DDL from `overview.md` §4.1, including the FTS5
+- [x] Write `V1__initial.sql` — the full DDL from `overview.md` §4.1, including the FTS5
       virtual table and the partial unique index on `projection_runs(is_active)`
-- [ ] Wire `refinery` to run migrations at startup, before any other connection opens
-- [ ] Pragma application (`overview.md` §4.3) via an `r2d2` connection customizer, so
+- [x] Wire `refinery` to run migrations at startup, before any other connection opens
+- [x] Pragma application (`overview.md` §4.3) via an `r2d2` connection customizer, so
       **every** pooled connection gets `foreign_keys = ON` — it is per-connection
-- [ ] Implement the single writer thread: `mpsc` command enum, oneshot replies, batched
+- [x] Implement the single writer thread: `mpsc` command enum, oneshot replies, batched
       transactions flushing at 1000 rows **or** 250 ms, whichever first
-- [ ] Implement the read pool (4 read-only connections)
-- [ ] Implement `db/embeddings.rs`: append-only `embeddings.bin`, f16 storage via `half`,
+- [x] Implement the read pool (4 read-only connections)
+- [x] Implement `db/embeddings.rs`: append-only `embeddings.bin`, f16 storage via `half`,
       `(offset, len)` return, `memmap2` whole-matrix read, `compact()` maintenance path
-- [ ] Unit tests: migration idempotency, FK enforcement actually rejects an orphan,
+- [x] Unit tests: migration idempotency, FK enforcement actually rejects an orphan,
       writer batching commits on both the count and the timeout trigger
-- [ ] Benchmark: insert 50,000 synthetic sample rows + features
-- [ ] Benchmark: append 50,000 × 512 f16 embeddings, mmap them back, verify round-trip
+- [x] Benchmark: insert 50,000 synthetic sample rows + features
+- [x] Benchmark: append 50,000 × 512 f16 embeddings, mmap them back, verify round-trip
       values and that resident memory does not grow by 51 MB on read
 
 **Exit criteria:** 50,000 synthetic rows insert in **< 2 s**; the embedding file
@@ -82,26 +82,28 @@ effect the second time.
 
 *Goal: point the app at a real sample folder and get real rows, with no ML involved.*
 
-- [ ] Add `ignore` (0.4), `blake3` (1.8), `symphonia` (0.6, all relevant codec features),
+- [x] Add `ignore` (0.4), `blake3` (1.8), `symphonia` (0.6, all relevant codec features),
       `rubato` (5.0), `rayon` (1.12), `realfft` (3.5), `ebur128` (0.1)
-- [ ] `pipeline/walk.rs`: `ignore::WalkBuilder::build_parallel()`, extension allowlist,
+- [x] `pipeline/walk.rs`: `ignore::WalkBuilder::build_parallel()`, extension allowlist,
       symlink-loop guard, size sanity bounds
       > Note: **not `jwalk`** — deprecated upstream ("Use `dua-core` instead").
         See `overview.md` §3.1.
-- [ ] `(path, mtime, size)` fast-skip against existing rows before any hashing
-- [ ] `blake3` content hashing, with head+tail+length sampling for files > 64 MB
-- [ ] Dedup: link a matching `content_hash` to the existing embedding rather than
+- [x] `(path, mtime, size)` fast-skip against existing rows before any hashing
+- [x] `blake3` content hashing, with head+tail+length sampling for files > 64 MB
+- [x] Dedup: link a matching `content_hash` to the existing embedding rather than
       re-processing
-- [ ] `pipeline/decode.rs`: `symphonia` probe + streaming decode, **hard stop at 10 s of
+- [x] `pipeline/decode.rs`: `symphonia` probe + streaming decode, **hard stop at 10 s of
       48 kHz output**, mono downmix during decode, `rubato` resample
-- [ ] Buffer pool for decode output — no per-sample allocation of the 1.92 MB buffer
-- [ ] `pipeline/features.rs`: `realfft` frames, plus peak / RMS / LUFS / centroid /
+- [x] Buffer pool for decode output — no per-sample allocation of the 1.92 MB buffer
+- [x] `pipeline/features.rs`: `realfft` frames, plus peak / RMS / LUFS / centroid /
       flatness / ZCR / onset density / BPM / key from the same pass
-- [ ] Decode-failure quarantine: `status = 'decode_failed'` + error string, scan continues
-- [ ] Wire the bounded channels between walk → decode → features → writer, with the queue
+- [x] Decode-failure quarantine: `status = 'decode_failed'` + error string, scan continues
+- [x] Wire the bounded channels between walk → decode → features → writer, with the queue
       depths from `overview.md` §3
-- [ ] Temporary dev-only command to trigger a scan and dump counts (real IPC is Phase 6)
+- [x] Temporary dev-only command to trigger a scan and dump counts (real IPC is Phase 6)
 - [ ] Benchmark on a real library of ≥ 5,000 files across mixed formats
+      > Open. The committed numbers in `BENCHMARKS.md` come from a 400-file **synthetic**
+        corpus of mixed formats and sample rates. Needs a run against a real library.
 
 **Exit criteria:** a real folder scans to the database with correct metadata and DSP
 features; corrupt and unsupported files are quarantined without aborting the scan; a
