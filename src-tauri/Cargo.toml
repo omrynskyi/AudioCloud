@@ -1,0 +1,42 @@
+[package]
+name = "audiobank"
+version = "0.1.0"
+description = "Spatial browser for large sample libraries"
+authors = ["AudioBank"]
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+# Tauri's mobile entry point requires a cdylib; the desktop binary links the rlib.
+name = "audiobank_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.6.3", features = [] }
+
+[dependencies]
+tauri = { version = "2.11.5", features = [] }
+tauri-plugin-opener = "2.5.4"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.20"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true
+
+[lints.rust]
+unsafe_code = "warn"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+# `cargo clippy -- -D warnings` is the gate; these raise what counts as a warning.
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"

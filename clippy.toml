@@ -1,0 +1,8 @@
+# Fail the lint pass on anything that can panic in a path we claim is recoverable.
+# See cross-cutting rule 8: errors are typed, not `.unwrap()`ed.
+avoid-breaking-exported-api = false
+too-many-arguments-threshold = 8
+
+# Every `.unwrap()`/`.expect()` outside tests should be a deliberate, argued exception.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true

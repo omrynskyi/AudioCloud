@@ -1,0 +1,37 @@
+# Rust
+target/
+src-tauri/target/
+
+# Node (build-time only -- see overview.md §1)
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# Tauri generated
+src-tauri/gen/
+
+# Models are release assets, never repo artifacts (Phase 3)
+*.onnx
+*.onnx.partial
+
+# Build products
+*.dmg
+*.app/
+
+# Local app data, if it is ever symlinked into the tree for debugging
+/appdata
+/Application Support
+
+# macOS
+.DS_Store
+
+# Editors
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp
+
+# Logs
+*.log
+npm-debug.log*

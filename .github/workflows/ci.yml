@@ -1,0 +1,116 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A superseded run has nothing useful to say.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  frontend:
+    name: Frontend (lint, format, types)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - run: npm ci
+
+      - name: Prettier
+        run: npm run format:check
+
+      - name: ESLint
+        run: npm run lint
+
+      - name: tsc --noEmit
+        run: npm run typecheck
+
+  rust:
+    name: Rust (fmt, clippy, test)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # tauri-build reads frontendDist at compile time, so `dist/` must exist before
+      # anything touches the Rust crate -- including `cargo fmt`'s workspace load.
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci && npm run build
+
+      - name: rustfmt
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+
+      - name: clippy
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test --manifest-path src-tauri/Cargo.toml --all-features
+
+  # Apple Silicon only, by decision. The Intel target below built clean as of Phase 0 --
+  # uncomment it to bring back universal-binary support (and with it Phase 11's `lipo`
+  # merge and the `ort` universal-binary problem, overview.md 8.1).
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-apple-darwin
+          # - x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: ${{ matrix.target }}
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - run: npm ci
+
+      # Unsigned is fine at this phase; signing and notarization are Phase 11.
+      - name: Build
+        run: npm run tauri -- build --target ${{ matrix.target }} --bundles app
+
+      # Phase 11 turns these two single-arch products into one universal binary.
+      # Recording the slice now means a regression there is visible as a diff.
+      - name: Verify slice
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          BIN="src-tauri/target/$TARGET/release/audiobank"
+          ARCH="${TARGET%%-*}"
+          lipo -info "$BIN"
+          lipo -info "$BIN" | grep -q "$ARCH"

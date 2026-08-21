@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main",
+  "description": "Minimum permission set for the main window. Phase 6 revisits this; the `fs` plugin is deliberately NOT granted -- all filesystem access goes through typed Rust commands (overview.md 2, Capabilities and the ACL).",
+  "windows": ["main"],
+  "permissions": ["core:default", "opener:default"]
+}

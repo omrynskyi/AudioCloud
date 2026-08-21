@@ -1,0 +1,32 @@
+@import 'tailwindcss';
+
+/* Tailwind v4 is CSS-first: there is no `content` array in a JS config any more.
+   `@source` is the direct equivalent and is what scopes the class scan to the
+   frontend sources. Paths are relative to this file. */
+@source '../**/*.{ts,tsx}';
+
+@theme {
+  --color-canvas: #08090b;
+  --color-panel: #111318;
+  --color-hairline: #23262e;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--color-canvas);
+  color: #e6e8ec;
+  font-family:
+    ui-sans-serif,
+    system-ui,
+    -apple-system,
+    'SF Pro Text',
+    'Helvetica Neue',
+    sans-serif;
+  overflow: hidden;
+}

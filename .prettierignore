@@ -1,0 +1,8 @@
+dist/
+node_modules/
+src/bindings/
+src-tauri/target/
+src-tauri/gen/
+package-lock.json
+*.md
+!README.md
