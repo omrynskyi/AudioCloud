@@ -175,6 +175,12 @@ front-end matches the graph.*
         STFT chain: the filterbank agrees to 5e-8, and the log-mel to 2e-5 dB for every bin
         within 40 dB of the peak. That is not the gate, and it is not nothing.
 - [x] Isolate every `ort` type behind `model/session.rs` so an rc upgrade touches one file
+- [x] *(added)* Synthetic ONNX fixtures so the session path is testable without the real
+      model — `scripts/make_session_fixtures.py`, `src-tauri/tests/session.rs`
+      > Three ~130 KB graphs with the real export's input signature: frames-major,
+        mels-major, and one with a dynamic mel axis that must be rejected. Proves session
+        init, CoreML binding, the warmup, layout detection and its transpose, batching, and
+        extraction — everything except parity, which needs the real model.
 
 **Exit criteria:** model downloads, verifies, survives a kill -9 mid-download and resumes;
 session initializes on both CoreML and forced-CPU; **the parity test passes at > 0.999**.
@@ -187,7 +193,7 @@ mid-body, and the resumed request asks for the exact byte offset — but against
 release, not the real asset, and the parity test has nothing to compare against. The gate
 is blocked on the export, and nothing downstream should start until it is green.
 
-**Two findings from this phase that change later ones:**
+**Three findings from this phase that change later ones:**
 
 1. **`ort` sessions cannot run concurrently.** `overview.md` §3.4 prescribes `Arc<Session>`
    across `rayon` workers on the grounds that ONNX Runtime is thread-safe for concurrent
@@ -197,7 +203,13 @@ is blocked on the export, and nothing downstream should start until it is green.
    affordable only because §3.4 also prescribes batching. **Phase 4's batch-size tuning is
    now load-bearing rather than an optimization**, and if the throughput target is missed
    the fix is one session per worker thread, not concurrent `run()`.
-2. **ONNX Runtime links statically.** `otool -L` on the built binary shows
+2. **CoreML does not compute in f32.** Against an f64 NumPy reference, the CoreML provider
+   differs by up to ~1.5e-5 per component where CPU differs by ~1e-7; CoreML and CPU differ
+   from each other by ~5e-5. That is fp16 accumulation on the ANE. It does not threaten the
+   parity gate's 0.999 cosine floor, but **Phase 5 must not assume a tolerance tighter than
+   this**, and a re-fit that runs on CoreML is not bit-reproducible against one that runs on
+   CPU.
+3. **ONNX Runtime links statically.** `otool -L` on the built binary shows
    `CoreML.framework` and no `libonnxruntime`. **Phase 11's §8.1 problem is smaller than
    written**: both approaches it proposes are about merging two ONNX Runtime *dylibs*, and
    there is no dylib to merge. The `lipo -info` sweep over the bundle stays; there is simply

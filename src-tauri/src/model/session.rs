@@ -157,12 +157,7 @@ impl ModelSession {
             return Err(SessionError::NotInstalled(path.to_path_buf()));
         }
 
-        // The environment is process-global and idempotent; `commit` on an already-committed
-        // environment is a no-op returning false, which is why the result is discarded.
-        let _ = ort::init()
-            .with_name("audiobank")
-            .with_telemetry(false)
-            .commit();
+        init_environment();
 
         if std::env::var_os(FORCE_CPU_ENV).is_some() {
             tracing::info!("{FORCE_CPU_ENV} is set; skipping CoreML");
@@ -183,6 +178,32 @@ impl ModelSession {
                     .map_err(|cpu| SessionError::NoProvider { coreml, cpu })
             }
         }
+    }
+
+    /// Builds a session on exactly one provider, with no fallback.
+    ///
+    /// What [`FORCE_CPU_ENV`] does, without the environment variable. Two callers:
+    /// `tests/session.rs`, which has to prove both halves of Phase 3's "initializes on both
+    /// CoreML and forced-CPU" separately rather than by mutating process-global state
+    /// underneath other tests; and the settings screen, where "re-open on CPU" is a real
+    /// recovery action for a machine whose CoreML stack is broken.
+    pub fn open_on(path: impl AsRef<Path>, provider: Provider) -> Result<Self, SessionError> {
+        let path = path.as_ref();
+        if !path.is_file() {
+            return Err(SessionError::NotInstalled(path.to_path_buf()));
+        }
+        init_environment();
+
+        Self::open_with(path, provider).map_err(|failure| match provider {
+            Provider::CoreMl => SessionError::NoProvider {
+                coreml: failure,
+                cpu: "not attempted: this provider was requested explicitly".into(),
+            },
+            Provider::Cpu => SessionError::NoProvider {
+                coreml: "not attempted: this provider was requested explicitly".into(),
+                cpu: failure,
+            },
+        })
     }
 
     /// Builds and **proves** a session on one provider.
@@ -328,6 +349,17 @@ impl ModelSession {
         }
         Ok(out)
     }
+}
+
+/// Brings up the `ort` environment, once per process.
+///
+/// Idempotent by construction: `commit` on an already-committed environment is a no-op
+/// that returns false, which is why the result is discarded rather than checked.
+fn init_environment() {
+    let _ = ort::init()
+        .with_name("audiobank")
+        .with_telemetry(false)
+        .commit();
 }
 
 /// Scales a vector to unit length, in place.

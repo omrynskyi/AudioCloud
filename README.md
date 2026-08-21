@@ -92,6 +92,11 @@ await invoke('dev_session_info'); // forces the lazy session; reports the bound 
 `AUDIOBANK_FORCE_CPU=1` skips CoreML, which is how the "verified CPU fallback" half of the
 Phase 3 exit criteria gets exercised without a machine that lacks a Neural Engine.
 
+Until the model is exported and pinned, `dev_model_status` reports `unpinned`,
+`dev_download_model` refuses (there is nothing safe to fetch), and `dev_session_info` reports
+no model. That is the correct behaviour for this state, not a bug — and it is what
+[`session.rs`](src-tauri/tests/session.rs) exercises with synthetic graphs instead.
+
 Benchmarks are `#[ignore]`d, so they compile on every `cargo test` and run only on request:
 
 ```sh
@@ -119,6 +124,21 @@ The downloader and the session are covered by real tests, including a kill-mid-t
 resumes from the exact byte offset, a server that ignores `Range` and forces a clean
 restart, a hash mismatch that installs nothing and discards the poisoned partial, and a
 cancel that keeps what it had.
+
+**Tested against a real ONNX Runtime.** `scripts/make_session_fixtures.py` generates three
+~130 KB graphs carrying the real export's input signature and output width, and
+[`session.rs`](src-tauri/tests/session.rs) runs `ort` against them: the session builds,
+CoreML binds, the warmup runs, batches match one-at-a-time runs, a graph with a dynamic mel
+axis is refused at init, and both providers initialize. They compute nonsense on purpose —
+parity is a separate job needing the real model — but every line of `model/session.rs` has
+now met the library it wraps.
+
+One measurement worth carrying forward: **CoreML does not compute this in f32.** Against an
+f64 NumPy reference the CoreML provider's components differ by up to ~1.5e-5 where the CPU
+provider differs by ~1e-7, and CoreML and CPU differ from each other by ~5e-5. That is fp16
+accumulation on the ANE doing what it is designed to do. It is nowhere near disturbing the
+parity gate's cosine floor of 0.999, but Phase 5 should not assume tighter than the numbers
+support.
 
 **Not done.** Running `scripts/export_clap_onnx.py` — a one-time, offline, developer-only
 step needing `torch` and `laion-clap` — to produce the `.onnx`, publish it as a release
