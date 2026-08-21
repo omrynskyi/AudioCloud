@@ -13,6 +13,17 @@ pub mod pipeline;
 pub mod projection;
 pub mod protocol;
 
+use tauri::Manager;
+
+use crate::db::Database;
+
+/// Dimensionality of a CLAP audio-tower embedding (`overview.md` §3.4).
+///
+/// Fixed here rather than discovered from the ONNX graph so the data layer can be built and
+/// benchmarked before the model exists (Phase 3). Phase 3's parity gate is what proves the
+/// two agree.
+pub const EMBEDDING_DIM: usize = 512;
+
 /// Builds and runs the desktop application.
 ///
 /// # Panics
@@ -30,8 +41,25 @@ pub fn run() {
     // there is nothing for a typed `AppError` to be recovered *by*. Every other failure in
     // this crate is a variant in `error.rs` -- see cross-cutting rule 8.
     #[allow(clippy::expect_used)]
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .run(tauri::generate_context!())
-        .expect("error while running AudioBank");
+        .setup(|app| {
+            // ~/Library/Application Support/<bundle-id>/, created on first run.
+            let data_dir = app.path().app_data_dir()?;
+            let db = Database::open(&data_dir, EMBEDDING_DIM)?;
+            app.manage(db);
+            Ok(())
+        })
+        .build(tauri::generate_context!())
+        .expect("error while starting AudioBank");
+
+    app.run(|app, event| {
+        // The writer holds up to 250 ms of uncommitted rows by design. Exiting without
+        // draining it throws away the tail of whatever scan was running.
+        if matches!(event, tauri::RunEvent::Exit) {
+            if let Some(db) = app.try_state::<Database>() {
+                db.shutdown();
+            }
+        }
+    });
 }

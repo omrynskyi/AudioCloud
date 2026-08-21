@@ -6,8 +6,12 @@ A spatial browser for large sample libraries. Samples are embedded with CLAP, pr
 - [`overview.md`](overview.md) — the architecture.
 - [`task.md`](task.md) — the implementation roadmap, phase by phase.
 
-**Status: Phase 0 complete.** An empty window builds and launches. Nothing below the shell
-is implemented yet.
+**Status: Phase 1 complete.** An empty window builds and launches, and behind it the data
+layer is real: migrated SQLite schema, one writer thread, a four-connection read pool, and
+the append-only embedding file. Nothing produces data for it yet — discovery and decode are
+Phase 2.
+
+Measured numbers live in [`BENCHMARKS.md`](BENCHMARKS.md).
 
 **Target: Apple Silicon only.** `x86_64-apple-darwin` built clean during Phase 0 but is not
 carried forward -- it is out of the CI matrix and out of Phase 11's distribution work, which
@@ -41,6 +45,18 @@ npm run lint             # eslint
 npm run format           # prettier
 ```
 
+The app data directory — the SQLite database, its WAL, and `embeddings.bin` — is
+`~/Library/Application Support/com.audiobank.app/`, created 0700 on first run. Deleting it
+is a supported reset: every row in it is derived from files on disk, apart from library
+roots, tags, and collections.
+
+Benchmarks are `#[ignore]`d, so they compile on every `cargo test` and run only on request:
+
+```sh
+cargo test --manifest-path src-tauri/Cargo.toml --profile perf --test benchmarks \
+    -- --ignored --nocapture --test-threads=1
+```
+
 ## Builds
 
 ```sh
@@ -65,10 +81,17 @@ CI runs all of these plus both target builds on every push.
 
 ## Layout
 
-The tree follows `overview.md` §9. Every `src-tauri/` module currently holds only a `//!`
-doc comment stating its responsibility and the phase that fills it in — the skeleton is
-there so that later phases add code to a named place rather than inventing structure under
-deadline.
+The tree follows `overview.md` §9. [`src-tauri/src/db/`](src-tauri/src/db/) is implemented;
+every other `src-tauri/` module still holds only a `//!` doc comment stating its
+responsibility and the phase that fills it in — the skeleton is there so that later phases
+add code to a named place rather than inventing structure under deadline.
+
+Two invariants in `db/` are worth knowing before touching it. The pool hands out
+`SQLITE_OPEN_READ_ONLY` connections and the single write connection is moved into the writer
+thread at construction, so "one writer" (cross-cutting rule 2) is enforced by SQLite and by
+ownership rather than by review. And the writer defers each caller's reply until after the
+commit that makes the write visible — answering earlier turns "the write returned" into a
+race against a pooled reader.
 
 ## Notes on deviations from the roadmap
 
@@ -77,5 +100,15 @@ deadline.
   [`src/styles/index.css`](src/styles/index.css) as `@source "../**/*.{ts,tsx}"`.
 - **TypeScript is pinned to 5.9**, not 7.x. `typescript-eslint` declares
   `typescript <6.1.0`; TS 7 would mean dropping type-aware linting.
+- **`rusqlite` is 0.39, not 0.40**, and `r2d2_sqlite` 0.34, not 0.35. `refinery-core`
+  0.9.2 declares `rusqlite >=0.23, <=0.39`; pairing it with 0.40 resolves two copies of
+  `libsqlite3-sys`, both of which set `links = "sqlite3"`, and the link fails. 0.39 is the
+  newest coherent set. Revisit when `refinery` widens the bound.
+- **The FTS5 tokenizer drops `tokenchars '_-'`** from the DDL in `overview.md` §4.1. That
+  option makes `_` and `-` token characters rather than separators, so
+  `KICK_808_Distorted-02.wav` indexes as one token and searching `808` — the example the
+  document itself gives — matches nothing. With the default separators both forms work: the
+  fragment as a bareword, the compound as a quoted phrase. See the note in
+  [`V1__initial.sql`](src-tauri/migrations/V1__initial.sql).
 - **The project was scaffolded by hand** rather than with `cargo create-tauri-app`, which
   requires an empty directory and would not have produced the §9 layout anyway.
