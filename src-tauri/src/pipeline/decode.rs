@@ -141,7 +141,9 @@ impl Deref for PooledBuffer {
 static EMPTY: Vec<f32> = Vec::new();
 
 impl PooledBuffer {
-    fn as_mut(&mut self) -> &mut Vec<f32> {
+    /// The buffer, writable. How a stage fills a pooled buffer -- the decoder writes its
+    /// window through this, and the mel stage writes its spectrogram through it.
+    pub fn buffer_mut(&mut self) -> &mut Vec<f32> {
         self.buf.get_or_insert_with(Vec::new)
     }
 }
@@ -351,11 +353,11 @@ impl Decoder {
 
         let mut samples = self.pool.take();
         if source_rate == TARGET_SAMPLE_RATE {
-            samples.as_mut().extend_from_slice(&self.mono);
+            samples.buffer_mut().extend_from_slice(&self.mono);
         } else {
             self.resample_into(source_rate, &mut samples)?;
         }
-        samples.as_mut().truncate(MAX_OUTPUT_SAMPLES);
+        samples.buffer_mut().truncate(MAX_OUTPUT_SAMPLES);
 
         Ok(Decoded {
             samples,
@@ -401,7 +403,7 @@ impl Decoder {
         let input_len = self.mono.len();
         let needed = resampler.process_all_needed_output_len(input_len);
 
-        let buf = out.as_mut();
+        let buf = out.buffer_mut();
         buf.clear();
         buf.resize(needed, 0.0);
 

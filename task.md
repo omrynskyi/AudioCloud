@@ -221,27 +221,92 @@ is blocked on the export, and nothing downstream should start until it is green.
 
 *Goal: 50,000 samples embedded end-to-end, with a recorded throughput number.*
 
-- [ ] `pipeline/embed.rs`: batching accumulator (start at 16, tune) with a flush timeout so
+- [x] `pipeline/embed.rs`: batching accumulator (start at 16, tune) with a flush timeout so
       the tail of a scan does not stall on an unfillable batch
-- [ ] `Arc<Session>` shared across `rayon` workers — one session, never one per thread
-- [ ] L2-normalize outputs immediately on receipt
-- [ ] Wire the full five-stage pipeline: walk → decode → mel → embed → persist
-- [ ] `pipeline/progress.rs`: atomic counters per stage + a single 100 ms ticker
+      > The accumulator talks to an `Embed` trait, not to `ort`. That keeps cross-cutting
+        rule 7's blast radius at one file and makes the batcher's own behaviour testable
+        against a counting fake — including the property a real session makes nearly
+        unobservable, that row 3's vector reaches row 3 and not row 5.
+- [x] `Arc<Session>` shared across `rayon` workers — one session, never one per thread
+      > One session, one embed thread. A second thread would only queue on the same mutex;
+        see Phase 3's finding 1. The parallelism is upstream, in decode and mel.
+- [x] L2-normalize outputs immediately on receipt
+- [x] Wire the full five-stage pipeline: walk → decode → mel → embed → persist
+      > Four threads and the `rayon` pool, three queues rather than four: **decode and mel
+        share a stage**, so what crosses the next channel is the 256 KB spectrogram and not
+        the 1.92 MB window. `overview.md` §3 draws them apart and then says decode output
+        should be "handed over as mel frames wherever possible"; this is that, and it is why
+        peak RSS for a 400-file scan is 17.5 MiB rather than a queue depth times 1.92 MB.
+- [x] `pipeline/progress.rs`: atomic counters per stage + a single 100 ms ticker
       (`overview.md` §6.5). **No per-file events.**
-- [ ] `CancellationToken` threaded through every stage; verify a cancel mid-scan unwinds
+      > The ticker drops snapshots that are identical to the last one, so an idle stage costs
+        the sink nothing, and it guarantees a terminal snapshot on drop — a UI cannot be left
+        at 99%. Phase 6's `Channel` is a sink like any other; nothing on the producer side
+        changes when it arrives.
+- [x] `CancellationToken` threaded through every stage; verify a cancel mid-scan unwinds
       cleanly, keeps partial results, and marks the `scan_runs` row `cancelled`
-- [ ] Resume: a re-run skips rows already `embedded`
-- [ ] Tune batch size and queue depths against the throughput target
+      > An in-flight `run()` is not interruptible — ONNX Runtime offers no such thing — so a
+        cancelled scan finishes the batch it is holding and stops. Bounded by the batch size,
+        which is the difference between cancellable and killable.
+- [x] Resume: a re-run skips rows already `embedded`
+      > This needed a change in the *walk* stage, not the embed stage:
+        `SampleStatus::is_processed` counted `decoded` as finished, so a resumed scan would
+        have fast-skipped exactly the rows that still owed a vector. It is now
+        `is_complete(embedding_required)`, and a scan with no session — the state before the
+        200 MB download finishes — is a first-class configuration rather than a failure.
+- [x] Tune batch size and queue depths against the throughput target
+      > Swept 1 → 64 and **the sweep cannot decide it**, because what batching amortizes is
+        nearly free for a 130 KB fixture graph. The default stays at 16. What the sweep did
+        find is that the front-end, not inference, was the pipeline: applying the mel bank
+        densely spent 32.9M f64 multiply-adds per file summing zeros, and restricting it to
+        each filter's nonzero span is a 7.5× end-to-end gain that is **bit-identical** on the
+        parity surface. See `BENCHMARKS.md`.
 - [ ] **Risk 5 evaluation (`overview.md` §10):** run a real one-shot drum library, not the
       demo corpus, and inspect nearest neighbors by hand. Do kicks retrieve kicks?
+      > **Open, and blocked on the same export as Phase 3.** The instrument is built and
+        committed: `dev_neighbors` ranks every stored vector against one sample by exact
+        cosine over the mmap, brute force on purpose so that an index's recall does not sit
+        between the question and the answer. Point the app at a drum library, scan, and ask
+        it for a kick. There is nothing to inspect until the vectors mean something.
 - [ ] If neighborhoods are poor: implement the duration-weighted CLAP + normalized-DSP
       blend before projection, behind a setting
+      > Deliberately not built. It is conditional on an evaluation that cannot run, and a
+        blend tuned against embeddings from a graph that computes nonsense would be a
+        weighting chosen by coin flip. The DSP descriptors it needs are already in
+        `sample_features` from Phase 2, which is the part that had to be done early.
 - [ ] Soak test: full 50k scan, memory profiled throughout
+      > Partially. `embed_memory_is_flat_as_the_library_grows` is the falsifiable half — 4×
+        the files at 2.5× of 1.3 MiB, which is noise around a constant — and it runs the
+        stage whose queue is *supposed* to be full. A 50k soak against a graph that is not
+        the model would measure the harness; it is Phase 10's Instruments pass, with the real
+        model, that closes this.
 
 **Exit criteria:** 50,000 samples embedded end-to-end with throughput **≥ 60 samples/s**
 recorded in the repo; peak RSS **< 800 MB**; cancellation is clean and resume works; a
 hand-inspected neighbor check on real percussive samples is documented with a
 keep-or-blend decision.
+
+**Status: structurally complete, not met.** Every stage, every counter, every dedup and
+resume path is built and tested end to end against a real ONNX Runtime — `tests/embed.rs` is
+eleven integration tests over the five-stage pipeline, and the peak-RSS and cancellation
+criteria are met. The throughput criterion and the Risk 5 decision are **blocked on Phase 3's
+export**, and deliberately not faked: the number in `BENCHMARKS.md` is labelled as the
+pipeline around a near-free model, which is an upper bound and not the claim the exit
+criterion asks for.
+
+**Two findings from this phase that change later ones:**
+
+1. **A vector can be shared by more than one row, and Phase 10 should know it.** A duplicate
+   file stores a *reference* to its twin's bytes rather than a second copy, so two rows can
+   carry the same `emb_offset`. Nothing downstream is harmed — each row still gets its own
+   coordinates — but `EmbeddingStore::compact` copies per sample, so compaction *un-shares*
+   them and a compacted file can be larger than the one it replaced. On a library that is
+   40% duplicates that is not a rounding error.
+2. **`upsert_samples` now clears `emb_offset`/`emb_len`.** A row only reaches that statement
+   because its file changed, so the vector those offsets point at describes audio the file no
+   longer contains. Left in place it survives as a stale-but-plausible embedding that every
+   duplicate of the *new* content would inherit. Phase 5's re-fit reads `all_embedding_locs`
+   and must keep assuming that a row with offsets is a row whose offsets are current.
 
 ---
 

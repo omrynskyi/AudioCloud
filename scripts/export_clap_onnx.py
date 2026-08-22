@@ -38,19 +38,38 @@ These are the versions the export was developed against. Pin them; `laion_clap` 
 into `transformers` and `torchlibrosa` internals and does not tolerate drift, and the whole
 value of this script is that its output is reproducible.
 
-    python==3.10.14
+    python==3.10.20
     torch==2.4.1
     torchaudio==2.4.1
+    torchvision==0.19.1
     torchlibrosa==0.1.0
     librosa==0.10.2.post1
     laion-clap==1.1.6
     transformers==4.30.2
-    numpy==1.26.4
+    numpy==1.23.5
     onnx==1.16.2
     onnxruntime==1.19.2
 
-    pip install torch==2.4.1 torchaudio==2.4.1 laion-clap==1.1.6 transformers==4.30.2 \\
-                numpy==1.26.4 onnx==1.16.2 onnxruntime==1.19.2
+Two of those are traps, and both were found by installing this list from scratch:
+
+* **numpy is 1.23.5, not 1.26.x.** `laion-clap` 1.1.6 hard-pins `numpy==1.23.5`. `pip`
+  resolves the conflict by installing one and overwriting it with the other, which is how an
+  earlier version of this docstring came to claim 1.26.4 -- a version this environment cannot
+  actually hold. A strict resolver refuses outright.
+* **torchvision is required and undeclared.** `laion_clap.clap_module.utils` imports
+  `torchvision.ops.misc`, but nothing in the dependency tree asks for it, so a clean install
+  succeeds and then fails at `import laion_clap`. 0.19.1 is the release paired with torch
+  2.4.1.
+
+Python 3.10 is not negotiable either: `transformers` 4.30.2 does not build on 3.12+.
+
+    # `uv` will fetch the interpreter itself; no system Python 3.10 needed.
+    uv python install 3.10
+    uv venv --python 3.10 .venv-export
+    VIRTUAL_ENV=.venv-export uv pip install \\
+        torch==2.4.1 torchaudio==2.4.1 torchvision==0.19.1 laion-clap==1.1.6 \\
+        transformers==4.30.2 numpy==1.23.5 librosa==0.10.2.post1 \\
+        onnx==1.16.2 onnxruntime==1.19.2
 
 Usage
 -----

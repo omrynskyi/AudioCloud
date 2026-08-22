@@ -508,6 +508,14 @@ fn upsert_samples(conn: &Connection, rows: &[NewSample]) -> Result<Vec<i64>, DbE
     )?;
     // COALESCE on the optional columns: a `None` from this stage means "not determined
     // yet", not "known to be absent", and must not erase what an earlier stage learned.
+    //
+    // `emb_offset` and `emb_len` are the exception, and they are cleared rather than
+    // coalesced. A row only reaches this statement because the file behind it changed --
+    // an unchanged one is fast-skipped in the walker and never re-upserted -- so whatever
+    // vector those offsets point at describes audio this file no longer contains. Left in
+    // place they would survive as a stale-but-plausible embedding, and
+    // `queries::embedded_sample_by_hash` would hand it to every duplicate of the *new*
+    // content. The fresh vector lands moments later in the same batch.
     let mut update = conn.prepare_cached(
         "UPDATE samples SET
              filename     = ?2,
@@ -519,6 +527,8 @@ fn upsert_samples(conn: &Connection, rows: &[NewSample]) -> Result<Vec<i64>, DbE
              sample_rate  = COALESCE(?8, sample_rate),
              channels     = COALESCE(?9, channels),
              status       = ?10,
+             emb_offset   = NULL,
+             emb_len      = NULL,
              error        = NULL,
              updated_at   = ?11
          WHERE id = ?1",

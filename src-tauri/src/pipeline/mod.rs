@@ -1,20 +1,35 @@
 //! Ingest pipeline: stage wiring, bounded channels, and cancellation (`overview.md` §3).
 //!
-//! Five stages -- walk, decode, mel/features, embed, persist -- connected by bounded
-//! channels whose depths are chosen so that backpressure, not memory growth, is what
-//! happens when a stage falls behind. A [`CancellationToken`] threads through every stage;
-//! cross-cutting rule 6 says every long operation is cancellable and reports progress on
-//! the same throttle.
+//! Five stages -- walk, decode, mel, embed, persist -- connected by bounded channels whose
+//! depths are chosen so that backpressure, not memory growth, is what happens when a stage
+//! falls behind. A [`CancellationToken`] threads through every stage; cross-cutting rule 6
+//! says every long operation is cancellable and reports progress on the same throttle.
 //!
-//! **Phase 2 wires three of the five.** Walk feeds a decode-and-analyze stage which feeds
-//! the writer; there is no mel or embed stage yet, so the two queues between them
-//! (`overview.md` §3's 256 and 64) do not exist and the decode stage hands its 1.92 MB
-//! buffer straight back to the pool instead of passing it on. That is why the queue between
-//! process and persist can be 1024 deep here: the payload crossing it is a metadata struct
-//! of a couple of hundred bytes, not audio. Phase 4 inserts the missing stages between
-//! them, and the depths in §3 apply from that point.
+//! **Decode and mel share a stage, and that is what keeps peak RSS down.** `overview.md`
+//! §3 draws them as separate stages with a 256-deep queue between them, and then
+//! immediately notes that a decoded window is 1.92 MB and that "decode output is actually
+//! handed over as mel frames wherever possible". This is that: one `rayon` worker decodes,
+//! analyzes and computes the spectrogram for a file, and what crosses the next channel is
+//! the 256 KB mel tensor rather than the 1.92 MB window. The 1.92 MB buffer goes straight
+//! back to its pool, so the number of them in existence is bounded by the number of cores
+//! rather than by a queue depth.
+//!
+//! What that leaves is three queues:
+//!
+//! - **walk -> process**, 4096 deep. A path and a few integers.
+//! - **process -> embed**, 64 deep ([`embed::EMBED_QUEUE_DEPTH`]). 256 KB each, 16 MB in
+//!   flight. This is the queue that is actually full during a scan, because inference is
+//!   the slowest stage, and it is therefore the one that bounds memory.
+//! - **embed -> persist**, 1024 deep. A metadata struct plus a 512-float vector.
+//!
+//! A scan with no inference session is a first-class configuration, not a degraded one:
+//! the model is a 200 MB download that may not have happened yet, and a library is worth
+//! indexing before it arrives. Such a scan leaves rows at `decoded`, and the *next* scan
+//! with a session picks them up -- see [`crate::db::SampleStatus::is_complete`], which is
+//! what stops the fast-skip from skipping exactly the files that still owe a vector.
 
 pub mod decode;
+pub mod dsp_embed;
 pub mod embed;
 pub mod features;
 pub mod mel;
@@ -33,12 +48,18 @@ use std::{
 use crossbeam_channel::{bounded, Receiver, Sender};
 use rayon::iter::{ParallelBridge, ParallelIterator};
 
-use crate::db::{
-    queries, Database, DbError, NewSample, SampleFeatures, SampleStatus, ScanCounts, ScanStatus,
+use crate::{
+    db::{
+        queries, Database, DbError, EmbeddingLoc, NewSample, SampleFeatures, SampleStatus,
+        ScanCounts, ScanStatus,
+    },
+    model::session::ModelSession,
+    pipeline::mel::Padding,
 };
 
-pub use decode::{BufferPool, Decoder};
-pub use progress::ScanProgress;
+pub use decode::{BufferPool, Decoder, PooledBuffer};
+pub use embed::{BatchConfig, Embed, EmbedError};
+pub use progress::{ProgressSnapshot, ScanPhase, ScanProgress, Ticker};
 pub use walk::{DiscoveredFile, Hasher};
 
 /// Depth of the walk -> process queue (`overview.md` §3).
@@ -49,7 +70,7 @@ pub use walk::{DiscoveredFile, Hasher};
 /// trickling along behind the decoders for the whole scan.
 pub const WALK_QUEUE_DEPTH: usize = 4096;
 
-/// Depth of the process -> persist queue (`overview.md` §3).
+/// Depth of the embed -> persist queue (`overview.md` §3).
 pub const PERSIST_QUEUE_DEPTH: usize = 1024;
 
 /// Rows the persist stage accumulates before handing them to the writer.
@@ -68,9 +89,11 @@ const TWIN_TABLE_CAPACITY: usize = 200_000;
 
 /// Everything the ingest pipeline can fail at as a whole.
 ///
-/// Note what is *not* here: a file that will not decode. That is a row with
-/// `status = 'decode_failed'`, not an error -- a scan that aborts on the first corrupt
-/// file is useless on a real library (`overview.md` §3.2).
+/// Note what is *not* here: a file that will not decode, and a batch that will not run.
+/// The first is a row with `status = 'decode_failed'` (`overview.md` §3.2); the second is a
+/// batch of rows left at `decoded` for the next scan to finish. A scan that aborts on the
+/// first corrupt file -- or on one transient CoreML hiccup 40,000 files in -- is useless on
+/// a real library.
 #[derive(Debug, thiserror::Error)]
 pub enum PipelineError {
     #[error(transparent)]
@@ -112,6 +135,102 @@ impl CancellationToken {
     }
 }
 
+/// How one scan should run: what can stop it, what embeds for it, and who watches it.
+///
+/// A struct rather than four more positional arguments, and constructed through builders so
+/// that adding Phase 5's projection trigger or Phase 9's per-root overrides does not break
+/// every call site again.
+pub struct ScanOptions<'a> {
+    cancel: &'a CancellationToken,
+    /// What turns a spectrogram into a vector. `dyn` rather than a concrete session
+    /// because CLAP is not the only answer: `dsp_embed::DspEmbedder` implements the same
+    /// trait at a ten-thousandth of the cost, and `tests/evaluation.rs` exists to find out
+    /// which one a drum library is actually better served by.
+    embedder: Option<Arc<dyn Embed>>,
+    padding: Padding,
+    batch: BatchConfig,
+    progress: Arc<ScanProgress>,
+    /// Where the 100 ms ticker sends its snapshots. `None` means no ticker runs at all --
+    /// the benchmarks and most tests do not want a thread waking up ten times a second in
+    /// the middle of a measurement.
+    #[allow(clippy::type_complexity)]
+    sink: Option<Box<dyn FnMut(ProgressSnapshot) + Send + 'static>>,
+}
+
+impl std::fmt::Debug for ScanOptions<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScanOptions")
+            .field("cancelled", &self.cancel.is_cancelled())
+            .field("embedding", &self.embedder.is_some())
+            .field("padding", &self.padding)
+            .field("batch", &self.batch)
+            .field("ticking", &self.sink.is_some())
+            .finish()
+    }
+}
+
+impl<'a> ScanOptions<'a> {
+    /// A scan that decodes and analyzes but does not embed.
+    pub fn new(cancel: &'a CancellationToken) -> Self {
+        Self {
+            cancel,
+            embedder: None,
+            padding: Padding::default(),
+            batch: BatchConfig::default(),
+            progress: Arc::new(ScanProgress::new()),
+            sink: None,
+        }
+    }
+
+    /// Attaches the CLAP session, turning this into a full five-stage scan.
+    pub fn with_session(self, session: Arc<ModelSession>) -> Self {
+        self.with_embedder(session)
+    }
+
+    /// Attaches any embedder. The model is one; `dsp_embed::DspEmbedder` is another.
+    pub fn with_embedder(mut self, embedder: Arc<dyn Embed>) -> Self {
+        self.embedder = Some(embedder);
+        self
+    }
+
+    /// Chooses what the mel front-end does with audio shorter than its ten-second window.
+    ///
+    /// [`Padding::RepeatPad`] is CLAP's own and is what the parity gate is stated against,
+    /// so it is the default and must stay so for any scan feeding the model.
+    /// [`Padding::ZeroPad`] is for embedders that measure the envelope, where tiling a
+    /// 200 ms kick twenty-five times would manufacture a decay the file does not have.
+    pub fn with_padding(mut self, padding: Padding) -> Self {
+        self.padding = padding;
+        self
+    }
+
+    /// Overrides the batching parameters. The sweep in `tests/benchmarks.rs` is the only
+    /// caller that should need this.
+    pub fn with_batch(mut self, batch: BatchConfig) -> Self {
+        self.batch = batch;
+        self
+    }
+
+    /// Starts a 100 ms ticker that hands each coalesced snapshot to `sink`
+    /// (`overview.md` §6.5). Phase 6's `Channel<ScanProgress>` is a sink like any other.
+    pub fn with_progress<F>(mut self, sink: F) -> Self
+    where
+        F: FnMut(ProgressSnapshot) + Send + 'static,
+    {
+        self.sink = Some(Box::new(sink));
+        self
+    }
+
+    /// Shares the counter set, so a caller can read totals while the scan runs.
+    pub fn progress(&self) -> Arc<ScanProgress> {
+        Arc::clone(&self.progress)
+    }
+
+    fn embedding_required(&self) -> bool {
+        self.embedder.is_some()
+    }
+}
+
 /// What one scan did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanReport {
@@ -124,6 +243,33 @@ pub struct ScanReport {
     pub deduped: u64,
     /// Files this scan actually decoded.
     pub processed: u64,
+    /// Files this scan produced a vector for, whether by inference or by borrowing a
+    /// twin's.
+    pub embedded: u64,
+    /// Spectrograms sent through the model, and how many `run()` calls that took. Zero and
+    /// zero for a scan with no session. The ratio is what the batch-size sweep reads.
+    pub inference_batches: u64,
+    pub inferred: u64,
+}
+
+/// What the embed stage decided should end up in `samples.emb_offset`.
+///
+/// A four-way split because the four cases cost wildly different amounts and only one of
+/// them involves the model at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmbedPlan {
+    /// Nothing to store: a quarantined file, or any file at all when no session is
+    /// available.
+    None,
+    /// A spectrogram was handed to the embed stage; the vector arrives alongside the row.
+    Compute,
+    /// A previous scan already embedded this exact content. The duplicate stores a second
+    /// reference to the same bytes rather than a second copy of them.
+    Existing(EmbeddingLoc),
+    /// A twin *in this scan* owns the vector. The persist stage resolves it once the twin's
+    /// bytes have actually landed, which may be several batches later or -- if the twin's
+    /// batch failed -- never.
+    CopyOf([u8; 32]),
 }
 
 /// A file that made it through decode and analysis, on its way to the writer.
@@ -134,6 +280,7 @@ struct Analyzed {
     features: Option<SampleFeatures>,
     /// The message stored in `samples.error`, for a quarantined file.
     error: Option<String>,
+    embed: EmbedPlan,
 }
 
 /// What an earlier file with the same content hash produced.
@@ -146,6 +293,10 @@ struct Twin {
     sample_rate: Option<i64>,
     channels: Option<i64>,
     features: SampleFeatures,
+    /// Where the twin's vector already lives, if it has one on disk. `None` for a twin
+    /// produced by this scan, whose vector is still somewhere between the batcher and the
+    /// writer -- those resolve through [`EmbedPlan::CopyOf`] instead.
+    embedding: Option<EmbeddingLoc>,
 }
 
 /// In-scan deduplication, by content hash.
@@ -164,7 +315,9 @@ struct Twin {
 ///
 /// Waiting cannot deadlock. A claim is always published -- on success, on decode failure,
 /// and on a panic, via [`TwinClaim`]'s `Drop` -- and the claiming worker never waits on
-/// anything itself, so the wait graph has no cycle.
+/// anything itself, so the wait graph has no cycle. In particular a claim is published
+/// **before** inference, not after: making a duplicate wait for its twin's batch to run
+/// would put a decode worker to sleep behind the slowest stage in the pipeline.
 #[derive(Debug, Default)]
 struct TwinTable {
     entries: Mutex<HashMap<[u8; 32], TwinState>>,
@@ -260,7 +413,18 @@ struct ScanState<'a> {
     cancel: &'a CancellationToken,
     progress: &'a ScanProgress,
     pool: Arc<BufferPool>,
+    /// The 256 KB spectrogram buffers. `None` when there is no session, in which case no
+    /// mel is computed at all -- the front-end is a third of the per-file cost and there is
+    /// nothing downstream that would read it.
+    mel_pool: Option<Arc<BufferPool>>,
+    padding: Padding,
     twins: TwinTable,
+}
+
+impl ScanState<'_> {
+    fn embedding_required(&self) -> bool {
+        self.mel_pool.is_some()
+    }
 }
 
 /// Per-worker scratch, built once per `rayon` thread rather than once per file.
@@ -268,12 +432,25 @@ struct Worker {
     hasher: Hasher,
     decoder: Decoder,
     analyzer: features::Analyzer,
+    front_end: mel::FrontEnd,
 }
 
-/// Scans every enabled library root.
+/// Scans every enabled library root, decoding but not embedding.
 pub fn scan_all_roots(
     db: &Database,
     cancel: &CancellationToken,
+) -> Result<Vec<ScanReport>, PipelineError> {
+    scan_all_roots_with(db, ScanOptions::new(cancel))
+}
+
+/// Scans every enabled library root under the given options.
+///
+/// One [`ScanOptions`] covers every root, which is what makes the session and the counter
+/// set shared across them: a library with six roots builds one session and reports one
+/// total, rather than six of each.
+pub fn scan_all_roots_with(
+    db: &Database,
+    mut options: ScanOptions<'_>,
 ) -> Result<Vec<ScanReport>, PipelineError> {
     let conn = db.read()?;
     let roots = queries::library_roots(&conn)?;
@@ -281,24 +458,35 @@ pub fn scan_all_roots(
     let mut reports = Vec::new();
 
     for root in roots.into_iter().filter(|r| r.enabled) {
-        if cancel.is_cancelled() {
+        if options.cancel.is_cancelled() {
             break;
         }
-        reports.push(scan_root(db, root.id, cancel)?);
+        reports.push(scan_root_with(db, root.id, &mut options)?);
     }
 
     Ok(reports)
+}
+
+/// Scans one library root end to end, decoding but not embedding.
+pub fn scan_root(
+    db: &Database,
+    root_id: i64,
+    cancel: &CancellationToken,
+) -> Result<ScanReport, PipelineError> {
+    scan_root_with(db, root_id, &mut ScanOptions::new(cancel))
 }
 
 /// Scans one library root end to end, opening and closing its `scan_runs` row.
 ///
 /// Returns `Ok` with a `cancelled` or `failed` status rather than `Err` for anything that
 /// happened *during* the scan; `Err` is reserved for never having got started.
-pub fn scan_root(
+pub fn scan_root_with(
     db: &Database,
     root_id: i64,
-    cancel: &CancellationToken,
+    options: &mut ScanOptions<'_>,
 ) -> Result<ScanReport, PipelineError> {
+    let cancel = options.cancel;
+    let progress = options.progress();
     let conn = db.read()?;
     let root = queries::library_roots(&conn)?
         .into_iter()
@@ -317,26 +505,38 @@ pub fn scan_root(
         root_id,
         path = %path.display(),
         known = known.len(),
+        embedding = options.embedding_required(),
         "scan starting"
     );
 
     let scan_id = db.writer().start_scan(Some(root_id))?;
-    let progress = ScanProgress::new();
+    // The ticker starts before the stages and is dropped after them, so the terminal
+    // snapshot reports the scan's real final counts rather than whatever the last 100 ms
+    // boundary happened to catch (`overview.md` §6.5).
+    let mut ticker = options
+        .sink
+        .take()
+        .map(|sink| Ticker::spawn(Arc::clone(&progress), scan_id, sink));
 
-    let outcome = run_stages(db, root_id, &path, &known, cancel, &progress);
+    let outcome = run_stages(db, root_id, &path, &known, options, &progress);
 
+    progress.enter(ScanPhase::Finishing);
     let counts = progress.counts();
     let status = match (&outcome, cancel.is_cancelled()) {
         (Err(_), _) => ScanStatus::Failed,
-        (Ok(()), true) => ScanStatus::Cancelled,
-        (Ok(()), false) => ScanStatus::Completed,
+        (Ok(_), true) => ScanStatus::Cancelled,
+        (Ok(_), false) => ScanStatus::Completed,
     };
     let error = outcome.as_ref().err().map(|e| e.to_string());
 
     // The scan_runs row closes even when the scan blew up -- a `running` row left behind
     // forever is how a UI ends up showing a progress bar with nothing behind it.
     db.writer().finish_scan(scan_id, status, counts, error)?;
+    if let Some(ticker) = ticker.as_mut() {
+        ticker.finish();
+    }
 
+    let (inferred, inference_batches) = outcome.as_ref().copied().unwrap_or((0, 0));
     tracing::info!(
         root_id,
         scan_id,
@@ -346,6 +546,8 @@ pub fn scan_root(
         skipped = counts.files_skipped,
         failed = counts.files_failed,
         deduped = ScanProgress::read(&progress.deduped),
+        embedded = ScanProgress::read(&progress.embedded),
+        inference_batches,
         "scan finished"
     );
 
@@ -358,6 +560,9 @@ pub fn scan_root(
         counts,
         deduped: ScanProgress::read(&progress.deduped),
         processed: ScanProgress::read(&progress.processed),
+        embedded: ScanProgress::read(&progress.embedded),
+        inferred,
+        inference_batches,
     })
 }
 
@@ -366,39 +571,99 @@ pub fn scan_root(
 /// The topology, and where each stage's threads come from:
 ///
 /// - **walk** -- one scoped thread, which hands the tree to `ignore`'s own parallel walker.
-/// - **process** -- the calling thread, fanned out across the global `rayon` pool by
-///   `par_bridge`. Decode and DSP are CPU-bound, which is what that pool is for.
+/// - **process** (hash, decode, DSP, mel) -- the calling thread, fanned out across the
+///   global `rayon` pool by `par_bridge`. All of it is CPU-bound, which is what that pool
+///   is for.
+/// - **embed** -- one scoped thread. One, because there is one session and `run()` on it is
+///   serialized; a second thread would only queue on the same mutex.
 /// - **persist** -- one scoped thread, batching into the single writer.
 ///
 /// Channel senders are what terminate the pipeline: the walk thread owns the only
 /// `DiscoveredFile` sender, so finishing the walk ends the process stage, which drops the
-/// only `Analyzed` sender, which ends the persist stage. There is no separate shutdown
-/// protocol to get wrong.
+/// only mel sender, which ends the embed stage, which drops the only row sender, which ends
+/// the persist stage. There is no separate shutdown protocol to get wrong.
+///
+/// Returns the spectrogram and batch counts, for the batch-size sweep.
 fn run_stages(
     db: &Database,
     root_id: i64,
     root: &std::path::Path,
     known: &HashMap<String, queries::SampleStamp>,
-    cancel: &CancellationToken,
+    options: &ScanOptions<'_>,
     progress: &ScanProgress,
-) -> Result<(), PipelineError> {
+) -> Result<(u64, u64), PipelineError> {
+    // Everything the stage threads need, lifted out of `options` before the scope. A
+    // `ScanOptions` holds a boxed sink and is therefore not `Sync`; the pieces are.
+    let cancel = options.cancel;
+    let embedder = options.embedder.clone();
+    let padding = options.padding;
+    let batch = options.batch;
+    let embedding_required = options.embedding_required();
+
     let (found_tx, found_rx) = bounded::<DiscoveredFile>(WALK_QUEUE_DEPTH);
-    let (done_tx, done_rx) = bounded::<Analyzed>(PERSIST_QUEUE_DEPTH);
+    let (mel_tx, mel_rx) = bounded::<embed::Pending<Analyzed>>(embed::EMBED_QUEUE_DEPTH);
+    let (done_tx, done_rx) = bounded::<embed::Embedded<Analyzed>>(PERSIST_QUEUE_DEPTH);
 
     let state = ScanState {
         db,
         cancel,
         progress,
         pool: BufferPool::for_decode(),
+        mel_pool: embedder.as_ref().map(|_| embed::mel_pool(batch)),
+        padding,
         twins: TwinTable::default(),
     };
 
-    std::thread::scope(|scope| -> Result<(), PipelineError> {
+    std::thread::scope(|scope| -> Result<(u64, u64), PipelineError> {
         let persist = std::thread::Builder::new()
             .name("audiobank-persist".into())
             .spawn_scoped(scope, || persist_stage(db, done_rx, progress))
             .map_err(|e| DbError::Io {
                 context: "spawning the persist stage".into(),
+                source: e,
+            })?;
+
+        let embedder = std::thread::Builder::new()
+            .name("audiobank-embed".into())
+            .spawn_scoped(scope, {
+                let embedder = embedder.clone();
+                move || {
+                    let counts = match embedder {
+                        Some(session) => {
+                            progress.enter(ScanPhase::Embedding);
+                            embed::embed_stage(
+                                &session,
+                                batch,
+                                cancel,
+                                mel_rx,
+                                &done_tx,
+                                &progress.embedded,
+                            )
+                        }
+                        // No session: the rows still have to reach the writer, so the stage
+                        // runs as a pass-through rather than being wired out of the
+                        // topology. One `if` here beats two shapes of pipeline.
+                        None => {
+                            for item in mel_rx {
+                                if done_tx
+                                    .send(embed::Embedded {
+                                        payload: item.payload,
+                                        embedding: None,
+                                    })
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            (0, 0)
+                        }
+                    };
+                    drop(done_tx);
+                    counts
+                }
+            })
+            .map_err(|e| DbError::Io {
+                context: "spawning the embed stage".into(),
                 source: e,
             })?;
 
@@ -409,6 +674,7 @@ fn run_stages(
                     root_id,
                     root,
                     known,
+                    embedding_required,
                     cancel,
                     progress,
                 };
@@ -423,8 +689,8 @@ fn run_stages(
                 source: e,
             })?;
 
-        process_stage(&state, found_rx, &done_tx);
-        drop(done_tx);
+        process_stage(&state, found_rx, &mel_tx);
+        drop(mel_tx);
 
         // A panicking stage is a bug, not a runtime condition, and there is no partial
         // result worth salvaging from one -- so it is logged and the scan is failed rather
@@ -433,23 +699,36 @@ fn run_stages(
         if walker.join().is_err() {
             tracing::error!("the walk stage panicked");
         }
+        let inference = match embedder.join() {
+            Ok(counts) => counts,
+            Err(_) => {
+                tracing::error!("the embed stage panicked");
+                (0, 0)
+            }
+        };
         match persist.join() {
-            Ok(result) => result,
+            Ok(result) => result.map(|()| inference),
             Err(_) => {
                 tracing::error!("the persist stage panicked");
-                Ok(())
+                Ok(inference)
             }
         }
     })
 }
 
-/// Hash, dedup, decode, analyze. Runs on the `rayon` pool, one closure invocation per file.
-fn process_stage(state: &ScanState<'_>, files: Receiver<DiscoveredFile>, out: &Sender<Analyzed>) {
+/// Hash, dedup, decode, analyze, and compute the spectrogram. Runs on the `rayon` pool, one
+/// closure invocation per file.
+fn process_stage(
+    state: &ScanState<'_>,
+    files: Receiver<DiscoveredFile>,
+    out: &Sender<embed::Pending<Analyzed>>,
+) {
     files.into_iter().par_bridge().for_each_init(
         || Worker {
             hasher: Hasher::new(),
             decoder: Decoder::new(Arc::clone(&state.pool)),
             analyzer: features::Analyzer::new(),
+            front_end: mel::FrontEnd::with_padding(state.padding),
         },
         |worker, file| {
             // Draining rather than breaking: `par_bridge` has no early exit, so a cancelled
@@ -458,6 +737,8 @@ fn process_stage(state: &ScanState<'_>, files: Receiver<DiscoveredFile>, out: &S
             if state.cancel.is_cancelled() {
                 return;
             }
+            state.progress.enter(ScanPhase::Decoding);
+            state.progress.note_path(&file.rel_path);
             let analyzed = process_one(state, worker, file);
             let _ = out.send(analyzed);
         },
@@ -465,7 +746,11 @@ fn process_stage(state: &ScanState<'_>, files: Receiver<DiscoveredFile>, out: &S
 }
 
 /// One file: hash it, look for a twin, and decode only if there isn't one.
-fn process_one(state: &ScanState<'_>, worker: &mut Worker, file: DiscoveredFile) -> Analyzed {
+fn process_one(
+    state: &ScanState<'_>,
+    worker: &mut Worker,
+    file: DiscoveredFile,
+) -> embed::Pending<Analyzed> {
     let hash = match worker.hasher.hash_file(&file.path, file.size_bytes as u64) {
         Ok(hash) => hash,
         Err(e) => {
@@ -503,6 +788,18 @@ fn process_one(state: &ScanState<'_>, worker: &mut Worker, file: DiscoveredFile)
     };
 
     let analysis = worker.analyzer.analyze(&decoded.samples);
+
+    // The spectrogram, computed here rather than in a stage of its own so that the 1.92 MB
+    // window can be released now instead of crossing another channel. It also reuses this
+    // worker's FFT plan, which `analyze` has already paid for.
+    let mel = state.mel_pool.as_ref().map(|pool| {
+        let mut buf = pool.take();
+        worker
+            .front_end
+            .compute(&decoded.samples, &mut worker.analyzer, buf.buffer_mut());
+        buf
+    });
+
     ScanProgress::bump(&state.progress.processed);
 
     let twin = Twin {
@@ -510,50 +807,78 @@ fn process_one(state: &ScanState<'_>, worker: &mut Worker, file: DiscoveredFile)
         sample_rate: Some(i64::from(decoded.source_sample_rate)),
         channels: Some(i64::from(decoded.channels)),
         features: analysis,
+        // This scan's own vector does not exist yet; duplicates of it resolve through
+        // `EmbedPlan::CopyOf` in the persist stage.
+        embedding: None,
     };
 
-    // Release the 1.92 MB buffer before the row goes into a queue 1024 deep. Phase 4 passes
-    // it on to the mel stage instead; today nothing downstream wants it.
+    // Release the 1.92 MB buffer before the row goes into a queue: what crosses it is the
+    // 256 KB spectrogram, which is the whole reason decode and mel share a stage.
     drop(decoded);
 
     if let Some(claim) = claim {
         claim.publish(twin.clone());
     }
 
-    Analyzed {
-        row: NewSample {
-            content_hash: Some(hash),
-            duration_ms: twin.duration_ms,
-            sample_rate: twin.sample_rate,
-            channels: twin.channels,
-            status: SampleStatus::Decoded,
-            ..base_row(&file)
+    let embed = if mel.is_some() {
+        EmbedPlan::Compute
+    } else {
+        EmbedPlan::None
+    };
+
+    embed::Pending {
+        payload: Analyzed {
+            row: NewSample {
+                content_hash: Some(hash),
+                duration_ms: twin.duration_ms,
+                sample_rate: twin.sample_rate,
+                channels: twin.channels,
+                status: SampleStatus::Decoded,
+                ..base_row(&file)
+            },
+            features: Some(twin.features),
+            error: None,
+            embed,
         },
-        features: Some(twin.features),
-        error: None,
+        mel,
     }
 }
 
 /// A complete row for a file whose content was already analyzed. Not a stub: a duplicate is
 /// as much a sample as its twin, it simply cost nothing to describe.
+///
+/// Costs nothing to *embed*, either, which is the part that matters at 50,000 files: the
+/// row points at its twin's bytes rather than running the model on identical audio to
+/// produce an identical vector.
 fn copy_of_twin(
     state: &ScanState<'_>,
     file: DiscoveredFile,
     hash: [u8; 32],
     twin: Twin,
-) -> Analyzed {
+) -> embed::Pending<Analyzed> {
     ScanProgress::bump(&state.progress.deduped);
-    Analyzed {
-        row: NewSample {
-            content_hash: Some(hash),
-            duration_ms: twin.duration_ms,
-            sample_rate: twin.sample_rate,
-            channels: twin.channels,
-            status: SampleStatus::Decoded,
-            ..base_row(&file)
+
+    let embed = match twin.embedding {
+        Some(loc) => EmbedPlan::Existing(loc),
+        None if state.embedding_required() => EmbedPlan::CopyOf(hash),
+        None => EmbedPlan::None,
+    };
+
+    embed::Pending {
+        payload: Analyzed {
+            row: NewSample {
+                content_hash: Some(hash),
+                duration_ms: twin.duration_ms,
+                sample_rate: twin.sample_rate,
+                channels: twin.channels,
+                status: SampleStatus::Decoded,
+                ..base_row(&file)
+            },
+            features: Some(twin.features),
+            error: None,
+            embed,
         },
-        features: Some(twin.features),
-        error: None,
+        mel: None,
     }
 }
 
@@ -576,22 +901,48 @@ fn base_row(file: &DiscoveredFile) -> NewSample {
 
 /// A row that records why the file could not be read, so the UI can list it
 /// (`overview.md` §3.2).
-fn quarantine(file: DiscoveredFile, hash: Option<[u8; 32]>, error: String) -> Analyzed {
-    Analyzed {
-        row: NewSample {
-            content_hash: hash,
-            status: SampleStatus::DecodeFailed,
-            ..base_row(&file)
+fn quarantine(
+    file: DiscoveredFile,
+    hash: Option<[u8; 32]>,
+    error: String,
+) -> embed::Pending<Analyzed> {
+    embed::Pending {
+        payload: Analyzed {
+            row: NewSample {
+                content_hash: hash,
+                status: SampleStatus::DecodeFailed,
+                ..base_row(&file)
+            },
+            features: None,
+            error: Some(error),
+            embed: EmbedPlan::None,
         },
-        features: None,
-        error: Some(error),
+        mel: None,
     }
 }
 
 /// A twin from a previous scan, found through the `content_hash` index.
+///
+/// When this scan is embedding, only an already-*embedded* twin will do. A twin that is
+/// merely `decoded` saves one decode and leaves both rows owing a vector, so this scan
+/// would end with the corpus half-embedded and the user would have to run it again to
+/// converge. Falling through to the decoder instead costs one decode and finishes the job:
+/// the file gets a real vector, and the in-scan [`TwinTable`] gives its duplicates a
+/// [`EmbedPlan::CopyOf`] reference to it.
 fn twin_from_database(state: &ScanState<'_>, hash: &[u8; 32]) -> Option<Twin> {
     let conn = state.db.read().ok()?;
-    let (id, meta) = queries::processed_sample_by_hash(&conn, hash).ok()??;
+
+    let (id, embedding) = if state.embedding_required() {
+        let (id, loc) = queries::embedded_sample_by_hash(&conn, hash).ok()??;
+        (id, Some(loc))
+    } else {
+        let (id, _) = queries::processed_sample_by_hash(&conn, hash).ok()??;
+        (id, None)
+    };
+
+    // Metadata is read off the row the vector came from rather than carried along from the
+    // lookup, so both branches describe the same sample.
+    let (_, meta) = queries::processed_sample_by_hash(&conn, hash).ok()??;
     let features = queries::sample_features(&conn, id).ok().flatten()?;
 
     Some(Twin {
@@ -599,7 +950,20 @@ fn twin_from_database(state: &ScanState<'_>, hash: &[u8; 32]) -> Option<Twin> {
         sample_rate: meta.sample_rate,
         channels: meta.channels,
         features,
+        embedding,
     })
+}
+
+/// Vectors this scan has already written, by content hash.
+///
+/// Bounded like [`TwinTable`]: past the cap a duplicate simply stores its own copy of the
+/// vector, which costs a kilobyte of `embeddings.bin` and never correctness.
+#[derive(Debug, Default)]
+struct EmbeddingLedger {
+    by_hash: HashMap<[u8; 32], EmbeddingLoc>,
+    /// Rows whose twin had not landed yet when they were written. Resolved once, at the end
+    /// of the scan.
+    deferred: Vec<(i64, [u8; 32])>,
 }
 
 /// Accumulates analyzed rows and hands them to the single writer in writer-sized batches.
@@ -608,26 +972,37 @@ fn twin_from_database(state: &ScanState<'_>, hash: &[u8; 32]) -> Option<Twin> {
 /// callers queued on the same channel.
 fn persist_stage(
     db: &Database,
-    rows: Receiver<Analyzed>,
+    rows: Receiver<embed::Embedded<Analyzed>>,
     progress: &ScanProgress,
 ) -> Result<(), PipelineError> {
-    let mut batch: Vec<Analyzed> = Vec::with_capacity(PERSIST_CHUNK);
+    let mut batch: Vec<embed::Embedded<Analyzed>> = Vec::with_capacity(PERSIST_CHUNK);
+    let mut ledger = EmbeddingLedger::default();
 
     for row in rows {
         batch.push(row);
         if batch.len() >= PERSIST_CHUNK {
-            flush(db, &mut batch, progress)?;
+            flush(db, &mut batch, &mut ledger, progress)?;
         }
     }
 
-    flush(db, &mut batch, progress)
+    flush(db, &mut batch, &mut ledger, progress)?;
+    resolve_deferred(db, &mut ledger, progress)?;
+
+    // One `fsync` per scan rather than one per batch. The file is append-only and the
+    // database is the index into it, so the ordering that matters is bytes-before-offsets,
+    // and that is what this call establishes before `finish_scan` closes the run.
+    if let Ok(store) = db.embeddings().lock() {
+        store.sync()?;
+    }
+    Ok(())
 }
 
-/// Writes one batch: the sample rows first, then the features and quarantine messages that
-/// need the ids the sample rows just returned.
+/// Writes one batch: the sample rows first, then the features, quarantine messages and
+/// vectors that need the ids the sample rows just returned.
 fn flush(
     db: &Database,
-    batch: &mut Vec<Analyzed>,
+    batch: &mut Vec<embed::Embedded<Analyzed>>,
+    ledger: &mut EmbeddingLedger,
     progress: &ScanProgress,
 ) -> Result<(), PipelineError> {
     if batch.is_empty() {
@@ -635,24 +1010,122 @@ fn flush(
     }
 
     let writer = db.writer();
-    let rows: Vec<NewSample> = batch.iter().map(|a| a.row.clone()).collect();
+    let rows: Vec<NewSample> = batch.iter().map(|a| a.payload.row.clone()).collect();
     let ids = writer.upsert_samples(rows)?;
 
     let mut features = Vec::new();
     let mut failures = Vec::new();
-    for (id, analyzed) in ids.iter().zip(batch.iter_mut()) {
+    // Vectors to append, with the row and content hash each one belongs to.
+    let mut fresh: Vec<(i64, Option<[u8; 32]>, Vec<f32>)> = Vec::new();
+    // Rows that point at bytes already in the file.
+    let mut locs: Vec<(i64, EmbeddingLoc)> = Vec::new();
+    // Rows that got a vector without one being computed for them. The embed stage counts
+    // the ones it ran; these would otherwise be invisible, and on a library that is 40%
+    // duplicates that is most of the progress bar.
+    let mut borrowed = 0u64;
+
+    for (id, item) in ids.iter().zip(batch.iter_mut()) {
+        let analyzed = &mut item.payload;
         if let Some(f) = analyzed.features.take() {
             features.push((*id, f));
         }
         if let Some(e) = analyzed.error.take() {
             failures.push((*id, e));
         }
+
+        match analyzed.embed {
+            EmbedPlan::None => {}
+            EmbedPlan::Compute => {
+                // `None` here is an inference failure, already logged by the embed stage.
+                // The row stays `decoded` and the next scan finishes it.
+                if let Some(vector) = item.embedding.take() {
+                    fresh.push((*id, analyzed.row.content_hash, vector));
+                }
+            }
+            EmbedPlan::Existing(loc) => {
+                locs.push((*id, loc));
+                borrowed += 1;
+            }
+            EmbedPlan::CopyOf(hash) => match ledger.by_hash.get(&hash) {
+                Some(loc) => {
+                    locs.push((*id, *loc));
+                    borrowed += 1;
+                }
+                // The twin is in a batch that has not been persisted yet -- the embed stage
+                // preserves order, but the *decode* stage does not, so a duplicate can
+                // legitimately overtake the file it copies from.
+                None => ledger.deferred.push((*id, hash)),
+            },
+        }
+    }
+
+    if !fresh.is_empty() {
+        let mut store = db
+            .embeddings()
+            .lock()
+            .map_err(|_| DbError::Poisoned("embedding store"))?;
+        let vectors: Vec<&[f32]> = fresh.iter().map(|(_, _, v)| v.as_slice()).collect();
+        let appended = store.append_batch(&vectors)?;
+        for ((id, hash, _), loc) in fresh.iter().zip(appended) {
+            locs.push((*id, loc));
+            if let Some(hash) = hash {
+                if ledger.by_hash.len() < TWIN_TABLE_CAPACITY {
+                    ledger.by_hash.insert(*hash, loc);
+                }
+            }
+        }
     }
 
     writer.set_features(features)?;
     writer.mark_decode_failed(failures)?;
+    // Last, and separately: this is the statement that flips a row to `embedded`, and it
+    // must not run before the bytes it points at are in the file.
+    writer.set_embeddings(locs)?;
 
     ScanProgress::bump_by(&progress.persisted, ids.len() as u64);
+    ScanProgress::bump_by(&progress.embedded, borrowed);
     batch.clear();
+    Ok(())
+}
+
+/// Points the duplicates that overtook their twins at the right bytes.
+///
+/// Runs once, after every row of the scan has been written. Anything still unresolved --
+/// because its twin's batch failed inference, or because the scan was cancelled before the
+/// twin got there -- is left `decoded` rather than guessed at, and the next scan embeds it
+/// on its own terms.
+fn resolve_deferred(
+    db: &Database,
+    ledger: &mut EmbeddingLedger,
+    progress: &ScanProgress,
+) -> Result<(), PipelineError> {
+    if ledger.deferred.is_empty() {
+        return Ok(());
+    }
+
+    let conn = db.read()?;
+    let mut locs = Vec::with_capacity(ledger.deferred.len());
+    let mut unresolved = 0u64;
+
+    for (id, hash) in ledger.deferred.drain(..) {
+        match ledger.by_hash.get(&hash) {
+            Some(loc) => locs.push((id, *loc)),
+            None => match queries::embedded_sample_by_hash(&conn, &hash)? {
+                Some((_, loc)) => locs.push((id, loc)),
+                None => unresolved += 1,
+            },
+        }
+    }
+    drop(conn);
+
+    if unresolved > 0 {
+        tracing::warn!(
+            unresolved,
+            "duplicates whose twin never produced a vector; left for the next scan"
+        );
+    }
+
+    ScanProgress::bump_by(&progress.embedded, locs.len() as u64);
+    db.writer().set_embeddings(locs)?;
     Ok(())
 }

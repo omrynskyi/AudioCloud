@@ -290,9 +290,11 @@ fn the_model_handle_goes_from_absent_to_a_working_session() {
     let data_dir = tempfile::tempdir().unwrap();
     let model = Model::new(data_dir.path());
 
-    // Unpinned, because no real release has been published yet -- so the first-run screen
-    // has something true to say rather than an empty progress bar.
-    assert_eq!(model.status(), ModelStatus::Unpinned);
+    // Not installed -- which of the two not-installed states it is depends on whether the
+    // shipped release carries a real digest yet, and that is `model::mod`'s test to make.
+    // What matters here is that the first-run screen has something true to say rather than
+    // an empty progress bar, and that no session exists to say it with.
+    assert_ne!(model.status(), ModelStatus::Installed);
     assert!(!model.session().is_initialized());
 
     // Stand in for a completed download. The download itself -- resume, verification,

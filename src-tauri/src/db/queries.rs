@@ -173,13 +173,20 @@ pub fn processed_sample_by_hash(
 
 /// Finds an already-embedded sample with the same content, so a duplicate file can borrow
 /// its vector instead of paying for inference again (Phase 4 dedup).
+///
+/// `status = 'embedded'` is not redundant next to the two `NOT NULL`s. A row that was
+/// re-processed after its file changed carries the new content hash while its old offsets
+/// are cleared and its new ones have not been written yet, and the whole cost of getting
+/// this wrong is a duplicate silently inheriting a vector for audio it does not contain.
+/// The status column is what says the two agree.
 pub fn embedded_sample_by_hash(
     conn: &Connection,
     content_hash: &[u8],
 ) -> Result<Option<(i64, EmbeddingLoc)>, DbError> {
     let mut stmt = conn.prepare_cached(
         "SELECT id, emb_offset, emb_len FROM samples
-         WHERE content_hash = ?1 AND emb_offset IS NOT NULL AND emb_len IS NOT NULL
+         WHERE content_hash = ?1 AND status = 'embedded'
+           AND emb_offset IS NOT NULL AND emb_len IS NOT NULL
          LIMIT 1",
     )?;
     let found = stmt
@@ -233,6 +240,41 @@ pub fn all_embedding_locs(conn: &Connection) -> Result<Vec<(i64, EmbeddingLoc)>,
                 dims: r.get::<_, i64>(2)? as u32,
             },
         ))
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(DbError::from)
+}
+
+/// An embedded sample, with enough context to be recognizable in a neighbor list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddedSample {
+    pub id: i64,
+    pub rel_path: String,
+    pub duration_ms: Option<i64>,
+    pub loc: EmbeddingLoc,
+}
+
+/// Every embedded sample and where its vector lives, in file order.
+///
+/// The brute-force neighbor pass reads this and walks the mmap once. Phase 5 replaces the
+/// pass with an HNSW index; this stays as the exact answer to check the approximate one
+/// against, and as what `task.md` Phase 4's Risk 5 evaluation inspects by hand.
+pub fn embedded_samples(conn: &Connection) -> Result<Vec<EmbeddedSample>, DbError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, rel_path, duration_ms, emb_offset, emb_len FROM samples
+         WHERE status = 'embedded' AND emb_offset IS NOT NULL AND emb_len IS NOT NULL
+         ORDER BY emb_offset",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(EmbeddedSample {
+            id: r.get(0)?,
+            rel_path: r.get(1)?,
+            duration_ms: r.get(2)?,
+            loc: EmbeddingLoc {
+                offset: r.get::<_, i64>(3)? as u64,
+                dims: r.get::<_, i64>(4)? as u32,
+            },
+        })
     })?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .map_err(DbError::from)

@@ -6,12 +6,12 @@ A spatial browser for large sample libraries. Samples are embedded with CLAP, pr
 - [`overview.md`](overview.md) — the architecture.
 - [`task.md`](task.md) — the implementation roadmap, phase by phase.
 
-**Status: Phase 3 implemented, its gate not yet passed.** An empty window builds and
-launches, and behind it the ingest pipeline is real: point it at a folder of audio and it
-walks, hashes, deduplicates, decodes, analyzes, and writes rows with DSP features. Phase 3
-adds the model side — the CLAP mel front-end, a resumable and SHA-256-verified downloader,
-and a lazily-built `ort` session with a CoreML-then-CPU fallback that is proved by a warmup
-run rather than assumed.
+**Status: Phase 4 implemented, Phase 3's gate not yet passed.** An empty window builds and
+launches, and behind it the ingest pipeline is real and complete: point it at a folder of
+audio and it walks, hashes, deduplicates, decodes, analyzes, computes CLAP's log-mel
+spectrogram, embeds it in batches through one shared `ort` session, and writes both the DSP
+features and the vector — with progress coalesced to 10 Hz, cancellation that keeps what it
+wrote, and a resume that finishes what an interrupted scan started.
 
 What is **not** done is the one thing Phase 3 is actually for. Exporting the ONNX file and
 recording the reference embeddings requires running LAION-CLAP under PyTorch, which is a
@@ -19,6 +19,12 @@ one-time offline step on a machine with that toolchain; it has not been run, so
 `ModelRelease::CURRENT` carries the `UNPINNED` sentinel, no `.onnx` exists to download, and
 the parity gate skips. See [Phase 3 status](#phase-3-status) for exactly what remains and
 what stops it from being forgotten.
+
+That blocks two of Phase 4's claims and no others. The pipeline is tested end to end against
+a real ONNX Runtime using the synthetic fixture graphs, so the plumbing is proved; what
+cannot be proved is that the numbers coming out of it _mean_ anything. The
+`≥ 60 samples/s` throughput criterion and the risk-5 question — does CLAP say anything useful
+about a 200 ms hi-hat — both wait on the export. See [Phase 4 status](#phase-4-status).
 
 Measured numbers live in [`BENCHMARKS.md`](BENCHMARKS.md).
 
@@ -70,12 +76,25 @@ const { invoke } = window.__TAURI__.core;
 
 await invoke('dev_add_root', { path: '/Users/you/Library/Audio/Samples' });
 await invoke('dev_list_roots');
-await invoke('dev_scan'); // walks, decodes, analyzes, and returns counts
+await invoke('dev_scan'); // walks, decodes, analyzes, embeds, and returns counts
+await invoke('dev_neighbors', { query: 'kick', limit: 20 }); // nearest neighbors, by cosine
 ```
 
 `dev_scan` returns files seen / added / skipped / failed, how many were decoded against how
-many were deduplicated, and the totals in the database afterwards. Run it twice: the second
-run should report everything skipped and finish in a fraction of the time.
+many were deduplicated against how many were embedded, and the totals in the database
+afterwards. Run it twice: the second run should report everything skipped and finish in a
+fraction of the time.
+
+It embeds if — and only if — a model is installed; the `inference` field says which execution
+provider bound, or why no session was used. A scan with no model is not a failure. It leaves
+its rows at `decoded`, and the next scan with a session finishes them, because a library is
+worth indexing before a 200 MB download is.
+
+`dev_neighbors` is the instrument for [risk 5](overview.md#10-risk-register): it ranks every
+stored vector against one sample by exact cosine over the memory-mapped matrix. Brute force
+on purpose — an approximate index would put its own recall between the question and the
+answer. It is what the "do kicks retrieve kicks" evaluation will be run through, and it will
+return nonsense until the real model exists.
 
 ### Model provisioning
 
@@ -159,6 +178,55 @@ embeddings that are the parity oracle. Until then the gate in
    in both Python and Rust rather than committed as 19 MB of wavs, and each carries a
    waveform probe — so a drift between the two generators reports itself instead of arriving
    later disguised as a parity failure.
+
+## Phase 4 status
+
+The five-stage pipeline is built, wired, and tested end to end. Two of Phase 4's claims wait
+on Phase 3's export, and they are the two that are about meaning rather than mechanism.
+
+**Done and under test.** Walk → decode → mel → embed → persist, with the queue depths from
+`overview.md` §3 and one deliberate departure from its diagram: **decode and mel share a
+stage.** §3 draws them apart and then observes that a decoded window is 1.92 MB against a mel
+tensor's 256 KB, so a worker decodes, analyzes and computes the spectrogram for one file and
+hands its window straight back to the pool. What crosses the next channel is the spectrogram,
+which is why a 400-file scan peaks at 17.5 MiB rather than at a queue depth times 1.92 MB.
+
+[`embed.rs`](src-tauri/src/pipeline/embed.rs) is the batching accumulator: sixteen
+spectrograms per `run()` with a flush timeout so the tail of a scan does not wait for a batch
+that will never fill, L2-normalized on receipt, one session shared behind its own mutex.
+It talks to an `Embed` trait rather than to `ort`, which keeps the rc-upgrade blast radius at
+one file and lets the batcher be tested against a counting fake — including the property a
+real session makes nearly unobservable, that row 3's vector reaches row 3 and not row 5.
+
+Dedup now saves inference as well as decode: a duplicate file stores a _reference_ to its
+twin's bytes, so six copies of a 909 kick cost one `run()` and one kilobyte. Duplicates that
+overtake the file they copy from — which happens, because decode order is not send order —
+are resolved at the end of the scan rather than guessed at.
+
+[`embed.rs` tests](src-tauri/tests/embed.rs) run all of it against a real ONNX Runtime on the
+synthetic fixture graph: every row embedded and normalized, batches rather than per-file
+runs, duplicates borrowing vectors, a scan with no model leaving work that a later scan
+finishes, a rescan reading nothing, a changed file losing its stale vector, quarantine
+without reaching the model, a cancelled scan keeping what it wrote, and progress that is
+coalesced and always terminates.
+
+**The finding worth carrying forward: the mel filterbank was the entire pipeline.** The first
+five-stage measurement came in at 218 samples/s against Phase 2's 1,599 for decode + DSP
+alone, and the batch-size sweep was flat from 1 to 64 — which is the tell that inference is
+not the bottleneck. Applying a 64 × 513 mel bank densely to 1,001 frames is 32.9 million f64
+multiply-adds per file, and a mel filter spans about sixteen FFT bins, so nearly all of that
+was summing zeros. Restricting each row to its nonzero span is **7.5× end to end** and
+**bit-identical** — asserted by bit pattern, not by tolerance, because this is the parity
+surface.
+
+**Not done, and blocked on the export.** The `≥ 60 samples/s` exit criterion, which is stated
+against real CLAP and is not claimed by a measurement taken against a 130 KB graph; and the
+risk-5 evaluation, the hand inspection of whether kicks retrieve kicks on a real one-shot
+library. The instrument for the second is built and committed (`dev_neighbors`), so that
+evaluation is one command away from being possible. The duration-weighted CLAP + DSP blend
+that risk 5 might call for is deliberately _not_ built: it is conditional on an evaluation
+that cannot run, and a weighting tuned against nonsense embeddings would be chosen by coin
+flip.
 
 ## Builds
 

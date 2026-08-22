@@ -63,6 +63,14 @@ pub enum DbError {
 
     #[error("embedding at byte {offset} (+{bytes}) lies outside embeddings.bin ({size} bytes)")]
     EmbeddingOutOfRange { offset: u64, bytes: u64, size: u64 },
+
+    /// A `Mutex` guarding a data-layer resource was left poisoned by a panicking holder.
+    ///
+    /// Reported rather than unwrapped: the holder is a pipeline stage, and a poisoned
+    /// embedding store means the scan cannot write vectors -- which is a scan that fails
+    /// with a reason, not a process that aborts (cross-cutting rule 8).
+    #[error("the {0} lock is poisoned")]
+    Poisoned(&'static str),
 }
 
 impl From<refinery::Error> for DbError {
@@ -111,16 +119,28 @@ impl SampleStatus {
         }
     }
 
-    /// Whether this row has been through the decode and feature stages.
+    /// Whether this row is finished, for a scan that does or does not embed.
     ///
     /// The discovery fast-skip consults this: an unchanged file whose row is still
     /// `pending` was never actually read -- the last scan died before reaching it -- so
     /// "unchanged" says nothing useful and the file has to be processed. `DecodeFailed` and
-    /// `Missing` count as processed, because retrying a corrupt file on every scan is a
+    /// `Missing` count as finished, because retrying a corrupt file on every scan is a
     /// cost with no upside; a user who fixes the file changes its mtime, which is what
     /// brings it back.
-    pub fn is_processed(self) -> bool {
-        !matches!(self, SampleStatus::Pending)
+    ///
+    /// `embedding_required` is what makes resume work in Phase 4. A row reaches `decoded`
+    /// when its DSP features land and `embedded` only once its vector is in
+    /// `embeddings.bin`, so a scan that ran before the model was installed -- or one that
+    /// was cancelled between the two -- leaves `decoded` rows behind. Those are finished
+    /// for a scan with no session and unfinished for a scan with one, which is precisely
+    /// the difference this argument carries. Without it a resumed scan would skip exactly
+    /// the files it exists to finish.
+    pub fn is_complete(self, embedding_required: bool) -> bool {
+        match self {
+            SampleStatus::Pending => false,
+            SampleStatus::Decoded => !embedding_required,
+            SampleStatus::Embedded | SampleStatus::DecodeFailed | SampleStatus::Missing => true,
+        }
     }
 
     pub fn parse(s: &str) -> Option<Self> {

@@ -116,6 +116,16 @@ pub struct FrontEndSpec {
 pub struct FrontEnd {
     /// Row-major `[MEL_BINS][NUM_BINS]` triangular weights.
     filters: Vec<f32>,
+    /// `[start, end)` of the nonzero weights in each row of [`Self::filters`].
+    ///
+    /// A mel filter is a triangle spanning a handful of FFT bins, so a row of 513 weights
+    /// holds around sixteen nonzero ones -- and applying the bank densely spends 32.9
+    /// million multiply-adds per file computing a sum of zeros. Restricted to these spans
+    /// it is about a thousand. The result is **bit-identical**, not merely close: the terms
+    /// skipped are `0.0 * p` for a finite `p`, and adding exact zero to an f64 accumulator
+    /// changes nothing. `sparse_application_is_bit_identical_to_the_dense_one` is what
+    /// holds that claim to the parity surface.
+    spans: Vec<(usize, usize)>,
     /// The signal, padded to the window and then reflect-padded for centering.
     padded: Vec<f32>,
     padding: Padding,
@@ -151,8 +161,11 @@ impl FrontEnd {
     }
 
     pub fn with_padding(padding: Padding) -> Self {
+        let filters = mel_filterbank();
+        let spans = nonzero_spans(&filters);
         Self {
-            filters: mel_filterbank(),
+            filters,
+            spans,
             padded: Vec::with_capacity(MAX_OUTPUT_SAMPLES + FRAME_SIZE),
             padding,
         }
@@ -188,13 +201,14 @@ impl FrontEnd {
             let row = &mut out[frame * MEL_BINS..(frame + 1) * MEL_BINS];
 
             for (mel, dst) in row.iter_mut().enumerate() {
-                let weights = &self.filters[mel * NUM_BINS..(mel + 1) * NUM_BINS];
-                // f64 accumulation: 513 products of numbers spanning the dynamic range of
-                // a power spectrum lose real precision in f32, and the log below turns a
+                let (start, end) = self.spans[mel];
+                let weights = &self.filters[mel * NUM_BINS + start..mel * NUM_BINS + end];
+                // f64 accumulation: the products span the dynamic range of a power
+                // spectrum and lose real precision in f32, and the log below turns a
                 // relative error near the floor into an absolute one in decibels.
                 let energy: f64 = weights
                     .iter()
-                    .zip(power.iter())
+                    .zip(power[start..end].iter())
                     .map(|(&w, &p)| f64::from(w) * f64::from(p))
                     .sum();
                 *dst = 10.0 * (energy.max(f64::from(AMIN))).log10() as f32;
@@ -309,6 +323,27 @@ fn mel_filterbank() -> Vec<f32> {
     filters
 }
 
+/// The `[start, end)` of each filter's nonzero weights, one pair per mel band.
+///
+/// An empty band -- possible in principle if two mel edges fall between the same pair of
+/// FFT bins -- yields `(0, 0)`, which sums to zero and lands on the log floor, exactly as
+/// the dense loop would.
+fn nonzero_spans(filters: &[f32]) -> Vec<(usize, usize)> {
+    (0..MEL_BINS)
+        .map(|mel| {
+            let row = &filters[mel * NUM_BINS..(mel + 1) * NUM_BINS];
+            let start = row.iter().position(|&w| w != 0.0);
+            match start {
+                Some(start) => {
+                    let end = row.iter().rposition(|&w| w != 0.0).unwrap_or(start) + 1;
+                    (start, end)
+                }
+                None => (0, 0),
+            }
+        })
+        .collect()
+}
+
 /// Periodic Hann, duplicated from `features.rs` only so the tests below can build a frame
 /// without reaching into a private helper. The analyzer's window is the one that runs.
 #[cfg(test)]
@@ -322,6 +357,66 @@ fn hann(n: usize) -> Vec<f32> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// The sparse application is an optimization on the parity surface, which is the one
+    /// place in this crate where "close enough" is not a thing. So it is held to the
+    /// stronger claim: every value identical to the dense loop's, bit for bit.
+    #[test]
+    fn sparse_application_is_bit_identical_to_the_dense_one() {
+        let mut front_end = FrontEnd::new();
+        let mut analyzer = Analyzer::new();
+        let signal: Vec<f32> = (0..48_000 * 2)
+            .map(|i| {
+                let t = i as f32 / TARGET_SAMPLE_RATE as f32;
+                0.6 * (std::f32::consts::TAU * 220.0 * t).sin()
+                    + 0.3 * (std::f32::consts::TAU * 3_700.0 * t).sin()
+            })
+            .collect();
+
+        let mut sparse = Vec::new();
+        front_end.compute(&signal, &mut analyzer, &mut sparse);
+
+        // The same computation with every span widened to the whole spectrum.
+        let mut dense_front_end = FrontEnd::new();
+        dense_front_end.spans = vec![(0, NUM_BINS); MEL_BINS];
+        let mut dense = Vec::new();
+        dense_front_end.compute(&signal, &mut analyzer, &mut dense);
+
+        assert_eq!(sparse.len(), dense.len());
+        for (i, (a, b)) in sparse.iter().zip(dense.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "value {i} differs: sparse {a}, dense {b}"
+            );
+        }
+    }
+
+    /// The premise of the optimization: a mel filter touches a few bins, not all 513.
+    #[test]
+    fn each_filter_touches_a_narrow_span_of_bins() {
+        let front_end = FrontEnd::new();
+        let widths: Vec<usize> = front_end.spans.iter().map(|(s, e)| e - s).collect();
+        let total: usize = widths.iter().sum();
+
+        assert!(
+            widths.iter().all(|&w| w > 0),
+            "a mel band ended up with no bins at all: {widths:?}"
+        );
+        assert!(
+            total < MEL_BINS * NUM_BINS / 8,
+            "the bank is not sparse enough to be worth this: {total} nonzero weights of {}",
+            MEL_BINS * NUM_BINS
+        );
+        // The spans must also cover every nonzero weight, or the sparse loop is dropping
+        // energy rather than dropping zeros.
+        for mel in 0..MEL_BINS {
+            let row = &front_end.filters[mel * NUM_BINS..(mel + 1) * NUM_BINS];
+            let (start, end) = front_end.spans[mel];
+            assert!(row[..start].iter().all(|&w| w == 0.0));
+            assert!(row[end..].iter().all(|&w| w == 0.0));
+        }
+    }
 
     /// The mel scale must round-trip, and it must be continuous where the two branches
     /// meet. A discontinuity at 1 kHz is the classic transcription bug: it moves every

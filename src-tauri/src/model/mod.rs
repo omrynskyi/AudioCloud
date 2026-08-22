@@ -58,9 +58,14 @@ impl ModelRelease {
     /// [`download::Downloader`] refuses to fetch anything -- see [`UNPINNED`].
     pub const CURRENT: ModelRelease = ModelRelease {
         version: "clap-audio-v1",
+        // TODO: this repository has no remote yet, so the asset is not published anywhere
+        // and this URL 404s. The digest below is real -- it is the export that passed the
+        // parity gate -- so `status()` reports `Downloadable` and a download attempt fails
+        // with `ModelError::Http` rather than silently fetching something unverifiable.
+        // Point this at the release asset once it exists.
         url: "https://github.com/audiobank/audiobank/releases/download/model-clap-audio-v1/clap_audio.onnx",
-        sha256: UNPINNED,
-        bytes: None,
+        sha256: "757910cd3aee90c95db4f6f3cca5252af6328c8c5296b306f105d5d6c2d7e1ae",
+        bytes: Some(117_325_762),
     };
 
     /// Whether this release has a real hash behind it.
@@ -236,10 +241,17 @@ mod tests {
         );
     }
 
+    /// Exercises the predicate, not the shipped constant's current value. An earlier
+    /// version of this test started from `ModelRelease::CURRENT` and asserted it was
+    /// unpinned, so it passed for as long as the export had not been run and failed the
+    /// moment it was -- testing the state of the world rather than the logic.
     #[test]
     fn pinning_rejects_the_sentinel_and_malformed_digests() {
-        let mut release = ModelRelease::CURRENT;
-        assert!(!release.is_pinned());
+        let mut release = ModelRelease {
+            sha256: UNPINNED,
+            ..ModelRelease::CURRENT
+        };
+        assert!(!release.is_pinned(), "the sentinel must not pass");
 
         release.sha256 = "ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
         assert!(!release.is_pinned(), "uppercase hex must not pass");
@@ -256,7 +268,13 @@ mod tests {
     #[test]
     fn status_distinguishes_unpinned_from_merely_not_downloaded() {
         let dir = tempfile::tempdir().unwrap();
-        let unpinned = Model::new(dir.path());
+        let unpinned = Model::with_release(
+            dir.path(),
+            ModelRelease {
+                sha256: UNPINNED,
+                ..ModelRelease::CURRENT
+            },
+        );
         assert_eq!(unpinned.status(), ModelStatus::Unpinned);
 
         let pinned = ModelRelease {

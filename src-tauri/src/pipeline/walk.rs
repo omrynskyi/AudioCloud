@@ -102,6 +102,9 @@ pub struct WalkContext<'a> {
     /// lookups would spend most of the scan queued on `r2d2`. At 50,000 rows the map is a
     /// few megabytes and it is dropped when the scan ends.
     pub known: &'a HashMap<String, SampleStamp>,
+    /// Whether this scan has an inference session behind it, and therefore whether a
+    /// `decoded` row counts as finished. See [`crate::db::SampleStatus::is_complete`].
+    pub embedding_required: bool,
     pub cancel: &'a CancellationToken,
     pub progress: &'a ScanProgress,
 }
@@ -210,9 +213,11 @@ fn visit(
     //
     // A row still in `pending` is not skippable however unchanged the file is -- the last
     // scan was interrupted before it produced anything, so "unchanged" describes a file we
-    // never actually read.
+    // never actually read. A `decoded` row is skippable only for a scan that is not
+    // embedding: with a session available it is a file that still owes a vector, and
+    // skipping it is how a resumed scan would leave the corpus permanently half-embedded.
     if let Some(stamp) = ctx.known.get(&rel_path) {
-        if stamp.unchanged(mtime, size as i64) && stamp.status.is_processed() {
+        if stamp.unchanged(mtime, size as i64) && stamp.status.is_complete(ctx.embedding_required) {
             ScanProgress::bump(&ctx.progress.skipped);
             return WalkState::Continue;
         }

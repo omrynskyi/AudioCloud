@@ -21,7 +21,7 @@ use tauri::State;
 use crate::{
     db::{queries, Database, SampleStatus},
     model::{Model, ModelStatus},
-    pipeline::{scan_all_roots, CancellationToken, ScanReport},
+    pipeline::{scan_all_roots_with, CancellationToken, ScanOptions, ScanReport},
 };
 
 /// What a dev scan did, flattened for the console.
@@ -34,6 +34,12 @@ pub struct DevScanSummary {
     pub files_failed: i64,
     pub decoded: u64,
     pub deduped: u64,
+    pub embedded: u64,
+    /// Spectrograms sent through the model, and the `run()` calls that took.
+    pub inferred: u64,
+    pub inference_batches: u64,
+    /// Which execution provider bound, or why no session was used.
+    pub inference: String,
     /// Totals across the whole database afterwards, not just this scan.
     pub total_samples: i64,
     pub total_quarantined: i64,
@@ -41,7 +47,12 @@ pub struct DevScanSummary {
 }
 
 impl DevScanSummary {
-    fn from_reports(reports: &[ScanReport], db: &Database, elapsed_ms: u128) -> Self {
+    fn from_reports(
+        reports: &[ScanReport],
+        db: &Database,
+        inference: String,
+        elapsed_ms: u128,
+    ) -> Self {
         let conn = db.read();
         let (total_samples, total_quarantined) = match &conn {
             Ok(conn) => (
@@ -59,6 +70,10 @@ impl DevScanSummary {
             files_failed: reports.iter().map(|r| r.counts.files_failed).sum(),
             decoded: reports.iter().map(|r| r.processed).sum(),
             deduped: reports.iter().map(|r| r.deduped).sum(),
+            embedded: reports.iter().map(|r| r.embedded).sum(),
+            inferred: reports.iter().map(|r| r.inferred).sum(),
+            inference_batches: reports.iter().map(|r| r.inference_batches).sum(),
+            inference,
             total_samples,
             total_quarantined,
             elapsed_ms,
@@ -90,15 +105,125 @@ pub fn dev_list_roots(db: State<'_, Database>) -> Result<Vec<String>, String> {
 ///
 /// Blocking, and therefore `async`: Tauri runs an `async` command on its own runtime rather
 /// than on the main thread, and cross-cutting rule 1 says nothing that blocks may run there.
+///
+/// Embeds if -- and only if -- a model is installed. A missing model downgrades the scan to
+/// decode and DSP rather than failing it: the library is worth indexing before the 200 MB
+/// download finishes, and the next scan finishes what this one starts. Progress goes to the
+/// log through the real 100 ms ticker, so the throttle is exercised even though Phase 6 owns
+/// the `Channel` it will eventually feed.
 #[tauri::command]
-pub async fn dev_scan(db: State<'_, Database>) -> Result<DevScanSummary, String> {
+pub async fn dev_scan(
+    db: State<'_, Database>,
+    model: State<'_, Model>,
+) -> Result<DevScanSummary, String> {
     let started = std::time::Instant::now();
-    let reports = scan_all_roots(&db, &CancellationToken::new()).map_err(|e| e.to_string())?;
+    let cancel = CancellationToken::new();
+
+    let (session, inference) = match model.status() {
+        ModelStatus::Installed => match model.session().get() {
+            Ok(session) => {
+                let provider = session.provider().as_str().to_string();
+                (Some(session), provider)
+            }
+            Err(e) => (None, format!("session init failed: {e}")),
+        },
+        other => (None, format!("no model: {other:?}")),
+    };
+
+    let mut options = ScanOptions::new(&cancel).with_progress(|snapshot| {
+        tracing::info!(
+            phase = snapshot.phase.as_str(),
+            seen = snapshot.files_seen,
+            done = snapshot.files_done,
+            embedded = snapshot.files_embedded,
+            failed = snapshot.files_failed,
+            eta_s = snapshot.eta_seconds,
+            "scan progress"
+        );
+    });
+    if let Some(session) = session {
+        options = options.with_session(session);
+    }
+
+    let reports = scan_all_roots_with(&db, options).map_err(|e| e.to_string())?;
     Ok(DevScanSummary::from_reports(
         &reports,
         &db,
+        inference,
         started.elapsed().as_millis(),
     ))
+}
+
+/// One row of a neighbor listing.
+#[derive(Debug, Serialize)]
+pub struct DevNeighbor {
+    pub rel_path: String,
+    pub duration_ms: Option<i64>,
+    /// Cosine similarity. Every stored vector is L2-normalized, so this is a dot product.
+    pub similarity: f32,
+}
+
+/// Nearest neighbors of one sample, by exact cosine over every stored vector.
+///
+/// **This is the instrument for `overview.md` risk 5**, the open question of whether CLAP
+/// says anything useful about a 200 ms hi-hat. `task.md` Phase 4 asks for a hand inspection
+/// of a real one-shot library -- do kicks retrieve kicks -- and a hand inspection needs
+/// something to look at. Point the app at a drum library, scan it, and call this on a kick.
+///
+/// Brute force on purpose: an approximate index would put its own recall between the
+/// question and the answer, and at 50,000 x 512 f16 one pass over the mmap is well under a
+/// second. Phase 5's HNSW is the fast path, and this stays as the exact answer to check it
+/// against.
+#[tauri::command]
+pub async fn dev_neighbors(
+    db: State<'_, Database>,
+    query: String,
+    limit: usize,
+) -> Result<Vec<DevNeighbor>, String> {
+    let conn = db.read().map_err(|e| e.to_string())?;
+    let samples = queries::embedded_samples(&conn).map_err(|e| e.to_string())?;
+    drop(conn);
+
+    let needle = query.to_lowercase();
+    let target = samples
+        .iter()
+        .find(|s| s.rel_path.to_lowercase().contains(&needle))
+        .ok_or_else(|| format!("no embedded sample matching {query:?}"))?;
+
+    let store = db.embeddings().lock().map_err(|_| "embedding store lock")?;
+    let matrix = store.matrix().map_err(|e| e.to_string())?;
+    let mut query_vector = Vec::new();
+    matrix
+        .row_into(target.loc, &mut query_vector)
+        .map_err(|e| e.to_string())?;
+
+    let mut scored = Vec::with_capacity(samples.len());
+    let mut row = Vec::new();
+    for sample in &samples {
+        if sample.id == target.id {
+            continue;
+        }
+        if matrix.row_into(sample.loc, &mut row).is_err() {
+            continue;
+        }
+        let similarity: f32 = query_vector
+            .iter()
+            .zip(row.iter())
+            .map(|(a, b)| a * b)
+            .sum();
+        scored.push((similarity, sample));
+    }
+
+    scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+    Ok(scored
+        .into_iter()
+        .take(limit.clamp(1, 200))
+        .map(|(similarity, sample)| DevNeighbor {
+            rel_path: sample.rel_path.clone(),
+            duration_ms: sample.duration_ms,
+            similarity,
+        })
+        .collect())
 }
 
 /// What the app knows about the model without touching the network or the graph.

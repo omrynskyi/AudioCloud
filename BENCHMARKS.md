@@ -97,3 +97,76 @@ describes.
 The number is also an upper bound rather than a typical cost. It is measured on a full
 10-second window; a drum library is overwhelmingly sub-second one-shots, and the end-to-end
 figure of 1,599 samples/s is what those actually cost.
+
+## Phase 4 — Embedding pipeline
+
+**The headline number for this phase is not here, and cannot be.** Phase 4's exit criterion
+is ≥ 60 samples/s end to end *with CLAP*, and the CLAP export (Phase 3) has not been run —
+`ModelRelease::CURRENT.sha256` is still the `UNPINNED` sentinel. What the graph in these
+measurements does is carry the real export's input signature and output width and compute
+deterministic nonsense in between (`tests/fixtures/session/frames_major.onnx`, ~130 KB).
+
+So every figure below is **the pipeline around a near-free model**: an upper bound on
+end-to-end throughput, and the exact cost of everything that is not a matmul. It is a real
+measurement of a real thing — five stages, one shared session, batching, backpressure,
+`embeddings.bin` — with the model-shaped hole labelled rather than papered over.
+
+| Measurement                                  | Target        | Actual              |
+| -------------------------------------------- | ------------- | ------------------- |
+| Five-stage throughput (fixture graph)        | ≥ 60 /s †     | **1,641 samples/s** |
+| Peak RSS, 400-file five-stage scan           | < 800 MB      | **17.5 MiB**        |
+| Peak RSS, 4× the files                       | flat          | 1.3 → 3.3 MiB       |
+| `run()` calls for 400 files at batch 16      | 25            | 25                  |
+| Inference runs, 50% duplicate corpus         | half          | **150 of 300**      |
+| `embeddings.bin`, 50% duplicate corpus       | 150 vectors   | **0.15 MiB**        |
+| Mel front-end, sparse vs. dense filterbank   | bit-identical | **bit-identical**   |
+
+† The target is stated against real CLAP and is not claimed by this row. The row is a
+regression guard: a pipeline that cannot clear a few hundred samples/s around a free model
+will not clear 60 around a real one.
+
+`embed_a_synthetic_library` — 400 sub-second one-shots, walk → decode → mel → embed →
+persist, CoreML bound. `duplicates_cost_nothing_to_embed` is the measurement that says what
+dedup is worth once inference is in the pipeline: half the corpus is byte-identical copies,
+and they cost neither a decode, nor a `run()`, nor a byte of `embeddings.bin` — six rows can
+point at one vector.
+
+### The mel filterbank was the whole pipeline
+
+The first run of `embed_a_synthetic_library` reported **218 samples/s**, against Phase 2's
+1,599 samples/s for decode + DSP alone. The batch-size sweep was flat across 1 → 64, which
+is the tell: if batch size does not matter, inference is not the bottleneck.
+
+It was the filterbank. Applying a 64 × 513 mel bank densely to 1,001 frames is 32.9 million
+f64 multiply-adds per file, and a mel filter is a triangle spanning about sixteen FFT bins —
+so essentially all of that arithmetic was summing zeros. `FrontEnd` now stores each row's
+nonzero span and multiplies only over it: **1,641 samples/s**, a 7.5× end-to-end gain, and
+the pipeline is back to costing what decode + DSP costs.
+
+The output is **bit-identical**, which matters because this is the parity surface
+(`overview.md` risk 4). The skipped terms are `0.0 * p` for finite `p`, and adding exact
+zero to an f64 accumulator changes nothing;
+`mel::tests::sparse_application_is_bit_identical_to_the_dense_one` compares every one of the
+64,064 values by bit pattern against the dense loop rather than by tolerance.
+
+### On the batch size
+
+| batch | samples/s | `run()`s | peak MiB |
+| ----- | --------- | -------- | -------- |
+| 1     | 1,546     | 300      | 5.3      |
+| 4     | 1,583     | 75       | 13.3     |
+| 8     | 1,595     | 38       | 7.1      |
+| 16    | 1,594     | 19       | 4.9      |
+| 32    | 1,558     | 10       | 32.1     |
+| 64    | 1,550     | 5        | 51.2     |
+
+Flat within noise, and that is the honest reading: **this sweep cannot tune the batch size**,
+because the thing batching amortizes — the cost of a `run()` — is nearly zero for a 130 KB
+graph. What it does establish is that the fixed per-call overhead outside the graph (tensor
+construction, dispatch, extraction, the mutex) is small, that nothing in the batcher degrades
+with size, and that memory grows with it as the arithmetic predicts.
+
+The default stays at 16, the low end of `overview.md` §3.4's 16–32. Re-run this sweep against
+the real model before changing it; that run is where the number gets chosen, and it is the
+run that decides whether one serialized session is enough or whether the fallback in
+`model/session.rs` — one session per worker — is needed.

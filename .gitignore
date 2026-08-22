@@ -37,6 +37,10 @@ src-tauri/gen/
 embeddings.bin
 embeddings.bin.compacting
 
+# The one-time ONNX export environment (scripts/export_clap_onnx.py). Developer-only and
+# never part of a build -- see overview.md 1 on why Python does not ship.
+.venv*/
+
 # macOS
 .DS_Store
 

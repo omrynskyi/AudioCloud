@@ -16,13 +16,16 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::time::Instant;
+use std::{sync::Arc, time::Instant};
 
 mod support;
 
 use audiobank_lib::{
     db::{queries, Database, EmbeddingStore, NewSample, SampleFeatures, SampleStatus},
-    pipeline::{features::Analyzer, scan_root, CancellationToken},
+    model::session::ModelSession,
+    pipeline::{
+        features::Analyzer, scan_root, scan_root_with, BatchConfig, CancellationToken, ScanOptions,
+    },
     EMBEDDING_DIM,
 };
 use half::f16;
@@ -533,5 +536,315 @@ fn scan_memory_is_flat_as_the_library_grows() {
         "scanning 4x the files cost {:.1} MiB against {:.1} MiB: memory is tracking file count",
         mib(large),
         mib(small)
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// Phase 4 -- the embedding pipeline
+// ---------------------------------------------------------------------------------------
+
+/// **These do not measure CLAP.** They measure everything around it.
+///
+/// The graph they run is `tests/fixtures/session/frames_major.onnx` -- ~130 KB of
+/// deterministic nonsense with the real export's input signature. Until the export in Phase
+/// 3 has actually been run, that is the only ONNX file this repository can produce a number
+/// from, and the number it produces is an *upper bound* on end-to-end throughput: everything
+/// except the matmuls, measured honestly, with the model-shaped hole clearly labelled.
+///
+/// Phase 4's exit criterion is >= 60 samples/s with real CLAP. Set [`MODEL_PATH_ENV`] to a
+/// real export and these become that measurement; leave it unset and they are the plumbing
+/// bound.
+const MODEL_PATH_ENV: &str = "AUDIOBANK_MODEL_PATH";
+
+/// Whether the session in hand is the real model rather than the fixture graph.
+fn is_real_model() -> bool {
+    std::env::var_os(MODEL_PATH_ENV).is_some()
+}
+
+/// A label for the graph a measurement ran against, printed next to every number.
+fn graph_label() -> &'static str {
+    if is_real_model() {
+        "REAL MODEL"
+    } else {
+        "fixture graph, not CLAP"
+    }
+}
+fn fixture_session() -> Option<Arc<ModelSession>> {
+    // `AUDIOBANK_MODEL_PATH` is the same escape hatch `tests/parity.rs` uses, and pointing
+    // it at the real export is what turns every number below from an upper bound into the
+    // measurement Phase 4's exit criterion actually asks for. Each benchmark prints which
+    // graph it ran, so a figure can never be read without knowing which one produced it.
+    let path = match std::env::var_os(MODEL_PATH_ENV) {
+        Some(path) => std::path::PathBuf::from(path),
+        None => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/session/frames_major.onnx"),
+    };
+    match ModelSession::open(&path) {
+        Ok(session) => Some(Arc::new(session)),
+        Err(e) => {
+            println!("SKIPPED: no fixture session ({e})");
+            None
+        }
+    }
+}
+
+/// Builds a library and scans it with a session attached, returning what it cost.
+fn embed_library(files: usize, batch: BatchConfig, session: &Arc<ModelSession>) -> EmbedRun {
+    let data = tempfile::tempdir().unwrap();
+    let library = tempfile::tempdir().unwrap();
+
+    for i in 0..files {
+        // Sub-second one-shots, which is what a drum library actually is. The long-window
+        // cost is measured separately by `analyze_a_full_window`.
+        write_wav(
+            &library
+                .path()
+                .join(format!("bank{:02}/hit_{i:05}.wav", i % 32)),
+            WavFormat::Pcm16,
+            48_000,
+            1,
+            &sine(80.0 + i as f32 * 1.3, 0.7, 0.8, 48_000),
+        );
+    }
+
+    let db = Database::open(data.path(), EMBEDDING_DIM).unwrap();
+    let root = db
+        .writer()
+        .add_root(library.path().to_str().unwrap(), None)
+        .unwrap();
+
+    let cancel = CancellationToken::new();
+    let mut options = ScanOptions::new(&cancel)
+        .with_session(Arc::clone(session))
+        .with_batch(batch);
+
+    let before = rss_bytes();
+    let started = Instant::now();
+    let report = scan_root_with(&db, root, &mut options).unwrap();
+    let elapsed = started.elapsed();
+    let peak = rss_bytes();
+
+    assert_eq!(
+        report.embedded as usize, files,
+        "not every file was embedded"
+    );
+    db.shutdown();
+
+    EmbedRun {
+        elapsed,
+        rss: peak.saturating_sub(before),
+        inferred: report.inferred,
+        batches: report.inference_batches,
+        files,
+    }
+}
+
+#[derive(Debug)]
+struct EmbedRun {
+    elapsed: std::time::Duration,
+    rss: u64,
+    inferred: u64,
+    batches: u64,
+    files: usize,
+}
+
+impl EmbedRun {
+    fn per_second(&self) -> f64 {
+        self.files as f64 / self.elapsed.as_secs_f64()
+    }
+}
+
+/// End-to-end throughput of the five-stage pipeline, and the peak RSS it costs.
+///
+/// The RSS assertion is the one that carries over to the real model unchanged: memory is
+/// bounded by queue depth times payload size (`overview.md` §3), and neither of those
+/// depends on how long a `run()` takes. The throughput figure does.
+#[test]
+#[ignore = "benchmark; run under --profile perf"]
+fn embed_a_synthetic_library() {
+    const FILES: usize = 400;
+
+    let Some(session) = fixture_session() else {
+        return;
+    };
+    println!("\n-- five-stage scan, {FILES} files --");
+    println!("  provider       {:>8}", session.provider().as_str());
+
+    let run = embed_library(FILES, BatchConfig::default(), &session);
+
+    println!("  wall clock     {:>8} ms", run.elapsed.as_millis());
+    println!("  throughput     {:>8.0} samples/s", run.per_second());
+    println!(
+        "  batches        {:>8} run() calls for {} spectrograms",
+        run.batches, run.inferred
+    );
+    println!("  peak RSS       {:>8.1} MiB", mib(run.rss));
+    println!("  ({})", graph_label());
+
+    // Against the real model this is Phase 4's exit criterion. Against the fixture graph it
+    // is a regression guard on the plumbing: a pipeline that cannot clear a few hundred
+    // samples/s around a near-free model will not clear 60 around a real one.
+    let floor = if is_real_model() { 60.0 } else { 200.0 };
+    assert!(
+        run.per_second() >= floor,
+        "{:.0} samples/s is below the {floor:.0} floor for this graph",
+        run.per_second()
+    );
+    assert!(
+        mib(run.rss) < 800.0,
+        "peak RSS {:.1} MiB exceeds the §7 budget",
+        mib(run.rss)
+    );
+}
+
+/// The batch-size tuning `overview.md` §3.4 defers to this phase.
+///
+/// It matters more than a normal tuning knob because inference is serialized behind one
+/// mutex (see `model::session`): the batch size is what decides how much of the pipeline is
+/// inside that critical section. A sweep against the fixture graph shows the *fixed*
+/// per-`run()` overhead -- session dispatch, tensor construction, extraction -- which is
+/// the part batching exists to amortize and the part that does not change when the graph
+/// gets bigger.
+#[test]
+#[ignore = "benchmark; run under --profile perf"]
+fn embed_batch_size_sweep() {
+    const FILES: usize = 300;
+
+    let Some(session) = fixture_session() else {
+        return;
+    };
+
+    println!("\n-- batch size sweep, {FILES} files --");
+    println!(
+        "  {:>5}  {:>12}  {:>8}  {:>10}",
+        "batch", "samples/s", "run()s", "peak MiB"
+    );
+
+    // The upper end of the sweep is not safe against the real model. HTSAT's activations
+    // scale with the batch, and batch 16 alone was measured at 11 GiB resident -- 32 and 64
+    // would put a 32 GB machine into swap and measure the pager rather than the model.
+    let sizes: &[usize] = if is_real_model() {
+        &[1, 2, 4, 8, 16]
+    } else {
+        &[1, 4, 8, 16, 32, 64]
+    };
+
+    let mut best = (0usize, 0.0f64);
+    for &size in sizes {
+        let run = embed_library(FILES, BatchConfig::of_size(size), &session);
+        println!(
+            "  {size:>5}  {:>12.0}  {:>8}  {:>10.1}",
+            run.per_second(),
+            run.batches,
+            mib(run.rss)
+        );
+        if run.per_second() > best.1 {
+            best = (size, run.per_second());
+        }
+    }
+
+    println!("  best: {} at {:.0} samples/s", best.0, best.1);
+    println!("  ({})", graph_label());
+}
+
+/// Dedup is worth more in this phase than in Phase 2, and this is the measurement that says
+/// by how much: a duplicate skips a decode *and* an inference, and stores no bytes.
+#[test]
+#[ignore = "benchmark; run under --profile perf"]
+fn duplicates_cost_nothing_to_embed() {
+    const FILES: usize = 300;
+
+    let Some(session) = fixture_session() else {
+        return;
+    };
+
+    let data = tempfile::tempdir().unwrap();
+    let library = tempfile::tempdir().unwrap();
+
+    // Half the corpus is copies, which is not unrealistic for a folder of sample packs that
+    // ship the same 909 kick under six names.
+    for i in 0..FILES {
+        let path = library.path().join(format!("hit_{i:05}.wav"));
+        if i % 2 == 1 {
+            std::fs::copy(library.path().join(format!("hit_{:05}.wav", i - 1)), &path).unwrap();
+            continue;
+        }
+        write_wav(
+            &path,
+            WavFormat::Pcm16,
+            48_000,
+            1,
+            &sine(80.0 + i as f32 * 1.3, 0.7, 0.8, 48_000),
+        );
+    }
+
+    let db = Database::open(data.path(), EMBEDDING_DIM).unwrap();
+    let root = db
+        .writer()
+        .add_root(library.path().to_str().unwrap(), None)
+        .unwrap();
+    let cancel = CancellationToken::new();
+    let mut options = ScanOptions::new(&cancel).with_session(Arc::clone(&session));
+
+    let started = Instant::now();
+    let report = scan_root_with(&db, root, &mut options).unwrap();
+    let elapsed = started.elapsed();
+
+    let stored = db.embeddings().lock().unwrap().len_bytes();
+    println!("\n-- half a library of duplicates, {FILES} files --");
+    println!("  wall clock     {:>8} ms", elapsed.as_millis());
+    println!(
+        "  throughput     {:>8.0} samples/s",
+        FILES as f64 / elapsed.as_secs_f64()
+    );
+    println!("  inferred       {:>8} of {FILES}", report.inferred);
+    println!("  embeddings.bin {:>8.2} MiB", mib(stored));
+
+    assert_eq!(
+        report.embedded as usize, FILES,
+        "a duplicate lost its vector"
+    );
+    assert_eq!(
+        report.inferred as usize,
+        FILES / 2,
+        "the model ran on duplicate audio"
+    );
+    assert_eq!(
+        stored,
+        (FILES as u64 / 2) * EMBEDDING_DIM as u64 * 2,
+        "duplicates stored their own copy of a vector they share"
+    );
+    db.shutdown();
+}
+
+/// The soak: memory has to stay flat as the corpus grows, with inference in the pipeline.
+///
+/// Same shape as `scan_memory_is_flat_as_the_library_grows`, and it is a separate test
+/// because the embed stage adds the one queue in the pipeline that is *supposed* to be full
+/// -- 64 spectrograms at 256 KB. If backpressure through it is wrong, this is where four
+/// times the files costs four times the memory.
+#[test]
+#[ignore = "benchmark; run under --profile perf"]
+fn embed_memory_is_flat_as_the_library_grows() {
+    let Some(session) = fixture_session() else {
+        return;
+    };
+
+    let small = embed_library(250, BatchConfig::default(), &session);
+    let large = embed_library(1000, BatchConfig::default(), &session);
+
+    println!("\n-- embed memory against library size --");
+    println!("     250 files  {:>8.1} MiB", mib(small.rss));
+    println!("   1000 files  {:>8.1} MiB", mib(large.rss));
+    println!(
+        "   ratio       {:>8.2}x for 4x the files",
+        large.rss as f64 / small.rss.max(1) as f64
+    );
+
+    assert!(
+        large.rss < small.rss.max(16 * 1024 * 1024) * 2,
+        "4x the files cost {:.1} MiB against {:.1} MiB -- a stage is accumulating",
+        mib(large.rss),
+        mib(small.rss)
     );
 }
