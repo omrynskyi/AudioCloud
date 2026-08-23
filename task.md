@@ -531,31 +531,91 @@ during a live scan; TypeScript types are generated and CI-enforced.
 
 *Goal: 60 fps orbit over 50,000 real points.*
 
-- [ ] **First task, before anything else:** query `ALIASED_POINT_SIZE_RANGE` in WKWebView
+- [x] **First task, before anything else:** query `ALIASED_POINT_SIZE_RANGE` in WKWebView
       and record the actual cap. If it is too low for the intended look, switch to the
       `InstancedMesh` quad path now — not in Phase 10. (`overview.md` §5.1)
-- [ ] `<Canvas frameloop="demand" dpr={[1,2]} gl={{antialias:false}}>`
-- [ ] `scene/buffers.ts`: build one `BufferGeometry` from the ArrayBuffer; interleave the
+      > **`[1, 511]` device pixels**, measured in a real WKWebView by
+      > `scripts/probe_webgl_caps.mjs`. Eight times the 64 px floor §5.1 sets, so the
+      > `THREE.Points` path stands and the quad path is not needed.
+- [x] `<Canvas frameloop="demand" dpr={[1,2]} gl={{antialias:false}}>`
+- [x] `scene/buffers.ts`: build one `BufferGeometry` from the ArrayBuffer; interleave the
       planar XYZ into the position attribute; `DynamicDrawUsage` on color and size only
-- [ ] `points.vert.glsl` / `points.frag.glsl`: distance-attenuated `gl_PointSize` clamped
+- [x] `points.vert.glsl` / `points.frag.glsl`: distance-attenuated `gl_PointSize` clamped
       to the queried range, soft `smoothstep` circular sprite, depth fade, additive blend
       with `depthWrite: false`
-- [ ] Orbit / pan / zoom controls; `invalidate()` on interaction only
-- [ ] `scene/picking.ts`: ID-color pass to an offscreen target, 1-px `readPixels`;
+- [x] Orbit / pan / zoom controls; `invalidate()` on interaction only
+- [x] `scene/picking.ts`: ID-color pass to an offscreen target, 1-px `readPixels`;
       **on-demand only** — click always, hover throttled to ~20 Hz, never during a drag
-- [ ] Hover highlight and selection ring via direct attribute mutation + `needsUpdate` —
+      > A 21-px window rather than a literal 1 px. A point whose *centre* falls outside the
+      > viewport is clipped before rasterization, so a 1×1 pick can only ever hit a point
+      > centred on that one pixel however large its sprite is. See `scene/picking.ts`.
+- [x] Hover highlight and selection ring via direct attribute mutation + `needsUpdate` —
       **no React state per point**
-- [ ] Color-by-feature: fetch the feature column as raw bytes, map to color in JS, write
+      > Two uniforms rather than attribute mutation. Same rule, less work: hover is one
+      > point out of 50,000, and re-uploading a 200 KB attribute twenty times a second to
+      > change one of them is what the rule was written against. See `scene/materials.ts`.
+- [x] Color-by-feature: fetch the feature column as raw bytes, map to color in JS, write
       the typed array once
-- [ ] Filter dimming: filtered-out points shrink and desaturate rather than disappearing,
+- [x] Filter dimming: filtered-out points shrink and desaturate rather than disappearing,
       so the shape of the corpus stays legible
-- [ ] Vertex-shader LOD; fragment discard below a size threshold
-- [ ] `webglcontextlost` handler that rebuilds from the cached ArrayBuffer without refetch
-- [ ] Frame-time profiling over a 30 s scripted orbit
+- [x] Vertex-shader LOD; fragment discard below a size threshold
+- [x] `webglcontextlost` handler that rebuilds from the cached ArrayBuffer without refetch
+- [x] Frame-time profiling over a 30 s scripted orbit
 
 **Exit criteria:** sustained **< 16.6 ms p99** frame time orbiting 50,000 points on Apple
 Silicon; idle canvas renders **0 frames/s**; GPU pick returns the correct sample under a
 dense cluster; context loss recovers without a refetch.
+
+**Three of the four are met and measured** (`npm run profile`, recorded in
+[`BENCHMARKS.md`](BENCHMARKS.md)): the idle canvas renders zero frames over three seconds,
+the GPU pick agrees with an independent CPU model on 200 of 200 pixels each carrying a stack
+of overlapping sprites, and a forced context loss recovers and draws again from the same
+`ArrayBuffer` object it was holding before.
+
+**The frame-time criterion is not met as stated, and the reason is the measurement rather
+than the scene.** WebKit's `requestAnimationFrame` has a p99 of **23 ms over a blank page**
+on this machine — no WebGL context, no scene, nothing to draw — against a 16 ms median. The
+criterion's absolute figure is below the floor of the environment it is being measured in,
+so it cannot be met there by any renderer. What the 50,000-point orbit measures is p50 =
+16 ms, exactly the display interval, and a p99 statistically indistinguishable from the same
+loop with the cloud hidden. Phase 10's Instruments pass is where a real GPU-side number
+comes from; WebKit exposes no `EXT_disjoint_timer_query_webgl2`, so in-page there is nothing
+better to be had.
+
+### Findings
+
+1. **The point-size cap was never the risk `overview.md` §5.1 thought it was.** The document
+   warns the maximum `gl_PointSize` "can be as low as 64 px" under ANGLE-on-Metal and makes
+   the whole `Points`-versus-`InstancedMesh` decision conditional on it. WKWebView on Apple
+   GPU reports `[1, 511]`. The check still runs at startup in `scene/caps.ts` and the shader
+   clamps to whatever it finds, because a cap measured on one Mac is not a cap promised on
+   another — but the architecture question is closed.
+
+2. **Measuring in WebKit needed its own tooling, and it earned its place.** `overview.md`
+   §7 specifies "Chrome DevTools trace", and Chrome is not the engine this ships in.
+   `scripts/webview_eval.swift` is a 200-line WKWebView harness that loads a page, evaluates
+   an expression and prints the JSON it resolves to; both Phase 7 measurements run through
+   it. Two things it turned up that a Chrome measurement would have hidden: the missing GPU
+   timer extension, and the rAF floor above.
+
+3. **`aId` is the cloud index, not the sample id.** A `float` attribute is exact to 2^24;
+   sample ids are `i64` from SQLite and grow with every rescan of an edited library. Picking
+   by id would have started returning a neighbouring sample somewhere past sixteen million
+   rows, silently. Indexing also makes decoding a pick a subscript rather than a search.
+
+4. **The pick check found a real bug, because it was written against an independent model.**
+   `Picker` converted CSS coordinates to device pixels with `Math.round`, which sends the
+   exact centre of pixel *n* to pixel *n + 1* — every pick landed one pixel off, which is
+   invisible by eye in a cluster and wrong every single time. It surfaced as 181 of 200
+   disagreements with the CPU reference. The first version of that reference was also wrong,
+   in a more interesting way: it asked which point's *centre* was on the cursor's pixel, when
+   what a pick returns — and should return — is the nearest point whose *sprite covers* it.
+
+5. **Coordinates are not normalized on arrival, and must not be.** Phase 5 goes to real
+   trouble to keep a layout stable across re-fits, and Procrustes preserves scale. Rescaling
+   the cloud into a unit cube on load would mean that adding 5,000 samples moves every point
+   on screen by two percent even though the alignment worked perfectly. The buffer keeps the
+   numbers the core sent and the camera adapts; see `scene/framing.ts`.
 
 ---
 

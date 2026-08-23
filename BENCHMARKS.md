@@ -328,3 +328,136 @@ Absent from this table, deliberately: **end-to-end load → first frame**, which
 neither of which exists yet, and measuring two thirds of it now would be a figure nobody could
 compare against the one Phase 7 will produce. What Phase 6 owes it is the two halves above,
 which sum to about 11 ms.
+
+---
+
+## Phase 7 — 3D visualization
+
+Everything here is measured in a real WKWebView on Apple GPU, not in a desktop browser.
+`scripts/webview_eval.swift` is a WKWebView that loads a page, evaluates one expression and
+prints the JSON it resolves to; `scripts/probe_webgl_caps.mjs` and
+`scripts/orbit_profile.mjs` drive it. That matters more here than anywhere else in the
+project: `overview.md` §5.1's entire caveat is that WebKit runs WebGL through ANGLE on Metal
+and does not behave like Chrome, so a number from Chrome is not evidence about this app.
+
+```sh
+npm run probe:webgl     # the point-size cap, and the rest of the context's limits
+npm run profile         # builds the harness, then the 30 s orbit and the exit criteria
+```
+
+### The first task: `ALIASED_POINT_SIZE_RANGE`
+
+| Parameter                            | Value                    |
+| ------------------------------------ | ------------------------ |
+| `ALIASED_POINT_SIZE_RANGE`           | **`[1, 511]` device px** |
+| ...in CSS px at dpr 2                | `[0.5, 255.5]`           |
+| Context                              | WebGL 2.0, GLSL ES 3.00  |
+| Unmasked vendor / renderer           | Apple Inc. / Apple GPU   |
+| `EXT_disjoint_timer_query_webgl2`    | **absent**               |
+| `WEBGL_lose_context`                 | present                  |
+
+511 px is **eight times** the 64 px floor at which `overview.md` §5.1 says to abandon
+`THREE.Points` for `InstancedMesh` quads. The sprite path stands, and the architectural
+question the roadmap put first in the phase is closed on the first day rather than
+discovered in Phase 10. `scene/caps.ts` still performs the same query at startup and the
+shader clamps to whatever it returns, because this is one Mac.
+
+The two extension rows are not incidental. **No GPU timer** means WebKit will not tell a page
+how long the GPU spent on a frame, so `overview.md` §7's "`WebGLRenderer.info` + Chrome
+DevTools trace" has no in-engine equivalent and the frame-time number below has to be built
+out of frame intervals instead. **`WEBGL_lose_context` present** means the context-loss
+criterion is testable for real rather than by inspection.
+
+### The 30-second scripted orbit
+
+50,000 synthetic points in the real `ABPC` wire format, clustered the way UMAP output
+clusters, in a 1440×900 window at dpr 2 — a 2880×1800 drawing buffer.
+
+| Measurement                                | Target        | Actual                       |
+| ------------------------------------------ | ------------- | ---------------------------- |
+| Frame interval, p50                        | —             | **16.00 ms** = the display   |
+| Frame interval, p99                        | < 16.6 ms     | **33 ms** — see below        |
+| CPU inside `render()`, p99                 | —             | **2 ms**                     |
+| Draw calls per frame                       | 1             | **1** (50,000 points)        |
+| Idle frames, 3 s after the orbit           | 0             | **0**                        |
+| Decode + interleave + geometry build       | —             | **~1 ms**                    |
+| Page start → first frame                   | < 300 ms      | **91–115 ms**                |
+| Hover pick, p50 / p99                      | —             | **2 ms / 9 ms**              |
+| Pick agreement with a CPU model            | correct       | **200 / 200**                |
+| Context loss → drawing again, same buffer  | no refetch    | **yes**                      |
+
+And the controls, measured in the same page, in the same run, for the same wall time:
+
+| Control                                        | p50      | p95   | p99       |
+| ---------------------------------------------- | -------- | ----- | --------- |
+| `requestAnimationFrame` on a blank page         | 16 ms    | 20 ms | **23 ms** |
+| The same orbit loop with the cloud hidden       | 16 ms    | 24 ms | **37 ms** |
+| The same orbit loop drawing 50,000 points       | 16 ms    | 24 ms | **33 ms** |
+
+### On the frame-time row, which is the one that fails
+
+The criterion is stated as an absolute: p99 under 16.6 ms. As measured it is 33 ms, and the
+honest reading of that number is not "the renderer is twice too slow".
+
+**An empty page in this engine has a p99 of 23 ms.** No WebGL context, no scene, no
+JavaScript beyond an `requestAnimationFrame` loop that increments a counter. About one frame
+in a hundred misses its vsync deadline for reasons entirely outside this project, and the
+criterion's threshold is below that floor — no renderer, however fast, can meet 16.6 ms p99
+where the empty case is 23. The third control settles what the scene itself costs: the same
+loop with `points.visible = false` measures p99 **37 ms**, which is *worse* than the run
+drawing all 50,000 points. Two samples of the same noise. Drawing the cloud is not
+detectable in this measurement.
+
+What can be said positively, and is:
+
+- **p50 is 16 ms, exactly the display interval**, in every configuration. The common case is
+  the display's own rate, which is what "60 fps orbit" means.
+- **CPU time inside `render()` is 2 ms at p99**, so the main thread is nowhere near the
+  budget and cross-cutting rule 1 holds with room to spare.
+- **One draw call for 50,000 points**, which is the structural claim §5.1 makes and the
+  reason the sprite path was chosen.
+- Point count does not move any of it: at **200** points the p99 was 24 ms, the same tail.
+
+What would actually settle the criterion is a GPU-side measurement, and WebKit does not
+expose one. That is Phase 10's Instruments pass against the real app, and it is the right
+place for it: `task.md` already assigns the Instruments work there, and Metal System Trace
+sees the frame the way the driver does rather than the way a page's timer can.
+
+### On the pick check, and the bug it found
+
+"GPU pick returns the correct sample under a dense cluster" is not a number, so it was made
+into one. `src/profile/checks.ts` reimplements the sizing chain from `points.vert.glsl` in
+JavaScript — projection, depth fade, LOD shrink, the clamp to the device's point-size range,
+the sub-pixel discard — and asks which point that model says should win on a given pixel.
+Two implementations of one rule, in two languages, compared on 200 pixels each carrying a
+stack of four to six overlapping sprites.
+
+It found a real bug immediately: 181 of 200 disagreements, because `Picker` converted CSS
+coordinates to device pixels with `Math.round`, and `Math.round(n + 0.5)` is `n + 1`. Every
+pick was landing one pixel off — invisible by eye in a cluster, wrong every single time.
+
+The first version of the reference was wrong too, and more interestingly. It asked which
+point's *centre* lay on the cursor's pixel. The GPU was right and the model was not: points
+are sprites several pixels across, so the point under the cursor is the one whose sprite
+*covers* that pixel, and among those, the one nearest the camera. That is what the depth test
+in `pick.frag.glsl` produces and what a person means by clicking on something.
+
+Current agreement is 200/200 — 171 exact, 29 where the GPU returned a different point that
+also covers the cursor and is no further from the camera, which is the model declining to
+have an opinion about a sprite within three quarters of a pixel of its edge. Zero behind,
+zero uncovered, zero missed.
+
+### On the measurement window, which took longer than the renderer
+
+macOS suspends `requestAnimationFrame` for a window it considers occluded, and it will
+consider a window occluded for sitting behind a full-screen terminal. In that state the page
+reports `document.visibilityState === "hidden"`, runs **zero** frames, and the harness hangs
+— indistinguishable, from the outside, from a bug in the scene. Several confusing hours were
+spent on the scene before the page was asked what it thought its own visibility was.
+
+`scripts/webview_eval.swift` now joins all Spaces, activates, and disables WebKit's window
+occlusion detection outright through SPI. That last one is unacceptable in a shipped app and
+is fine in a developer measurement tool that is never bundled; the alternative is a benchmark
+whose ability to run depends on which window happens to be in front. It also warns on stderr
+if the system reports the window occluded anyway, so a throttled number cannot be recorded as
+a real one.

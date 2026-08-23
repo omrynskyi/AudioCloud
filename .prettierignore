@@ -1,4 +1,6 @@
 dist/
+dist-profile/
+build/
 node_modules/
 src/bindings/
 src-tauri/target/

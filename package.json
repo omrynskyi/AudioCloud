@@ -6,6 +6,9 @@
   "scripts": {
     "dev": "vite",
     "build": "npm run typecheck && vite build",
+    "profile:build": "vite build --mode profile",
+    "profile": "npm run profile:build && node scripts/orbit_profile.mjs",
+    "probe:webgl": "node scripts/probe_webgl_caps.mjs",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json",
     "lint": "eslint .",

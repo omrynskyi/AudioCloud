@@ -6,8 +6,8 @@ A spatial browser for large sample libraries. Samples are embedded with CLAP, pr
 - [`overview.md`](overview.md) — the architecture.
 - [`task.md`](task.md) — the implementation roadmap, phase by phase.
 
-**Status: Phase 6 implemented, Phase 3's gate not yet passed.** An empty window builds and
-launches, and behind it the ingest pipeline is real and complete: point it at a folder of
+**Status: Phase 7 implemented, Phase 3's gate not yet passed.** The window now draws the
+map, and behind it the ingest pipeline is real and complete: point it at a folder of
 audio and it walks, hashes, deduplicates, decodes, analyzes, computes CLAP's log-mel
 spectrogram, embeds it in batches through one shared `ort` session, and writes both the DSP
 features and the vector — with progress coalesced to 10 Hz, cancellation that keeps what it
@@ -26,6 +26,14 @@ than as strings, and the payloads that are the size of the library take the bina
 transport: the 50,000-point cloud is **one 800 KB `ArrayBuffer`** that becomes four typed
 arrays with no parse and no copy. TypeScript types are generated from the Rust structs and
 CI-enforced. See [Phase 6 status](#phase-6-status).
+
+Phase 7 draws it. 50,000 points are one `BufferGeometry` and **one draw call**, shaded by a
+pair of hand-written GLSL programs; hovering and selecting a point mutate two uniforms rather
+than any React state, and an idle canvas renders exactly zero frames. Picking is a GPU pass
+into a 21-pixel window, and it agrees with an independently written CPU model on 200 out of
+200 crowded pixels. The first thing the phase did was ask WKWebView what its maximum
+`gl_PointSize` actually is — `[1, 511]`, eight times the floor at which the whole layer would
+have had to be rebuilt as textured quads. See [Phase 7 status](#phase-7-status).
 
 What is **not** done is the one thing Phase 3 is actually for. Exporting the ONNX file and
 recording the reference embeddings requires running LAION-CLAP under PyTorch, which is a
@@ -72,7 +80,15 @@ cargo tauri dev          # vite + the Rust shell, hot-reloading both
 npm run typecheck        # tsc --noEmit over src/ and the config files
 npm run lint             # eslint
 npm run format           # prettier
+
+npm run probe:webgl      # what WKWebView's WebGL will actually do (Phase 7)
+npm run profile          # the 30 s scripted orbit and Phase 7's exit criteria
 ```
+
+The last two compile [`scripts/webview_eval.swift`](scripts/webview_eval.swift) on demand,
+so they need the Xcode Command Line Tools and a **visible display** — `requestAnimationFrame`
+does not run in a window macOS considers occluded, and a frame time measured in one would be
+a fiction. `npm run profile` exits non-zero if an exit criterion fails.
 
 The app data directory — the SQLite database, its WAL, and `embeddings.bin` — is
 `~/Library/Application Support/com.audiobank.app/`, created 0700 on first run. Deleting it
@@ -81,7 +97,8 @@ roots, tags, and collections.
 
 ### Driving it
 
-There is no UI yet — Phase 9 builds the shell. Until then the real IPC surface is reachable
+The map renders, but there is nothing to drive it with yet — Phase 9 builds the shell. Until
+then the real IPC surface is reachable
 from the devtools console under `cargo tauri dev`, and it is the same surface the app will
 ship with; the debug-only `dev_*` commands that stood in for it through Phases 2–5 are gone.
 
@@ -211,6 +228,68 @@ embeddings that are the parity oracle. Until then the gate in
    in both Python and Rust rather than committed as 19 MB of wavs, and each carries a
    waveform probe — so a drift between the two generators reports itself instead of arriving
    later disguised as a parity failure.
+
+## Phase 7 status
+
+Three of Phase 7's four exit criteria are met and measured; the fourth fails on the
+measurement rather than on the renderer. Run them yourself:
+
+```sh
+npm run probe:webgl     # ALIASED_POINT_SIZE_RANGE, in a real WKWebView
+npm run profile         # the 30 s scripted orbit and every exit criterion
+```
+
+Both drive [`scripts/webview_eval.swift`](scripts/webview_eval.swift), a small WKWebView that
+loads a page, evaluates one expression and prints the JSON it resolves to. That exists
+because `overview.md` §5.1's entire caveat is that WebKit runs WebGL through ANGLE on Metal
+and does not behave like Chrome — a 60 fps number from a desktop browser is not evidence
+about the engine this ships in. Numbers in [`BENCHMARKS.md`](BENCHMARKS.md).
+
+**The point-size cap is `[1, 511]` device pixels**, so `THREE.Points` stands and the
+`InstancedMesh` quad path is not needed. `overview.md` §5.1 makes that decision conditional
+on a cap that "can be as low as 64 px" and `task.md` puts the query first in the phase for
+exactly that reason; it is eight times the floor. [`scene/caps.ts`](src/scene/caps.ts) runs
+the same query at startup and the shader clamps to what it finds, because this is one Mac.
+
+**One draw call, and React is not in the frame loop.** The whole library is one
+`BufferGeometry`: `position` static, `aColor` and `aSize` `DynamicDrawUsage`, `aId` the
+picking payload. Per-frame cost is a dozen uniform writes and one `gl.drawArrays`. Hover and
+selection are two uniforms rather than attribute mutation — the same rule as
+`overview.md` §5.6 and less work than the roadmap's spelling of it, since re-uploading a
+200 KB attribute twenty times a second to change one point out of 50,000 is what the rule was
+written against.
+
+**`aId` is the cloud index, not the sample id.** A `float` attribute is exact to 2^24 and
+sample ids are `i64` that grow with every rescan of an edited library, so picking by id would
+start returning a neighbouring sample past sixteen million rows, silently and with no error
+anywhere. Index zero is shifted to one so the cleared background cannot decode to a point.
+
+**The picking window is 21 pixels, not the 1 px in §5.3.** A point whose _centre_ falls
+outside the viewport is clipped before rasterization, so a literal 1×1 pick can only hit a
+point centred on that exact pixel however large the sprite covering it is. A small window
+searched outward from the middle gives the better semantics anyway: the nearest sprite to the
+cursor, and among those, the one nearest the camera.
+
+**The frame-time criterion is the one that fails, and the control is why.** The orbit
+measures p50 = 16 ms — exactly the display interval — and p99 = 33 ms against a 16.6 ms
+target. But `requestAnimationFrame` on a **blank page** in this same WebView has a p99 of
+23 ms, and the same orbit loop with the cloud hidden measures 37 ms. The threshold is below
+the floor of the environment it is being measured in, and drawing 50,000 points is not
+detectable above that floor. WebKit exposes no `EXT_disjoint_timer_query_webgl2`, so there is
+no GPU clock available to a page; a real answer needs Phase 10's Instruments pass, which
+`task.md` already assigns there.
+
+**Coordinates are not normalized on arrival.** Phase 5 works hard to keep a layout stable
+across re-fits and Procrustes preserves scale; rescaling the cloud into a unit cube on load
+would move every point on screen by two percent when 5,000 samples are added, even though the
+alignment worked perfectly. The buffer keeps the numbers the core sent and the camera adapts
+— [`scene/framing.ts`](src/scene/framing.ts).
+
+**What is not here.** The shell. [`App.tsx`](src/App.tsx) fetches the cloud, wires the two
+data props and renders a one-line readout, which is the IPC-to-scene boundary Phase 9 will
+inherit; the panels, the search field and the filter UI are Phase 9's. Nothing yet writes to
+`useSceneStore.setColorBy` or `setFilter`, so those paths are exercised by the harness rather
+than by a user.
 
 ## Phase 6 status
 
@@ -382,6 +461,13 @@ decode stage, which drops the only `Analyzed` sender, which ends the persist sta
 no separate shutdown protocol, and adding one would give the pipeline a second way to
 terminate that the first way does not know about.
 
+On the frontend, [`src/scene/`](src/scene/) is the whole visualization layer and
+[`src/ipc/`](src/ipc/) is the only code that calls `invoke`. The two do not meet: the scene
+does no IPC and the store holds no point data, so something has to fetch the bytes and hand
+them over, and that is the shell in [`App.tsx`](src/App.tsx). [`src/profile/`](src/profile/)
+is the Phase 7 measurement harness — it mounts the real scene over a synthetic library and is
+built only by `vite build --mode profile`, never into the app.
+
 `model/session.rs` is the **only** file in the crate permitted to name an `ort` type
 (cross-cutting rule 7). `ort` is pinned to an exact release candidate whose API moves
 between rcs; keeping it behind one file means an upgrade has one blast radius. What leaves
@@ -451,3 +537,32 @@ that module is `f32`, a `Provider`, and a `SessionError`.
   wrong number of mel bins will accept the wrong number of mel bins.
 - **`rust-version` moved from 1.77 to 1.88**, which is what `ignore` 0.4.33, `rubato` 5.0 and
   `rayon` 1.12 — the versions `task.md` Phase 2 pins — require. CI builds on stable.
+- **Hover and selection are uniforms, not attribute mutations.** `task.md` Phase 7 asks for
+  "direct attribute mutation + `needsUpdate`", and the rule behind that — no React state per
+  point — is kept exactly. The mechanism is not: hover changes one point out of 50,000, and
+  flagging `aColor` or `aSize` for upload re-sends a 200 KB buffer twenty times a second to
+  change one of them. Two `float` uniforms compared in the vertex shader cost nothing and
+  cannot drift out of sync with the picking pass, which reads the same values. Attribute
+  mutation is still how colour-by and filter dimming work, because those genuinely are
+  per-point.
+- **The pick window is 21 device pixels, not one.** `overview.md` §5.3 describes "a 1×1
+  scissored" read. Point primitives are clipped by their centre, so a 1×1 viewport can only
+  return a point whose centre is on that exact pixel — the sprite covering the cursor is
+  never drawn if its centre is a pixel away. Widening the window and searching outward from
+  the middle also changes the semantics for the better: the nearest sprite to the cursor,
+  and among those, the nearest to the camera.
+- **Frame time is measured from frame intervals, not from a GPU timer or a Chrome trace.**
+  `overview.md` §7 specifies "`WebGLRenderer.info` + Chrome DevTools trace". Chrome is not
+  the engine this ships in, and WebKit exposes no `EXT_disjoint_timer_query_webgl2` — there
+  is no GPU clock available to a page at all. What the harness reports instead is the
+  interval between rendered frames, the CPU time inside `render()`, the dropped-frame count,
+  and two controls that establish what the engine's own tail is. See
+  [`BENCHMARKS.md`](BENCHMARKS.md) on why the absolute criterion cannot be met by any
+  renderer in that environment.
+- **`scripts/webview_eval.swift` uses one piece of WebKit SPI.**
+  `-[WKWebView _setWindowOcclusionDetectionEnabled:]`, guarded by `responds(to:)`. macOS
+  suspends `requestAnimationFrame` for a window it considers occluded — including one merely
+  sitting behind a full-screen terminal — and in that state the page runs zero frames and the
+  harness looks like it has hung. The alternative is a benchmark whose ability to run depends
+  on which window happens to be in front. This file is a developer tool in `scripts/`; it is
+  never bundled and no SPI appears anywhere in the app.
