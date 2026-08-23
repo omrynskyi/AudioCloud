@@ -170,3 +170,111 @@ The default stays at 16, the low end of `overview.md` §3.4's 16–32. Re-run th
 the real model before changing it; that run is where the number gets chosen, and it is the
 run that decides whether one serialized session is enough or whether the fallback in
 `model/session.rs` — one session per worker — is needed.
+
+## Phase 5 — Projection
+
+| Measurement                              | Target      | Actual                 |
+| ---------------------------------------- | ----------- | ---------------------- |
+| UMAP re-fit, 50,000 × 512                | < 5 min     | **58–70 s**            |
+| PCA re-fit, 50,000 × 512                 | —           | 0.8–0.9 s              |
+| Peak RSS, UMAP re-fit                    | see below   | **2.95 GiB**           |
+| Peak RSS, PCA re-fit                     | —           | 95 MiB                 |
+| Incremental placement, 500 into 50,000   | ≪ a re-fit  | **2.7 s (24× UMAP)**   |
+| Median displacement, 5% import (PCA)     | small       | < 10% of diagonal      |
+| Median displacement, 5% import (UMAP)    | small       | **11–16%**             |
+| ...the same UMAP fits, unaligned         | —           | 24–87%                 |
+
+`refit_50k_by_512` — 50,000 L2-normalized 512-dimensional vectors around 24 cluster centers,
+projected by both projectors over the same `embeddings.bin`. PCA is **seventy times cheaper**
+than UMAP, and that ratio is what makes it a usable fallback rather than a nominal one: a
+library that trips the disconnected-graph guard gets a map in under a second instead of
+waiting a minute to be told no.
+
+**Run the two Phase 5 benchmarks in separate processes.** The wall-clock figures are stable
+either way, but a UMAP re-fit leaves the process's resident set somewhere the next
+measurement's baseline cannot interpret.
+
+The RSS figures here are a **sampled high-water mark**, not the before/after delta the other
+phases use. `ps -o rss` reports current resident size, and for a re-fit that allocates
+gigabytes and frees them the delta measures whatever the allocator had not yet returned —
+the same fit reported 1.6 GiB one run and 2.9 GiB the next. `PeakRss` polls every 50 ms
+instead. Everywhere else in this file the delta is honest, because those benchmarks peak at
+the end.
+
+### The 3 GB is a gap in §7, not a pass
+
+**A 50,000-sample UMAP re-fit peaks at 2.95 GiB.** §7 budgets peak RSS during a *scan* at
+800 MB and has no row for a re-fit, so this violates nothing as written — and treating that
+as a pass would be reading the table instead of the machine. It is 3.7× the scan budget, on
+an application that ships to 8 GB Macs, in a job the user can trigger from a menu. §7 is
+missing a row and Phase 10 should add it.
+
+Where it goes: `hnsw_rs` stores the vectors it is given, so the index alone is 102 MB of f32
+plus its graph; `annembed` then builds a sparse Laplacian, runs a randomized SVD over it, and
+keeps gradient state per edge — 50,000 nodes × 15 neighbours is 750,000 edges. None of that
+is under AudioBank's control. The mmap discipline in `projection/umap.rs` covers the part
+that is: vectors reach the index 1,024 rows at a time and no second copy of the matrix is
+ever materialized, which is why PCA over the same corpus peaks at 95 MiB.
+
+Two mitigations exist today and neither is sufficient. A full re-fit is a background job at
+background QoS rather than something an import triggers (§3.8), so the exposure is
+occasional; and `Refit::with_fallback` means the app has a projector that costs 95 MiB when
+UMAP will not run. What Phase 10 should actually weigh is capping the corpus a single re-fit
+sees, chunking the fit, or holding the index in f16 — and, either way, measuring this on an
+8 GB machine rather than a 32 GB one.
+
+### On incremental placement, and the loop order that decides it
+
+The argument for the incremental path is partly speed and mostly the guarantee: no existing
+point moves, exactly, because no existing row is written. The benchmark asserts both.
+
+The speed half is measured against **both** re-fits rather than the flattering one.
+Placement is 23× cheaper than the UMAP re-fit it exists to avoid, which is the comparison
+that matters — a full re-fit means a UMAP re-fit in production. It is about three times
+*more* expensive than a PCA re-fit, and that is not a defect to tune away: brute-force
+placement of 500 points against 50,000 anchors is 12.8 GFLOP, and PCA's covariance pass over
+the same corpus is 6.6 GFLOP. Comparable work costs comparable time. What is not
+comparable is the memory: placement peaks at 69 MiB against UMAP's 2.95 GiB.
+
+What *was* a defect, and what only the benchmark caught, is the loop order. The first
+implementation ran **5.4 s** — three and a half times the PCA re-fit — because it was
+parallel over newcomers, each scanning every anchor, which re-reads and re-widens all 50,000
+mmap rows once per newcomer: 25 million row decodes for 500 placements. Transposed, holding
+the newcomers' vectors and widening each anchor row exactly once, it is the same arithmetic
+with a hundredth of the memory traffic and a sequential mmap walk per thread.
+
+### The optimization that made it slower
+
+| Dot product, 20,000 × 32 × 512 | Throughput   |
+| ------------------------------ | ------------ |
+| `iter().zip().map().sum()`     | 2.0 GFLOP/s  |
+| eight independent accumulators | 1.1 GFLOP/s  |
+
+The inner loop of the placement pass is a 512-element dot product, and the textbook thing to
+do to one is split the sum across independent accumulators: floating-point addition is not
+associative, so a single accumulator is a serial dependency chain the compiler is not allowed
+to reassociate, and eight lanes states that the reassociation is acceptable.
+
+It is **1.8× slower**. LLVM already vectorizes the iterator form on aarch64, and the
+hand-written version replaces good autovectorized code with worse hand-rolled code. The naive
+loop stayed; `lane_split_versus_serial_dot` is the A/B, kept in the tree so the idea does not
+get had a second time.
+
+### On the two displacement figures
+
+`task.md` Phase 5 asks that a re-fit with 5% new data leave existing points "substantially in
+place after alignment". Measured as the median distance a pre-existing point moves, over the
+diagonal of the cloud it moved in — an absolute distance means nothing across layouts whose
+scale is arbitrary and then rescaled again by Procrustes.
+
+PCA is stable more or less by construction, because `pca.rs` canonicalizes eigenvector signs.
+**UMAP is the case the criterion is actually about**, and there the aligned median is 11–16%
+against 24–87% for the same fits unaligned. That 24–87% spread is itself the point: an
+unaligned UMAP re-fit's orientation is a coin flip, and sometimes the coin lands close.
+
+Which is also why the *assertion* in `alignment_can_never_make_a_umap_layout_move_further` is
+not an effect size. Procrustes minimizes the sum of squared distances over the
+correspondences across all similarity transforms, and the identity is one of those, so the
+aligned RMS can never exceed the unaligned RMS — on any layout, on any run. Asserting on the
+effect size instead failed about one run in eight, which is a test that reports the weather.
+The effect size belongs here, as a measurement.

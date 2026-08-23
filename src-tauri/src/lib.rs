@@ -37,6 +37,8 @@ fn dev_commands() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         commands::dev::dev_list_roots,
         commands::dev::dev_scan,
         commands::dev::dev_neighbors,
+        commands::dev::dev_project,
+        commands::dev::dev_projection_status,
         commands::dev::dev_model_status,
         commands::dev::dev_download_model,
         commands::dev::dev_session_info,

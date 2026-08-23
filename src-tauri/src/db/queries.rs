@@ -5,7 +5,7 @@
 //! the caller decides whether it is spending a pooled read connection or running inside the
 //! writer's transaction. They are also, for the same reason, trivially unit-testable.
 //!
-//! Extended through Phases 5-9.
+//! Extended through Phases 6-9.
 
 use std::collections::HashMap;
 
@@ -245,6 +245,19 @@ pub fn all_embedding_locs(conn: &Connection) -> Result<Vec<(i64, EmbeddingLoc)>,
         .map_err(DbError::from)
 }
 
+/// How many samples have a vector in `embeddings.bin`.
+///
+/// A `COUNT(*)`, not the length of [`all_embedding_locs`]: the projection planner runs after
+/// every scan and has no business materializing 50,000 rows to learn a number SQLite can
+/// answer from an index.
+pub fn count_embedded_samples(conn: &Connection) -> Result<i64, DbError> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM samples WHERE emb_offset IS NOT NULL AND emb_len IS NOT NULL",
+        [],
+        |r| r.get(0),
+    )?)
+}
+
 /// An embedded sample, with enough context to be recognizable in a neighbor list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmbeddedSample {
@@ -311,6 +324,155 @@ pub fn sample_features(
         .map(Some)
         .or_else(no_rows_is_none)?;
     Ok(found)
+}
+
+/// A row of `projection_runs`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectionRun {
+    pub id: i64,
+    /// `'umap'` or `'pca'`.
+    pub algorithm: String,
+    pub params_json: String,
+    pub sample_count: i64,
+    pub created_at: i64,
+    /// `None` while the run is still a shadow being built.
+    pub completed_at: Option<i64>,
+    pub is_active: bool,
+}
+
+/// The one active projection, or `None` before the first re-fit completes.
+///
+/// The schema's partial unique index makes "the one" a fact rather than a convention, so
+/// this is a `query_row` and not a `LIMIT 1` over an ordering nobody chose.
+pub fn active_projection_run(conn: &Connection) -> Result<Option<ProjectionRun>, DbError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, algorithm, params_json, sample_count, created_at, completed_at, is_active
+         FROM projection_runs WHERE is_active = 1",
+    )?;
+    let found = stmt
+        .query_row([], projection_run_from_row)
+        .map(Some)
+        .or_else(no_rows_is_none)?;
+    Ok(found)
+}
+
+/// One run by id, active or not. What a test asserting the swap reads.
+pub fn projection_run(conn: &Connection, run_id: i64) -> Result<Option<ProjectionRun>, DbError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, algorithm, params_json, sample_count, created_at, completed_at, is_active
+         FROM projection_runs WHERE id = ?1",
+    )?;
+    let found = stmt
+        .query_row([run_id], projection_run_from_row)
+        .map(Some)
+        .or_else(no_rows_is_none)?;
+    Ok(found)
+}
+
+/// Every `projection_runs` row, newest first. For the dev inspector and for pruning.
+pub fn projection_runs(conn: &Connection) -> Result<Vec<ProjectionRun>, DbError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, algorithm, params_json, sample_count, created_at, completed_at, is_active
+         FROM projection_runs ORDER BY created_at DESC, id DESC",
+    )?;
+    let rows = stmt.query_map([], projection_run_from_row)?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(DbError::from)
+}
+
+fn projection_run_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectionRun> {
+    Ok(ProjectionRun {
+        id: r.get(0)?,
+        algorithm: r.get(1)?,
+        params_json: r.get(2)?,
+        sample_count: r.get(3)?,
+        created_at: r.get(4)?,
+        completed_at: r.get(5)?,
+        is_active: r.get::<_, i64>(6)? != 0,
+    })
+}
+
+/// Every coordinate belonging to one run, by `sample_id`.
+pub fn projection_points(conn: &Connection, run_id: i64) -> Result<Vec<(i64, [f32; 3])>, DbError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT sample_id, x, y, z FROM projections WHERE run_id = ?1 ORDER BY sample_id",
+    )?;
+    let rows = stmt.query_map([run_id], |r| {
+        Ok((r.get::<_, i64>(0)?, [r.get(1)?, r.get(2)?, r.get(3)?]))
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(DbError::from)
+}
+
+/// The active layout, in one statement.
+///
+/// One statement rather than "read the run, then read its points" for a reason that
+/// outlives this phase: the swap deletes the superseded run in the same transaction that
+/// activates the new one, so a caller that issues two queries can read the old run id and
+/// then find no rows under it. A single join is atomic against the swap under WAL and
+/// cannot see the gap. Phase 6's `get_point_cloud` calls this.
+pub fn active_projection_points(conn: &Connection) -> Result<Vec<(i64, [f32; 3])>, DbError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT p.sample_id, p.x, p.y, p.z
+         FROM projections p
+         JOIN projection_runs r ON r.id = p.run_id AND r.is_active = 1
+         ORDER BY p.sample_id",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((r.get::<_, i64>(0)?, [r.get(1)?, r.get(2)?, r.get(3)?]))
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(DbError::from)
+}
+
+/// Coordinates in one run, as a lookup keyed by `sample_id`.
+///
+/// The Procrustes correspondence pass needs random access by id, not a sorted list.
+pub fn projection_point_map(
+    conn: &Connection,
+    run_id: i64,
+) -> Result<HashMap<i64, [f32; 3]>, DbError> {
+    Ok(projection_points(conn, run_id)?.into_iter().collect())
+}
+
+/// How many coordinates a run holds.
+pub fn count_projection_points(conn: &Connection, run_id: i64) -> Result<i64, DbError> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM projections WHERE run_id = ?1",
+        [run_id],
+        |r| r.get(0),
+    )?)
+}
+
+/// Embedded samples that `run_id` has no coordinate for, in file order.
+///
+/// The incremental placement path's input: everything the active layout has never seen.
+/// `NOT EXISTS` rather than a `LEFT JOIN ... IS NULL` because `projections` is `WITHOUT
+/// ROWID` with `(run_id, sample_id)` as its primary key, which makes the existence probe a
+/// single index seek per candidate row.
+pub fn embedding_locs_missing_from_run(
+    conn: &Connection,
+    run_id: i64,
+) -> Result<Vec<(i64, EmbeddingLoc)>, DbError> {
+    let mut stmt = conn.prepare(
+        "SELECT s.id, s.emb_offset, s.emb_len FROM samples s
+         WHERE s.emb_offset IS NOT NULL AND s.emb_len IS NOT NULL
+           AND NOT EXISTS (
+               SELECT 1 FROM projections p WHERE p.run_id = ?1 AND p.sample_id = s.id
+           )
+         ORDER BY s.emb_offset",
+    )?;
+    let rows = stmt.query_map([run_id], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            EmbeddingLoc {
+                offset: r.get::<_, i64>(1)? as u64,
+                dims: r.get::<_, i64>(2)? as u32,
+            },
+        ))
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(DbError::from)
 }
 
 /// Full-text search over filenames and tags, best match first.

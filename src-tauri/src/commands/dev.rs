@@ -22,6 +22,10 @@ use crate::{
     db::{queries, Database, SampleStatus},
     model::{Model, ModelStatus},
     pipeline::{scan_all_roots_with, CancellationToken, ScanOptions, ScanReport},
+    projection::{
+        place_incremental, plan, refit_at_low_priority, PcaProjector, Plan, Projector, Refit,
+        UmapParams, UmapProjector,
+    },
 };
 
 /// What a dev scan did, flattened for the console.
@@ -290,4 +294,149 @@ pub async fn dev_session_info(model: State<'_, Model>) -> Result<String, String>
         session.provider().as_str(),
         session.embedding_dim()
     ))
+}
+
+/// What a dev projection did, flattened for the console.
+#[derive(Debug, Serialize)]
+pub struct DevProjectionSummary {
+    /// `"full"`, `"incremental"`, or `"up_to_date"`.
+    pub path: String,
+    pub run_id: Option<i64>,
+    /// The projector that actually produced the coordinates, which is not necessarily the
+    /// one that was asked for -- see [`Refit::with_fallback`].
+    pub algorithm: Option<String>,
+    pub sample_count: usize,
+    pub placed: usize,
+    /// Samples present in both the old layout and the new one.
+    pub correspondences: usize,
+    pub reflected: bool,
+    pub scale: f32,
+    /// Median distance a pre-existing point moved, as a fraction of the cloud's diagonal.
+    /// The stability number `task.md` Phase 5 is stated against.
+    pub relative_displacement: Option<f32>,
+    pub elapsed_ms: u128,
+}
+
+/// Projects the library to 3D and swaps the result in.
+///
+/// Chooses between incremental placement and a full re-fit the way `overview.md` §3.8 says
+/// to, so calling this after a scan is what a Phase 9 "library changed" hook will do.
+/// `umap` selects the primary projector; PCA is always the fallback, because a library with
+/// no map at all is worse than a library with a plainer one.
+///
+/// Blocking and long, hence `async`: cross-cutting rule 1. Progress goes to the log through
+/// the real 100 ms ticker, so the throttle is exercised even though Phase 6 owns the
+/// `Channel<RefitProgress>` it will eventually feed.
+#[tauri::command]
+pub async fn dev_project(
+    db: State<'_, Database>,
+    umap: bool,
+    force_full: bool,
+    n_neighbors: Option<usize>,
+) -> Result<DevProjectionSummary, String> {
+    let started = std::time::Instant::now();
+    let cancel = CancellationToken::new();
+
+    let decision = plan(&db).map_err(|e| e.to_string())?;
+    if matches!(decision, Plan::Incremental { .. }) && !force_full {
+        let report = place_incremental(&db, &cancel).map_err(|e| e.to_string())?;
+        return Ok(DevProjectionSummary {
+            path: "incremental".into(),
+            run_id: Some(report.run_id),
+            algorithm: None,
+            sample_count: 0,
+            placed: report.placed,
+            correspondences: 0,
+            reflected: false,
+            scale: 1.0,
+            relative_displacement: Some(0.0),
+            elapsed_ms: started.elapsed().as_millis(),
+        });
+    }
+    if matches!(decision, Plan::UpToDate) && !force_full {
+        return Ok(DevProjectionSummary {
+            path: "up_to_date".into(),
+            run_id: None,
+            algorithm: None,
+            sample_count: 0,
+            placed: 0,
+            correspondences: 0,
+            reflected: false,
+            scale: 1.0,
+            relative_displacement: Some(0.0),
+            elapsed_ms: started.elapsed().as_millis(),
+        });
+    }
+
+    let pca = PcaProjector::new();
+    let umap_projector = UmapProjector::new(UmapParams {
+        n_neighbors: n_neighbors.unwrap_or(UmapParams::default().n_neighbors),
+        ..Default::default()
+    });
+    let primary: &dyn Projector = if umap { &umap_projector } else { &pca };
+
+    let options = Refit::new(primary, &cancel)
+        .with_fallback(&pca)
+        .with_progress(|snapshot| {
+            tracing::info!(
+                phase = snapshot.phase.as_str(),
+                samples = snapshot.samples,
+                written = snapshot.written,
+                "re-fit progress"
+            );
+        });
+    let report = refit_at_low_priority(&db, options).map_err(|e| e.to_string())?;
+
+    Ok(DevProjectionSummary {
+        path: "full".into(),
+        run_id: Some(report.run_id),
+        algorithm: Some(report.algorithm.to_string()),
+        sample_count: report.sample_count,
+        placed: report.sample_count,
+        correspondences: report.correspondences,
+        reflected: report.reflected,
+        scale: report.scale,
+        relative_displacement: report.relative_displacement(),
+        elapsed_ms: started.elapsed().as_millis(),
+    })
+}
+
+/// What the active projection is, and what the next projection call would do.
+#[derive(Debug, Serialize)]
+pub struct DevProjectionStatus {
+    pub active_run_id: Option<i64>,
+    pub algorithm: Option<String>,
+    pub params_json: Option<String>,
+    pub points: i64,
+    pub embedded_samples: i64,
+    /// What [`plan`] would choose right now.
+    pub next: String,
+}
+
+/// Reports the projection state without computing anything.
+#[tauri::command]
+pub fn dev_projection_status(db: State<'_, Database>) -> Result<DevProjectionStatus, String> {
+    let conn = db.read().map_err(|e| e.to_string())?;
+    let active = queries::active_projection_run(&conn).map_err(|e| e.to_string())?;
+    let points = match &active {
+        Some(run) => queries::count_projection_points(&conn, run.id).map_err(|e| e.to_string())?,
+        None => 0,
+    };
+    let embedded = queries::count_embedded_samples(&conn).map_err(|e| e.to_string())?;
+    drop(conn);
+
+    let next = match plan(&db).map_err(|e| e.to_string())? {
+        Plan::UpToDate => "up_to_date".to_string(),
+        Plan::Incremental { new, total } => format!("incremental ({new} of {total})"),
+        Plan::Full { new, total } => format!("full ({new} of {total})"),
+    };
+
+    Ok(DevProjectionStatus {
+        active_run_id: active.as_ref().map(|r| r.id),
+        algorithm: active.as_ref().map(|r| r.algorithm.clone()),
+        params_json: active.as_ref().map(|r| r.params_json.clone()),
+        points,
+        embedded_samples: embedded,
+        next,
+    })
 }

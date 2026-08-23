@@ -1,4 +1,4 @@
-//! Phase 1 and 2 benchmarks (`task.md`, cross-cutting rule 9).
+//! Phase 1, 2, 4 and 5 benchmarks (`task.md`, cross-cutting rule 9).
 //!
 //! These are `#[ignore]`d because they are only meaningful in an optimized build, and because
 //! a 50,000-row insert has no business running on every `cargo test`. CI compiles them --
@@ -26,6 +26,7 @@ use audiobank_lib::{
     pipeline::{
         features::Analyzer, scan_root, scan_root_with, BatchConfig, CancellationToken, ScanOptions,
     },
+    projection::{place_incremental, refit, PcaProjector, Point3, Projector, Refit, UmapProjector},
     EMBEDDING_DIM,
 };
 use half::f16;
@@ -70,6 +71,54 @@ fn rss_bytes() -> u64 {
 
 fn mib(bytes: u64) -> f64 {
     bytes as f64 / (1024.0 * 1024.0)
+}
+
+/// High-water resident size across a span of work.
+///
+/// `rss_bytes()` reports *current* RSS, so the usual before/after delta measures whatever
+/// the allocator happened not to have returned yet. For most of these benchmarks that is
+/// close enough -- their peak is at the end. It is not close enough for the UMAP re-fit,
+/// where the same fit reported 1.6 GiB one run and 2.9 GiB the next, and where the number is
+/// the one Phase 10 will plan against. So that one samples.
+///
+/// 50 ms is well under the granularity of anything being measured here and costs one `ps`
+/// per tick.
+#[derive(Debug)]
+struct PeakRss {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    peak: Arc<std::sync::atomic::AtomicU64>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PeakRss {
+    fn watch() -> Self {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let peak = Arc::new(std::sync::atomic::AtomicU64::new(rss_bytes()));
+        let (flag, high) = (Arc::clone(&stop), Arc::clone(&peak));
+
+        let handle = std::thread::spawn(move || {
+            while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                high.fetch_max(rss_bytes(), std::sync::atomic::Ordering::Relaxed);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            high.fetch_max(rss_bytes(), std::sync::atomic::Ordering::Relaxed);
+        });
+
+        Self {
+            stop,
+            peak,
+            handle: Some(handle),
+        }
+    }
+
+    /// Stops sampling and returns the high-water mark in bytes.
+    fn finish(mut self) -> u64 {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+        self.peak.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 fn synthetic_sample(root_id: i64, i: usize) -> NewSample {
@@ -846,5 +895,222 @@ fn embed_memory_is_flat_as_the_library_grows() {
         "4x the files cost {:.1} MiB against {:.1} MiB -- a stage is accumulating",
         mib(large.rss),
         mib(small.rss)
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// Phase 5 -- projection
+// ---------------------------------------------------------------------------------------
+
+/// A database holding `count` embedded samples with 512-dimensional vectors.
+///
+/// The vectors are L2-normalized noise around `clusters` centers, which is what a real
+/// corpus looks like to a projector: mostly one diffuse blob with structure inside it. Pure
+/// noise would be worse than unrealistic -- with no neighborhood structure at all, UMAP's
+/// gradient descent has nothing to converge to and the timing would measure a pathology.
+fn projection_corpus(count: usize, clusters: usize) -> (tempfile::TempDir, Database) {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(dir.path(), EMBEDDING_DIM).unwrap();
+    let root = db
+        .writer()
+        .add_root("/Library/Audio/Samples", None)
+        .unwrap();
+
+    let mut rng = Xorshift(0x5EED_1234_9ABC_DEF0);
+    for start in (0..count).step_by(CHUNK) {
+        let end = (start + CHUNK).min(count);
+        let rows: Vec<NewSample> = (start..end).map(|i| synthetic_sample(root, i)).collect();
+        let ids = db.writer().upsert_samples(rows).unwrap();
+
+        let vectors: Vec<Vec<f32>> = (start..end)
+            .map(|i| {
+                let center = i % clusters;
+                let mut v: Vec<f32> = (0..EMBEDDING_DIM).map(|_| rng.next_f32()).collect();
+                // A center strong enough to be a neighborhood and weak enough that the
+                // clumps still touch -- a kNN graph in disconnected pieces is a different
+                // benchmark (see `projection::umap`).
+                v[center % EMBEDDING_DIM] += 3.0;
+                v[(center * 31 + 7) % EMBEDDING_DIM] += 2.0;
+                let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                for x in &mut v {
+                    *x /= norm;
+                }
+                v
+            })
+            .collect();
+        let locs = {
+            let mut store = db.embeddings().lock().unwrap();
+            store.append_batch(&vectors).unwrap()
+        };
+        db.writer()
+            .set_embeddings(ids.into_iter().zip(locs).collect())
+            .unwrap();
+    }
+    db.writer().flush().unwrap();
+    db.embeddings().lock().unwrap().sync().unwrap();
+    (dir, db)
+}
+
+fn timed_refit(db: &Database, projector: &dyn Projector) -> (std::time::Duration, u64) {
+    let cancel = CancellationToken::new();
+    let rss_before = rss_bytes();
+    let watcher = PeakRss::watch();
+    let started = Instant::now();
+    let report = refit(db, Refit::new(projector, &cancel)).unwrap();
+    let elapsed = started.elapsed();
+    let peak = watcher.finish().saturating_sub(rss_before);
+    assert_eq!(report.sample_count, CORPUS);
+    assert_eq!(report.algorithm, projector.name());
+    (elapsed, peak)
+}
+
+/// **Exit criterion: a UMAP re-fit of 50,000 x 512 completes in under five minutes.**
+///
+/// Both projectors in one benchmark, because the interesting number is not either one
+/// alone -- it is what PCA costs relative to the thing it is the fallback for. A fallback
+/// that took the same five minutes would not be one.
+#[test]
+#[ignore = "benchmark; run under --profile perf"]
+fn refit_50k_by_512() {
+    let (dir, db) = projection_corpus(CORPUS, 24);
+    let embeddings_bytes = std::fs::metadata(dir.path().join("embeddings.bin"))
+        .unwrap()
+        .len();
+
+    let (pca_elapsed, pca_rss) = timed_refit(&db, &PcaProjector::new());
+    let (umap_elapsed, umap_rss) = timed_refit(&db, &UmapProjector::default());
+
+    let conn = db.read().unwrap();
+    let points = queries::active_projection_points(&conn).unwrap();
+    assert_eq!(points.len(), CORPUS);
+    assert!(points.iter().all(|(_, p)| p.iter().all(|v| v.is_finite())));
+
+    println!("\n-- re-fit 50k x 512 --");
+    println!("  embeddings.bin {:>8.1} MiB", mib(embeddings_bytes));
+    println!(
+        "  pca            {:>8.1} s   (peak RSS +{:.1} MiB)",
+        pca_elapsed.as_secs_f64(),
+        mib(pca_rss)
+    );
+    println!(
+        "  umap           {:>8.1} s   (peak RSS +{:.1} MiB)",
+        umap_elapsed.as_secs_f64(),
+        mib(umap_rss)
+    );
+
+    assert!(
+        umap_elapsed.as_secs_f64() < 300.0,
+        "a 50k UMAP re-fit took {umap_elapsed:?}, target < 5 min"
+    );
+}
+
+/// The other half of the §3.8 trade: what the *incremental* path costs on the same corpus.
+///
+/// The whole argument for incremental placement is that a small import must not pay for a
+/// re-fit. That is a claim about a ratio, so it is measured as one -- against the PCA
+/// number, which is the cheaper of the two re-fits and therefore the harder comparison.
+#[test]
+#[ignore = "benchmark; run under --profile perf"]
+fn incremental_placement_of_a_small_import() {
+    let (_dir, db) = projection_corpus(CORPUS, 24);
+
+    let cancel = CancellationToken::new();
+    let refit_started = Instant::now();
+    refit(&db, Refit::new(&PcaProjector::new(), &cancel)).unwrap();
+    let refit_elapsed = refit_started.elapsed();
+
+    // 1% of the corpus: comfortably inside `INCREMENTAL_THRESHOLD`.
+    let new = CORPUS / 100;
+    let root = db
+        .writer()
+        .add_root("/Library/Audio/Samples", None)
+        .unwrap();
+    let rows: Vec<NewSample> = (CORPUS..CORPUS + new)
+        .map(|i| synthetic_sample(root, i))
+        .collect();
+    let ids = db.writer().upsert_samples(rows).unwrap();
+    let mut rng = Xorshift(0xABCD_0123_4567_89EF);
+    let vectors: Vec<Vec<f32>> = (0..new)
+        .map(|_| {
+            let mut v: Vec<f32> = (0..EMBEDDING_DIM).map(|_| rng.next_f32()).collect();
+            v[3] += 3.0;
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            for x in &mut v {
+                *x /= norm;
+            }
+            v
+        })
+        .collect();
+    let locs = {
+        let mut store = db.embeddings().lock().unwrap();
+        store.append_batch(&vectors).unwrap()
+    };
+    db.writer()
+        .set_embeddings(ids.into_iter().zip(locs).collect())
+        .unwrap();
+    db.writer().flush().unwrap();
+
+    let before: std::collections::HashMap<i64, Point3> = {
+        let conn = db.read().unwrap();
+        queries::active_projection_points(&conn)
+            .unwrap()
+            .into_iter()
+            .collect()
+    };
+
+    let rss_before = rss_bytes();
+    let watcher = PeakRss::watch();
+    let started = Instant::now();
+    let report = place_incremental(&db, &cancel).unwrap();
+    let elapsed = started.elapsed();
+    let rss = watcher.finish().saturating_sub(rss_before);
+
+    assert_eq!(report.placed, new);
+
+    // The claim the whole path exists for, checked rather than asserted in prose: not one
+    // pre-existing coordinate changed.
+    let conn = db.read().unwrap();
+    let after: std::collections::HashMap<i64, Point3> = queries::active_projection_points(&conn)
+        .unwrap()
+        .into_iter()
+        .collect();
+    assert_eq!(after.len(), CORPUS + new);
+    for (id, old) in &before {
+        assert_eq!(
+            after[id], *old,
+            "sample {id} moved during an incremental import"
+        );
+    }
+
+    println!("\n-- incremental placement, {new} into 50k --");
+    println!(
+        "  placement      {:>8.0} ms  (peak RSS +{:.1} MiB)",
+        elapsed.as_secs_f64() * 1000.0,
+        mib(rss)
+    );
+    println!(
+        "  pca re-fit     {:>8.0} ms  ({:.2}x)",
+        refit_elapsed.as_secs_f64() * 1000.0,
+        refit_elapsed.as_secs_f64() / elapsed.as_secs_f64().max(1e-9)
+    );
+
+    // The UMAP baseline runs *last*, deliberately. It allocates about 1.9 GB and evicts the
+    // mmap pages the placement pass reads, so measuring it first would make the placement
+    // number a measurement of page faults. This is also the comparison that matters: an
+    // import must not cost what the re-fit it is avoiding costs, and in production a full
+    // re-fit is a UMAP re-fit.
+    let umap_started = Instant::now();
+    let umap_report = refit(&db, Refit::new(&UmapProjector::default(), &cancel)).unwrap();
+    let umap_elapsed = umap_started.elapsed();
+    assert_eq!(umap_report.algorithm, "umap");
+
+    println!(
+        "  umap re-fit    {:>8.0} ms  ({:.1}x)",
+        umap_elapsed.as_secs_f64() * 1000.0,
+        umap_elapsed.as_secs_f64() / elapsed.as_secs_f64().max(1e-9)
+    );
+    assert!(
+        elapsed.as_secs_f64() * 10.0 < umap_elapsed.as_secs_f64(),
+        "placement took {elapsed:?} against a {umap_elapsed:?} re-fit"
     );
 }

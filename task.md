@@ -193,7 +193,7 @@ mid-body, and the resumed request asks for the exact byte offset — but against
 release, not the real asset, and the parity test has nothing to compare against. The gate
 is blocked on the export, and nothing downstream should start until it is green.
 
-**Three findings from this phase that change later ones:**
+**Four findings from this phase that change later ones:**
 
 1. **`ort` sessions cannot run concurrently.** `overview.md` §3.4 prescribes `Arc<Session>`
    across `rayon` workers on the grounds that ONNX Runtime is thread-safe for concurrent
@@ -314,30 +314,139 @@ criterion asks for.
 
 *Goal: stable 3D coordinates for the whole corpus.*
 
-- [ ] Define the `Projector` trait (`overview.md` §3.7)
-- [ ] `projection/pca.rs` first — `nalgebra` (0.35) truncated SVD. Fast, deterministic,
+- [x] Define the `Projector` trait (`overview.md` §3.7)
+      > It takes an `EmbeddingSet` — a borrowed view over the mmap plus the
+        `(sample_id, location)` list — rather than an owned matrix, so §4.2's "never
+        heap-load 102 MB" is a property every implementation gets for free instead of one
+        each has to remember. What is deliberately *not* on the trait is persistence, the
+        single-active invariant, the swap, and alignment: those are identical for every
+        algorithm and live in `projection/refit.rs`.
+- [x] `projection/pca.rs` first — `nalgebra` (0.35) truncated SVD. Fast, deterministic,
       and it unblocks Phase 7 with real coordinates immediately.
-- [ ] Persist to `projection_runs` + `projections`; enforce the single-active invariant
-- [ ] Add `annembed` (**pin `0.1.6`**) and `hnsw_rs` (0.3). **Vendor `annembed` into the
+      > It is a truncated SVD, computed as the top-3 eigenvectors of the 512 × 512
+        covariance — the same three vectors, reached the way that does not require a
+        `DMatrix` of the whole corpus. `nalgebra` has no truncated SVD, and `SVD::new` over
+        50,000 × 512 is exactly the heap load the previous bullet exists to avoid.
+        **Eigenvector signs are canonicalized** (largest-magnitude component made positive),
+        which is what makes two PCA fits over the same data byte-identical rather than
+        mirrored, and what makes a PCA re-fit land almost on top of its predecessor before
+        Procrustes is even asked.
+- [x] Persist to `projection_runs` + `projections`; enforce the single-active invariant
+      > Four writer commands, three of them `is_durable` so they get the writer's
+        `BEGIN IMMEDIATE`…`COMMIT` to themselves. Activation also **prunes the runs it
+        supersedes**, restricted to runs with a `completed_at`, so a concurrent shadow run
+        cannot be deleted out from under the job building it.
+- [x] Add `annembed` (**pin `0.1.6`**) and `hnsw_rs` (0.3). **Vendor `annembed` into the
       repo** — `overview.md` §10 risk 2.
-- [ ] `projection/umap.rs`: HNSW kNN graph → `annembed` → 3D; expose `n_neighbors`,
+      > `src-tauri/vendor/annembed/`, 416 KB, upstream's published source with **no change
+        to any `.rs` file**. Only the manifest is edited, and only to remove things that
+        cost build time and buy nothing: the binaries and examples (which Cargo never builds
+        for a dependency, but whose `clap`/`bincode`/`byteorder`/`num_cpus` dependencies it
+        did), the `python` feature, and the `cdylib`. The LAPACK backend is
+        `macos-accelerate` — `lax` is a hard dependency of the crate and its symbols have to
+        resolve against something, and on the only platform AudioBank ships to that
+        something is already installed.
+- [x] `projection/umap.rs`: HNSW kNN graph → `annembed` → 3D; expose `n_neighbors`,
       `min_dist`, cosine metric
-- [ ] Read the embedding matrix via `mmap`, not a heap load
-- [ ] `projection/procrustes.rs`: SVD alignment — center, cross-covariance, `R = V Uᵀ`,
+      > `n_neighbors` and cosine are real; **`min_dist` is a documented stand-in**.
+        `annembed` does not implement Python UMAP's kernel — it derives its embedded scale
+        from each point's local scale, modulated by `scale_rho`, and has no `min_dist` at
+        all. The parameter is kept because it is the knob a user reaches for and mapped
+        monotonically onto `scale_rho`, with the default (0.1) landing exactly on
+        `annembed`'s own default (1.0). The numbers do not transfer from a Python notebook,
+        and the `params_json` records the derived value alongside the asked-for one.
+- [x] Read the embedding matrix via `mmap`, not a heap load
+      > True of everything AudioBank owns, and **not** true of the HNSW index: `hnsw_rs`
+        stores the vectors it is given, so a 50k × 512 index is ~102 MB for the duration of
+        a UMAP fit and there is no version of that which is not. What the mmap buys is
+        everything around it — rows reach the index 1024 at a time and the block is dropped
+        before the next is read, so peak is the index plus a chunk rather than the index
+        plus a second copy of the corpus.
+- [x] `projection/procrustes.rs`: SVD alignment — center, cross-covariance, `R = V Uᵀ`,
       **allow reflection**, uniform scale
-- [ ] Incremental placement path for small imports (< ~2% of corpus): kNN barycenter in
+      > No determinant correction, and `a_reflected_layout_is_recovered_rather_than_left_mirrored`
+        is the test that fails if someone adds the textbook Kabsch one back.
+- [x] Incremental placement path for small imports (< ~2% of corpus): kNN barycenter in
       existing 3D space, existing points never move
-- [ ] Full re-fit as a cancellable background job at low priority, writing to a shadow run
-- [ ] Atomic swap: `BEGIN IMMEDIATE`, flip `is_active`, commit — readers never see a
+      > "Never move" is exact rather than approximate: rows for existing samples are not
+        written at all, and the test asserts float equality rather than a tolerance.
+        Neighbors are found by **exact brute force over the mmap, not by an HNSW index** —
+        §3.8 says "via the existing HNSW index" and there is no such thing, because the
+        index a re-fit builds is never persisted anywhere in the design. At 2% of 50,000 the
+        exact answer costs about a second, once, on an import, and needs no index to keep in
+        sync. Weights are similarities shifted into `[0, 2]`, because cosine runs to −1 and a
+        negative weight pushes a point *out* of its neighbors' hull. Placements get a
+        deterministic sub-pixel jitter keyed by `sample_id`, because Phase 4's dedup means
+        two rows can share one vector exactly and would otherwise share one pixel forever.
+- [x] Full re-fit as a cancellable background job at low priority, writing to a shadow run
+      > Cancellable at every boundary, and **not** inside `Embedder::embed()`, which is one
+        opaque call exactly like Phase 3's `Session::run()`. A cancelled or failed job
+        deletes its shadow run and leaves the active map untouched, which is what makes
+        minutes of work safe to abandon.
+- [x] Atomic swap: `BEGIN IMMEDIATE`, flip `is_active`, commit — readers never see a
       half-swapped map
-- [ ] Test: re-fit with 5% new samples, verify median displacement of pre-existing points
+      > Clear, set, prune, in that order — the order is forced by the schema, since
+        `idx_projection_active` is a partial unique index and setting the new flag first is a
+        constraint violation rather than a momentary inconsistency. That it *fails* rather
+        than *corrupts* is the reason the index is there.
+        `a_concurrent_reader_never_sees_a_half_swapped_map` runs a reader through four
+        consecutive swaps and asserts it only ever sees a whole map.
+- [x] Test: re-fit with 5% new samples, verify median displacement of pre-existing points
       after Procrustes is small relative to the cloud's bounding box
-- [ ] Benchmark the 50k × 512 re-fit
+      > Under both projectors. PCA is < 10% of the cloud diagonal; UMAP is **11–16%**
+        against 24–87% unaligned. The alignment claim is measured on *one* fit rather than
+        two — align a layout by hand and compare it to itself — because two stochastic
+        descents differ by more than the alignment does.
+- [x] Benchmark the 50k × 512 re-fit
+      > See `BENCHMARKS.md`. Both projectors, plus what the incremental path costs on the
+        same corpus, which is the ratio the whole §3.8 trade rests on.
 
 **Exit criteria:** 3D coordinates exist for the full corpus under both projectors; UMAP
 re-fit of 50k × 512 completes in **< 5 min**; a re-fit with 5% new data leaves existing
 points substantially in place after alignment; the atomic swap holds under a concurrent
 reader.
+
+**Status: met.** `tests/projection.rs` is fourteen integration tests over a real database
+and a real `embeddings.bin`, one per criterion plus the failure modes that make the criteria
+safe.
+
+**Three findings from this phase that change later ones:**
+
+1. **`annembed` panics on a disconnected kNN graph, and the release profile aborts on
+   panic.** Its initialization runs a diffusion map, and on a graph in separate components
+   that decomposition degenerates into a constant-or-NaN initial embedding; `set_data_box`
+   then divides by its own zero maximum and trips a bare `assert!`. A corpus of six tight,
+   well-separated clumps reproduces it better than half the time, and a library of five
+   hundred near-identical 909 kicks next to a folder of vocal loops is exactly that shape.
+   Because `panic = "abort"` is set for release, `catch_unwind` is not available as a
+   backstop — the defence has to be to never create the condition. `umap.rs` counts
+   components by union-find before calling `embed()` and refuses the graph, and
+   `Refit::with_fallback` turns the refusal into a PCA layout. **Phase 9's re-fit UI must
+   surface that the fallback fired**, because a user who asked for UMAP and got PCA is owed
+   the sentence. The named future improvement is to escalate `n_neighbors` and retry before
+   giving up; it is not built because the effective value would then differ from the
+   recorded one, and a `projection_runs` row that misreports its own parameters is worse
+   than a plainer map.
+2. **A projection run is recorded under the projector that actually produced it**, not the
+   one that was asked for. This is why the fallback is a field on the job rather than a
+   `Projector` that wraps two: a wrapper would have to answer `name()` before knowing which
+   one ran, and a `'umap'` row over a PCA layout is a lie that outlives the session.
+   Phase 6's `get_point_cloud` should pass `projection_runs.algorithm` through to the
+   frontend for the same reason.
+3. **Read the active run and its points in one statement.** The swap deletes the superseded
+   run inside the same transaction that activates the new one, so a caller that issues two
+   queries can read the old run id and then find nothing under it. `active_projection_points`
+   does the join in one statement, which is atomic against the swap under WAL;
+   Phase 6's `get_point_cloud` must call that rather than composing two reads.
+4. **A 50k UMAP re-fit peaks at 2.95 GiB, and `overview.md` §7 has no row for it.** The
+   table budgets peak RSS during a *scan* at 800 MB and says nothing about a projection, so
+   this violates nothing as written — which is a gap in the table, not a pass. It is 3.7×
+   the scan budget, on an app that ships to 8 GB Macs, in a job the user can start from a
+   menu. Almost all of it is `hnsw_rs`'s copy of the vectors plus `annembed`'s Laplacian,
+   SVD workspace and per-edge gradient state, none of which is under our control; PCA over
+   the same corpus peaks at 95 MiB, which is what the mmap discipline buys where it applies.
+   **Phase 10 should add the row and measure it on an 8 GB machine**, and weigh capping the
+   corpus a single re-fit sees or holding the index in f16. See `BENCHMARKS.md`.
 
 ---
 

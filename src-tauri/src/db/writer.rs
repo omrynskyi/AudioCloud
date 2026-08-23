@@ -133,6 +133,25 @@ enum Command {
         error: Option<String>,
         reply: Reply<()>,
     },
+    BeginProjectionRun {
+        algorithm: String,
+        params_json: String,
+        sample_count: i64,
+        reply: Reply<i64>,
+    },
+    SetProjectionPoints {
+        run_id: i64,
+        rows: Vec<(i64, [f32; 3])>,
+        reply: Reply<()>,
+    },
+    ActivateProjectionRun {
+        run_id: i64,
+        reply: Reply<()>,
+    },
+    DiscardProjectionRun {
+        run_id: i64,
+        reply: Reply<()>,
+    },
     Flush {
         reply: Reply<()>,
     },
@@ -147,6 +166,7 @@ impl Command {
             Command::SetFeatures { rows, .. } => rows.len(),
             Command::SetEmbeddings { rows, .. } => rows.len(),
             Command::MarkDecodeFailed { rows, .. } => rows.len(),
+            Command::SetProjectionPoints { rows, .. } => rows.len(),
             _ => 0,
         }
     }
@@ -164,6 +184,14 @@ impl Command {
                 | Command::RemoveRoot { .. }
                 | Command::StartScan { .. }
                 | Command::FinishScan { .. }
+                // The swap, and the two commands that bracket it. `is_durable` opens one
+                // `BEGIN IMMEDIATE` around the command and commits before answering, which
+                // is exactly `overview.md` §3.8 step 5's atomic swap -- readers never
+                // observe a half-swapped map because there is no moment at which two runs
+                // are active or none is.
+                | Command::BeginProjectionRun { .. }
+                | Command::ActivateProjectionRun { .. }
+                | Command::DiscardProjectionRun { .. }
                 | Command::Flush { .. }
         )
     }
@@ -286,6 +314,60 @@ impl WriterHandle {
             error,
             reply,
         })
+    }
+
+    /// Opens a shadow `projection_runs` row. Not active, not complete: just a home for the
+    /// coordinates a re-fit is about to write.
+    pub fn begin_projection_run(
+        &self,
+        algorithm: &str,
+        params_json: &str,
+        sample_count: i64,
+    ) -> Result<i64, DbError> {
+        let algorithm = algorithm.to_string();
+        let params_json = params_json.to_string();
+        self.request(|reply| Command::BeginProjectionRun {
+            algorithm,
+            params_json,
+            sample_count,
+            reply,
+        })
+    }
+
+    /// Writes coordinates into a run. Upserts, so a re-run over the same run replaces
+    /// rather than conflicting.
+    pub fn set_projection_points(
+        &self,
+        run_id: i64,
+        rows: Vec<(i64, [f32; 3])>,
+    ) -> Result<(), DbError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        self.request(|reply| Command::SetProjectionPoints {
+            run_id,
+            rows,
+            reply,
+        })
+    }
+
+    /// **The atomic swap** (`overview.md` §3.8, step 5).
+    ///
+    /// Deactivates whatever was active, activates `run_id`, stamps its `completed_at`, and
+    /// drops the runs it supersedes -- all inside the single `BEGIN IMMEDIATE` the writer
+    /// wraps a durable command in. A reader either sees the whole new map or the whole old
+    /// one.
+    pub fn activate_projection_run(&self, run_id: i64) -> Result<(), DbError> {
+        self.request(|reply| Command::ActivateProjectionRun { run_id, reply })
+    }
+
+    /// Deletes a run and, by cascade, its coordinates.
+    ///
+    /// What a cancelled or failed re-fit calls on its shadow row. Refuses to delete the
+    /// active run: dropping it would leave the app with no map at all, and no caller has a
+    /// reason to want that.
+    pub fn discard_projection_run(&self, run_id: i64) -> Result<(), DbError> {
+        self.request(|reply| Command::DiscardProjectionRun { run_id, reply })
     }
 
     /// Commits the open batch and returns once it is durable.
@@ -432,6 +514,26 @@ impl Writer {
                 reply,
                 finish_scan(conn, scan_id, status, counts, error.as_deref()),
             ),
+            Command::BeginProjectionRun {
+                algorithm,
+                params_json,
+                sample_count,
+                reply,
+            } => answer(
+                reply,
+                begin_projection_run(conn, &algorithm, &params_json, sample_count),
+            ),
+            Command::SetProjectionPoints {
+                run_id,
+                rows,
+                reply,
+            } => answer(reply, set_projection_points(conn, run_id, &rows)),
+            Command::ActivateProjectionRun { run_id, reply } => {
+                answer(reply, activate_projection_run(conn, run_id))
+            }
+            Command::DiscardProjectionRun { run_id, reply } => {
+                answer(reply, discard_projection_run(conn, run_id))
+            }
             Command::Flush { reply } => answer(reply, Ok(())),
             Command::Shutdown => Box::new(|| {}),
         }
@@ -664,6 +766,81 @@ fn mark_decode_failed(conn: &Connection, rows: &[(i64, String)]) -> Result<(), D
         stmt.execute((sample_id, SampleStatus::DecodeFailed.as_str(), error, now))?;
     }
 
+    Ok(())
+}
+
+fn begin_projection_run(
+    conn: &Connection,
+    algorithm: &str,
+    params_json: &str,
+    sample_count: i64,
+) -> Result<i64, DbError> {
+    let id = conn.query_row(
+        "INSERT INTO projection_runs (algorithm, params_json, sample_count, created_at, is_active)
+         VALUES (?1, ?2, ?3, ?4, 0) RETURNING id",
+        (algorithm, params_json, sample_count, now_ms()),
+        |r| r.get(0),
+    )?;
+    Ok(id)
+}
+
+fn set_projection_points(
+    conn: &Connection,
+    run_id: i64,
+    rows: &[(i64, [f32; 3])],
+) -> Result<(), DbError> {
+    let mut stmt = conn.prepare_cached(
+        "INSERT INTO projections (run_id, sample_id, x, y, z) VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(run_id, sample_id) DO UPDATE SET
+             x = excluded.x, y = excluded.y, z = excluded.z",
+    )?;
+    for (sample_id, [x, y, z]) in rows {
+        stmt.execute((run_id, sample_id, x, y, z))?;
+    }
+    Ok(())
+}
+
+/// Clear, set, prune -- in that order, in one transaction.
+///
+/// The order is forced by the schema. `idx_projection_active` is a partial unique index on
+/// `is_active = 1`, so setting the new flag before clearing the old one is a constraint
+/// violation rather than a momentary inconsistency. That the index makes the wrong order
+/// *fail* rather than *corrupt* is the whole reason it is there.
+///
+/// The prune is deliberately limited to runs that finished. A shadow run being built by
+/// another job has `completed_at IS NULL` and survives, so activating one re-fit cannot
+/// delete another re-fit's work out from under it.
+fn activate_projection_run(conn: &Connection, run_id: i64) -> Result<(), DbError> {
+    let exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM projection_runs WHERE id = ?1",
+        [run_id],
+        |r| r.get(0),
+    )?;
+    if exists == 0 {
+        return Err(DbError::Sqlite(rusqlite::Error::QueryReturnedNoRows));
+    }
+
+    conn.execute(
+        "UPDATE projection_runs SET is_active = 0 WHERE is_active = 1 AND id <> ?1",
+        [run_id],
+    )?;
+    conn.execute(
+        "UPDATE projection_runs SET is_active = 1, completed_at = COALESCE(completed_at, ?2)
+         WHERE id = ?1",
+        (run_id, now_ms()),
+    )?;
+    conn.execute(
+        "DELETE FROM projection_runs WHERE id <> ?1 AND completed_at IS NOT NULL",
+        [run_id],
+    )?;
+    Ok(())
+}
+
+fn discard_projection_run(conn: &Connection, run_id: i64) -> Result<(), DbError> {
+    conn.execute(
+        "DELETE FROM projection_runs WHERE id = ?1 AND is_active = 0",
+        [run_id],
+    )?;
     Ok(())
 }
 
@@ -1102,5 +1279,97 @@ mod tests {
 
         db.writer().flush().unwrap();
         assert_eq!(committed(&db), 800);
+    }
+
+    /// The invariant the schema enforces and the writer must not violate: setting the new
+    /// active flag before clearing the old one is a constraint violation, not a momentary
+    /// inconsistency. This is the test that fails if the two `UPDATE`s ever swap places.
+    #[test]
+    fn activating_a_run_deactivates_the_one_it_replaces() {
+        let (_dir, db) = temp_db();
+        let writer = db.writer();
+
+        let first = writer.begin_projection_run("pca", "{}", 3).unwrap();
+        writer.activate_projection_run(first).unwrap();
+        let second = writer.begin_projection_run("umap", "{}", 3).unwrap();
+        writer.activate_projection_run(second).unwrap();
+
+        let conn = db.read().unwrap();
+        let active: Vec<i64> = conn
+            .prepare("SELECT id FROM projection_runs WHERE is_active = 1")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(active, vec![second]);
+
+        let run = queries::projection_run(&conn, second).unwrap().unwrap();
+        assert_eq!(run.algorithm, "umap");
+        assert!(run.completed_at.is_some(), "an active run must be complete");
+    }
+
+    /// Activation prunes what it supersedes -- but only runs that finished. A shadow run
+    /// another job is still filling has no `completed_at` and must survive, or two
+    /// concurrent re-fits delete each other's work.
+    #[test]
+    fn activation_prunes_finished_runs_and_spares_shadows() {
+        let (_dir, db) = temp_db();
+        let writer = db.writer();
+        let root = writer.add_root("/samples", None).unwrap();
+        let ids = writer
+            .upsert_samples(vec![sample(root, "a.wav"), sample(root, "b.wav")])
+            .unwrap();
+
+        let old = writer.begin_projection_run("pca", "{}", 2).unwrap();
+        writer
+            .set_projection_points(old, vec![(ids[0], [1.0, 2.0, 3.0])])
+            .unwrap();
+        writer.activate_projection_run(old).unwrap();
+
+        let shadow = writer.begin_projection_run("umap", "{}", 2).unwrap();
+        let fresh = writer.begin_projection_run("pca", "{}", 2).unwrap();
+        writer
+            .set_projection_points(fresh, vec![(ids[1], [4.0, 5.0, 6.0])])
+            .unwrap();
+        writer.activate_projection_run(fresh).unwrap();
+
+        let conn = db.read().unwrap();
+        let ids_left: Vec<i64> = queries::projection_runs(&conn)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert!(ids_left.contains(&fresh), "the new run was pruned");
+        assert!(
+            ids_left.contains(&shadow),
+            "an unfinished shadow run was pruned"
+        );
+        assert!(!ids_left.contains(&old), "the superseded run survived");
+
+        // And the pruned run's coordinates went with it, by cascade.
+        assert_eq!(queries::count_projection_points(&conn, old).unwrap(), 0);
+        assert_eq!(
+            queries::active_projection_points(&conn).unwrap(),
+            vec![(ids[1], [4.0, 5.0, 6.0])]
+        );
+    }
+
+    /// Discarding is for shadows. The active run is the map the user is looking at, and no
+    /// caller has a reason to want it gone.
+    #[test]
+    fn the_active_run_cannot_be_discarded() {
+        let (_dir, db) = temp_db();
+        let writer = db.writer();
+        let run = writer.begin_projection_run("pca", "{}", 0).unwrap();
+        writer.activate_projection_run(run).unwrap();
+
+        writer.discard_projection_run(run).unwrap();
+
+        let conn = db.read().unwrap();
+        assert_eq!(
+            queries::active_projection_run(&conn).unwrap().map(|r| r.id),
+            Some(run)
+        );
     }
 }

@@ -6,12 +6,19 @@ A spatial browser for large sample libraries. Samples are embedded with CLAP, pr
 - [`overview.md`](overview.md) — the architecture.
 - [`task.md`](task.md) — the implementation roadmap, phase by phase.
 
-**Status: Phase 4 implemented, Phase 3's gate not yet passed.** An empty window builds and
+**Status: Phase 5 implemented, Phase 3's gate not yet passed.** An empty window builds and
 launches, and behind it the ingest pipeline is real and complete: point it at a folder of
 audio and it walks, hashes, deduplicates, decodes, analyzes, computes CLAP's log-mel
 spectrogram, embeds it in batches through one shared `ort` session, and writes both the DSP
 features and the vector — with progress coalesced to 10 Hz, cancellation that keeps what it
 wrote, and a resume that finishes what an interrupted scan started.
+
+Phase 5 turns those vectors into a map. Two projectors behind one trait — a deterministic
+PCA and UMAP over a vendored `annembed` — reduce 512 dimensions to 3, and the layout is kept
+*stable* across re-fits: Procrustes alignment (reflection allowed) onto the previous map, a
+shadow run swapped in atomically so a reader never sees half a map, and an incremental path
+that places a small import without moving one existing point. A 50,000 × 512 UMAP re-fit
+takes 58 s against a five-minute budget. See [Phase 5 status](#phase-5-status).
 
 What is **not** done is the one thing Phase 3 is actually for. Exporting the ONNX file and
 recording the reference embeddings requires running LAION-CLAP under PyTorch, which is a
@@ -179,6 +186,30 @@ embeddings that are the parity oracle. Until then the gate in
    waveform probe — so a drift between the two generators reports itself instead of arriving
    later disguised as a parity failure.
 
+## Phase 5 status
+
+Phase 5's exit criteria are met, and the map it produces is only as meaningful as the
+vectors underneath it — which is still Phase 3's open question, not a new one.
+
+Three things worth knowing before touching this code:
+
+**`annembed` panics on a disconnected kNN graph, and release builds abort on panic.** Its
+diffusion-map initialization degenerates on a graph in separate components, and
+`set_data_box` then trips a bare `assert!`. A library of five hundred near-identical 909
+kicks next to a folder of vocal loops is exactly that shape. `projection/umap.rs` counts
+components before calling `embed()` and refuses the graph; `Refit::with_fallback` turns the
+refusal into a PCA layout, which is what `overview.md` §3.7 means by keeping PCA as a tested
+fallback rather than a theoretical one.
+
+**A run is recorded under the projector that produced it**, never the one that was asked
+for. That is why the fallback is a field on the job rather than a `Projector` wrapping two:
+a wrapper would have to answer `name()` before knowing which one ran.
+
+**Read the active run and its points in one statement.** The swap deletes the superseded run
+inside the transaction that activates the new one, so two separate queries can read a run id
+and then find nothing under it. `queries::active_projection_points` does the join in one
+statement, and Phase 6's `get_point_cloud` must call that rather than composing two reads.
+
 ## Phase 4 status
 
 The five-stage pipeline is built, wired, and tested end to end. Two of Phase 4's claims wait
@@ -253,11 +284,18 @@ CI runs all of these plus both target builds on every push.
 ## Layout
 
 The tree follows `overview.md` §9. [`src-tauri/src/db/`](src-tauri/src/db/),
-[`src-tauri/src/pipeline/`](src-tauri/src/pipeline/) and
-[`src-tauri/src/model/`](src-tauri/src/model/) are implemented; every other
+[`src-tauri/src/pipeline/`](src-tauri/src/pipeline/),
+[`src-tauri/src/model/`](src-tauri/src/model/) and
+[`src-tauri/src/projection/`](src-tauri/src/projection/) are implemented; every other
 `src-tauri/` module still holds only a `//!` doc comment stating its responsibility and the
 phase that fills it in — the skeleton is there so that later phases add code to a named place
 rather than inventing structure under deadline.
+
+[`src-tauri/vendor/annembed/`](src-tauri/vendor/annembed/) is the one third-party crate
+checked into the repo, for the reason `overview.md` §10 risk 2 gives: a 0.1.x crate with one
+maintainer decides the layout of the user's entire map. Its `.rs` files are upstream 0.1.6
+byte for byte; only its manifest is edited, and its own `Cargo.toml` says what changed and
+why.
 
 Two invariants in `db/` are worth knowing before touching it. The pool hands out
 `SQLITE_OPEN_READ_ONLY` connections and the single write connection is moved into the writer

@@ -67,6 +67,32 @@ tokio = { version = "1.49.0", features = ["fs", "io-util", "rt", "sync", "time"]
 # only file in the crate permitted to name an `ort` type: an upgrade has one blast radius.
 ort = { version = "=2.0.0-rc.13", features = ["coreml"] }
 
+# Projection (overview.md 3.7). `nalgebra` is the small, boring half: PCA's eigenproblem
+# and Procrustes' 3x3 SVD, both dense and both deterministic.
+nalgebra = { version = "0.35.0", default-features = false, features = ["std"] }
+
+# The other half. `annembed` is **vendored** (`src-tauri/vendor/annembed`) rather than
+# resolved from crates.io -- overview.md 10, risk 2: a 0.1.x crate with one maintainer
+# decides the layout of the user's entire map, so a yank must not be able to break a build.
+# See that directory's Cargo.toml for what was changed (the manifest, nothing else).
+#
+# `macos-accelerate` is the LAPACK backend. AudioBank is a macOS application and Accelerate
+# is already on every machine it runs on; the alternative features build or link OpenBLAS.
+annembed = { path = "vendor/annembed", features = ["macos-accelerate"] }
+
+# The kNN graph `annembed` embeds. Named here rather than reached through `annembed`'s
+# re-export because `projection/umap.rs` builds the index itself: it is what decides that
+# the metric is cosine and that vectors arrive from the mmap a chunk at a time.
+hnsw_rs = "0.3.4"
+
+# One FFI call: `pthread_set_qos_class_self_np`, so a background re-fit is genuinely
+# background and not merely called that. `overview.md` §3.8 asks for "low priority" and on
+# macOS that word means a QoS class, which no portable Rust API exposes. Already in the tree
+# transitively; named here so the direct use has a direct dependency, and scoped to Apple
+# targets because `qos_class_t` does not exist anywhere else.
+[target.'cfg(target_vendor = "apple")'.dependencies]
+libc = "0.2.189"
+
 [dev-dependencies]
 tempfile = "3.27.0"
 # `macros` for `#[tokio::test]`, which the download tests need in order to drive an async

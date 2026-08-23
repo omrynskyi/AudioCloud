@@ -20,7 +20,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-pub use embeddings::{EmbeddingLoc, EmbeddingStore};
+pub use embeddings::{EmbeddingLoc, EmbeddingMatrix, EmbeddingStore};
 pub use pool::{ReadConn, ReadPool};
 pub use writer::WriterHandle;
 
