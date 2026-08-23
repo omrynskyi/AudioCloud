@@ -8,6 +8,7 @@ pub mod audio;
 pub mod commands;
 pub mod db;
 pub mod error;
+pub mod ipc;
 pub mod model;
 pub mod pipeline;
 pub mod projection;
@@ -15,7 +16,7 @@ pub mod protocol;
 
 use tauri::Manager;
 
-use crate::{db::Database, model::Model};
+use crate::{audio::peaks::PeakCache, commands::Jobs, db::Database, model::Model, protocol::peaks};
 
 /// Dimensionality of a CLAP audio-tower embedding (`overview.md` §3.4).
 ///
@@ -24,30 +25,43 @@ use crate::{db::Database, model::Model};
 /// two agree.
 pub const EMBEDDING_DIM: usize = 512;
 
-/// The command surface.
+/// The command surface (`overview.md` §6.1).
 ///
-/// Empty in release: Phase 2's only commands are the development scan triggers in
-/// [`commands::dev`], and the real surface (`overview.md` §6.1) is Phase 6. Shipping a
-/// release build with no commands is correct for a phase whose frontend is still an empty
-/// window.
-#[cfg(debug_assertions)]
-fn dev_commands() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static {
+/// Every command the frontend can call, in one list. Three of them -- `get_point_cloud`,
+/// `get_feature_column`, `query_samples` -- answer in raw bytes; the rest are JSON. Waveform
+/// peaks are not here at all: they travel over the `abpeaks://` scheme registered below, so
+/// bulk asset traffic never competes with commands (`overview.md` §6.4).
+///
+/// `pub` so `tests/surface.rs` can mount the same list on a mock runtime. A test that
+/// registered its own subset would prove that the subset works and say nothing about the
+/// surface the app actually exposes.
+pub fn command_handler<R: tauri::Runtime>(
+) -> impl Fn(tauri::ipc::Invoke<R>) -> bool + Send + Sync + 'static {
     tauri::generate_handler![
-        commands::dev::dev_add_root,
-        commands::dev::dev_list_roots,
-        commands::dev::dev_scan,
-        commands::dev::dev_neighbors,
-        commands::dev::dev_project,
-        commands::dev::dev_projection_status,
-        commands::dev::dev_model_status,
-        commands::dev::dev_download_model,
-        commands::dev::dev_session_info,
+        commands::library::add_library_root,
+        commands::library::list_library_roots,
+        commands::library::remove_library_root,
+        commands::library::set_root_enabled,
+        commands::library::scan_library,
+        commands::library::cancel_scan,
+        commands::cloud::get_point_cloud,
+        commands::cloud::get_feature_column,
+        commands::cloud::query_samples,
+        commands::samples::get_sample_detail,
+        commands::samples::get_similar,
+        commands::samples::set_tag,
+        commands::samples::unset_tag,
+        commands::samples::list_tags,
+        commands::samples::create_collection,
+        commands::samples::reveal_in_finder,
+        commands::samples::play_sample,
+        commands::samples::stop_playback,
+        commands::projection::start_refit,
+        commands::projection::cancel_refit,
+        commands::model::get_model_status,
+        commands::model::download_model,
+        commands::model::cancel_download,
     ]
-}
-
-#[cfg(not(debug_assertions))]
-fn dev_commands() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static {
-    tauri::generate_handler![]
 }
 
 /// Builds and runs the desktop application.
@@ -69,7 +83,11 @@ pub fn run() {
     #[allow(clippy::expect_used)]
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(dev_commands())
+        .invoke_handler(command_handler())
+        // Transport 3 (`overview.md` §6.4). Registered on the builder rather than served
+        // from a command so waveform fetches get the WebView's own HTTP cache and never
+        // queue behind the point cloud on the IPC handler.
+        .register_uri_scheme_protocol(peaks::SCHEME, peaks::handle)
         .setup(|app| {
             // ~/Library/Application Support/<bundle-id>/, created on first run.
             let data_dir = app.path().app_data_dir()?;
@@ -82,6 +100,12 @@ pub fn run() {
             // only honest if init genuinely happens somewhere else. See
             // `model::session::LazySession`.
             app.manage(Model::new(&data_dir));
+
+            // Both are empty containers. `Jobs` is three mutexes; `PeakCache` holds one
+            // decoder whose buffer pool allocates lazily -- neither reads a file, and
+            // neither is on the path from launch to first frame.
+            app.manage(Jobs::new());
+            app.manage(PeakCache::new());
             Ok(())
         })
         .build(tauri::generate_context!())

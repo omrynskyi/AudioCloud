@@ -155,6 +155,15 @@ pub struct ScanOptions<'a> {
     /// the middle of a measurement.
     #[allow(clippy::type_complexity)]
     sink: Option<Box<dyn FnMut(ProgressSnapshot) + Send + 'static>>,
+    /// Called once per root, with the `scan_runs` id, the instant that row is opened.
+    ///
+    /// The seam Phase 6's `scan_library` needs. `overview.md` §6.1 has that command return
+    /// a `scanId` while the scan itself keeps running, and the id is assigned by the insert
+    /// in [`scan_root_with`] -- so the command spawns the job, waits on this callback for
+    /// the id, registers the cancellation token under it, and answers. Milliseconds, not a
+    /// scan's duration.
+    #[allow(clippy::type_complexity)]
+    on_start: Option<Box<dyn Fn(i64) + Send + Sync + 'static>>,
 }
 
 impl std::fmt::Debug for ScanOptions<'_> {
@@ -165,6 +174,7 @@ impl std::fmt::Debug for ScanOptions<'_> {
             .field("padding", &self.padding)
             .field("batch", &self.batch)
             .field("ticking", &self.sink.is_some())
+            .field("watched", &self.on_start.is_some())
             .finish()
     }
 }
@@ -179,6 +189,7 @@ impl<'a> ScanOptions<'a> {
             batch: BatchConfig::default(),
             progress: Arc::new(ScanProgress::new()),
             sink: None,
+            on_start: None,
         }
     }
 
@@ -218,6 +229,16 @@ impl<'a> ScanOptions<'a> {
         F: FnMut(ProgressSnapshot) + Send + 'static,
     {
         self.sink = Some(Box::new(sink));
+        self
+    }
+
+    /// Registers a callback that receives the `scan_runs` id as soon as the row is opened,
+    /// before any file is touched.
+    pub fn on_start<F>(mut self, f: F) -> Self
+    where
+        F: Fn(i64) + Send + Sync + 'static,
+    {
+        self.on_start = Some(Box::new(f));
         self
     }
 
@@ -510,6 +531,9 @@ pub fn scan_root_with(
     );
 
     let scan_id = db.writer().start_scan(Some(root_id))?;
+    if let Some(on_start) = options.on_start.as_ref() {
+        on_start(scan_id);
+    }
     // The ticker starts before the stages and is dropped after them, so the terminal
     // snapshot reports the scan's real final counts rather than whatever the last 100 ms
     // boundary happened to catch (`overview.md` §6.5).

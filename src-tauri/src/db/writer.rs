@@ -152,6 +152,21 @@ enum Command {
         run_id: i64,
         reply: Reply<()>,
     },
+    SetTag {
+        sample_id: i64,
+        tag_name: String,
+        reply: Reply<()>,
+    },
+    UnsetTag {
+        sample_id: i64,
+        tag_name: String,
+        reply: Reply<()>,
+    },
+    CreateCollection {
+        name: String,
+        sample_ids: Vec<i64>,
+        reply: Reply<i64>,
+    },
     Flush {
         reply: Reply<()>,
     },
@@ -192,6 +207,13 @@ impl Command {
                 | Command::BeginProjectionRun { .. }
                 | Command::ActivateProjectionRun { .. }
                 | Command::DiscardProjectionRun { .. }
+                // Tags and collections are real user work, not a derived cache. A tag the
+                // user typed and a crash a moment later must not be a tag they have to type
+                // again, and the FTS reindex that accompanies it has to land in the same
+                // transaction or search would disagree with the sidebar.
+                | Command::SetTag { .. }
+                | Command::UnsetTag { .. }
+                | Command::CreateCollection { .. }
                 | Command::Flush { .. }
         )
     }
@@ -370,6 +392,45 @@ impl WriterHandle {
         self.request(|reply| Command::DiscardProjectionRun { run_id, reply })
     }
 
+    /// Attaches a tag to a sample, creating the tag if this is its first use.
+    ///
+    /// Idempotent: tagging an already-tagged sample succeeds and changes nothing.
+    pub fn set_tag(&self, sample_id: i64, tag_name: impl Into<String>) -> Result<(), DbError> {
+        let tag_name = tag_name.into();
+        self.request(|reply| Command::SetTag {
+            sample_id,
+            tag_name,
+            reply,
+        })
+    }
+
+    /// Removes a tag from a sample. The tag itself survives with a count of zero -- see
+    /// [`queries::all_tags`].
+    ///
+    /// [`queries::all_tags`]: super::queries::all_tags
+    pub fn unset_tag(&self, sample_id: i64, tag_name: impl Into<String>) -> Result<(), DbError> {
+        let tag_name = tag_name.into();
+        self.request(|reply| Command::UnsetTag {
+            sample_id,
+            tag_name,
+            reply,
+        })
+    }
+
+    /// Creates a collection holding the given samples, in the order given.
+    pub fn create_collection(
+        &self,
+        name: impl Into<String>,
+        sample_ids: Vec<i64>,
+    ) -> Result<i64, DbError> {
+        let name = name.into();
+        self.request(|reply| Command::CreateCollection {
+            name,
+            sample_ids,
+            reply,
+        })
+    }
+
     /// Commits the open batch and returns once it is durable.
     pub fn flush(&self) -> Result<(), DbError> {
         self.request(|reply| Command::Flush { reply })
@@ -534,6 +595,21 @@ impl Writer {
             Command::DiscardProjectionRun { run_id, reply } => {
                 answer(reply, discard_projection_run(conn, run_id))
             }
+            Command::SetTag {
+                sample_id,
+                tag_name,
+                reply,
+            } => answer(reply, set_tag(conn, sample_id, &tag_name)),
+            Command::UnsetTag {
+                sample_id,
+                tag_name,
+                reply,
+            } => answer(reply, unset_tag(conn, sample_id, &tag_name)),
+            Command::CreateCollection {
+                name,
+                sample_ids,
+                reply,
+            } => answer(reply, create_collection(conn, &name, &sample_ids)),
             Command::Flush { reply } => answer(reply, Ok(())),
             Command::Shutdown => Box::new(|| {}),
         }
@@ -842,6 +918,120 @@ fn discard_projection_run(conn: &Connection, run_id: i64) -> Result<(), DbError>
         [run_id],
     )?;
     Ok(())
+}
+
+/// The tag names indexed against one sample, in the order [`fts_tag_text`] joins them.
+///
+/// Read *before* a change and again *after* it, because `samples_fts` is contentless: an
+/// fts5 table with `content = ''` stores no copy of the text, so a row is deleted by
+/// re-supplying the exact values it was indexed with. Get the old text wrong and the delete
+/// silently corrupts the index instead of failing, which is why this is one function used by
+/// both sides rather than two expressions that look alike.
+fn fts_tag_text(conn: &Connection, sample_id: i64) -> Result<String, DbError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT t.name FROM tags t
+         JOIN sample_tags st ON st.tag_id = t.id
+         WHERE st.sample_id = ?1
+         ORDER BY t.name COLLATE NOCASE",
+    )?;
+    let names = stmt
+        .query_map([sample_id], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(names.join(" "))
+}
+
+/// Rewrites one sample's `samples_fts` row so search sees the tags the sidebar shows.
+///
+/// `old_tags` is what the index currently holds; `filename` is a function of `rel_path`,
+/// which together with `root_id` is the row's identity, so it never changes and both halves
+/// of the delete/insert pair use the same value.
+fn reindex_sample(conn: &Connection, sample_id: i64, old_tags: &str) -> Result<(), DbError> {
+    let filename: String = conn.query_row(
+        "SELECT filename FROM samples WHERE id = ?1",
+        [sample_id],
+        |r| r.get(0),
+    )?;
+
+    conn.prepare_cached(
+        "INSERT INTO samples_fts (samples_fts, rowid, filename, tags) VALUES ('delete', ?1, ?2, ?3)",
+    )?
+    .execute((sample_id, &filename, old_tags))?;
+
+    let new_tags = fts_tag_text(conn, sample_id)?;
+    conn.prepare_cached("INSERT INTO samples_fts (rowid, filename, tags) VALUES (?1, ?2, ?3)")?
+        .execute((sample_id, &filename, &new_tags))?;
+
+    Ok(())
+}
+
+/// Attaches a tag, creating it on first use.
+///
+/// The `ON CONFLICT DO NOTHING` plus a separate `SELECT` rather than `RETURNING id`: the
+/// name column is `COLLATE NOCASE`, so "Kick" and "kick" are the same tag, and `RETURNING`
+/// on a no-op conflict returns nothing at all. Two statements say what is meant.
+fn set_tag(conn: &Connection, sample_id: i64, tag_name: &str) -> Result<(), DbError> {
+    let name = tag_name.trim();
+    if name.is_empty() {
+        return Ok(());
+    }
+
+    let old_tags = fts_tag_text(conn, sample_id)?;
+
+    conn.prepare_cached("INSERT INTO tags (name) VALUES (?1) ON CONFLICT(name) DO NOTHING")?
+        .execute([name])?;
+    let tag_id: i64 =
+        conn.query_row("SELECT id FROM tags WHERE name = ?1", [name], |r| r.get(0))?;
+
+    // The foreign key is what rejects a tag on a sample that does not exist, so an unknown
+    // id is a constraint violation with a real message rather than a silent no-op.
+    conn.prepare_cached(
+        "INSERT INTO sample_tags (sample_id, tag_id) VALUES (?1, ?2)
+         ON CONFLICT(sample_id, tag_id) DO NOTHING",
+    )?
+    .execute((sample_id, tag_id))?;
+
+    reindex_sample(conn, sample_id, &old_tags)
+}
+
+/// Detaches a tag. The `tags` row survives with a count of zero -- a tag the user invented
+/// and then cleared off every sample is still a tag they invented.
+fn unset_tag(conn: &Connection, sample_id: i64, tag_name: &str) -> Result<(), DbError> {
+    let name = tag_name.trim();
+    let old_tags = fts_tag_text(conn, sample_id)?;
+
+    let removed = conn
+        .prepare_cached(
+            "DELETE FROM sample_tags
+             WHERE sample_id = ?1
+               AND tag_id = (SELECT id FROM tags WHERE name = ?2)",
+        )?
+        .execute((sample_id, name))?;
+
+    if removed == 0 {
+        return Ok(());
+    }
+    reindex_sample(conn, sample_id, &old_tags)
+}
+
+/// Creates a collection over the given samples, preserving the order they were given in.
+///
+/// `position` is that order, and it is the reason a collection is not just a tag: a tag is a
+/// set, and a collection is a sequence the user arranged.
+fn create_collection(conn: &Connection, name: &str, sample_ids: &[i64]) -> Result<i64, DbError> {
+    conn.prepare_cached("INSERT INTO collections (name, created_at) VALUES (?1, ?2)")?
+        .execute((name.trim(), now_ms()))?;
+    let collection_id = conn.last_insert_rowid();
+
+    let mut insert = conn.prepare_cached(
+        "INSERT INTO collection_members (collection_id, sample_id, position)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(collection_id, sample_id) DO NOTHING",
+    )?;
+    for (position, sample_id) in sample_ids.iter().enumerate() {
+        insert.execute((collection_id, sample_id, position as i64))?;
+    }
+
+    Ok(collection_id)
 }
 
 fn add_root(conn: &Connection, path: &str, label: Option<&str>) -> Result<i64, DbError> {

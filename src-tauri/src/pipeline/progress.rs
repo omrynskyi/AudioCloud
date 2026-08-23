@@ -10,6 +10,9 @@
 //! changes nothing on the producer side, which is the point -- the throttle is a property
 //! of the pipeline, not a favour the IPC layer does for it.
 
+use serde::Serialize;
+use ts_rs::TS;
+
 use std::{
     sync::{
         atomic::{AtomicU64, AtomicU8, Ordering},
@@ -29,7 +32,9 @@ pub const TICK: Duration = Duration::from_millis(100);
 /// "Mostly", because the stages overlap by design -- the walker is still finding files
 /// while the embedder is running batches. The phase is the furthest stage that has started,
 /// which is what a progress label is actually asking about.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "ScanPhase.ts")]
 #[repr(u8)]
 pub enum ScanPhase {
     Walking = 0,
@@ -183,9 +188,14 @@ impl ScanProgress {
 
 /// What one tick reports.
 ///
-/// `ts-rs` derives and the `Channel<ScanProgress>` that carries this are Phase 6; the shape
-/// is `overview.md` §6.5's, so that phase adds derives rather than a translation layer.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The shape is `overview.md` §6.5's, which is why Phase 6 could add derives here rather
+/// than a translation layer: this *is* the wire type, carried by `Channel<ScanEvent>` as
+/// the `progress` variant and exported to TypeScript as `ScanProgress`. It is named
+/// `ProgressSnapshot` in Rust only because [`ScanProgress`] -- the counter set -- got the
+/// obvious name first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename = "ScanProgress", export_to = "ScanProgress.ts")]
 pub struct ProgressSnapshot {
     pub scan_id: i64,
     pub phase: ScanPhase,

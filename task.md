@@ -454,26 +454,76 @@ safe.
 
 *Goal: the frontend can pull the real 50,000-point cloud as one ArrayBuffer.*
 
-- [ ] Implement the JSON command surface from `overview.md` §6.1
-- [ ] `AppError` (§6.7) with `thiserror` + tagged serde
-- [ ] `get_point_cloud` as `ipc::Response` raw bytes: magic + version + count + 16-byte
+- [x] Implement the JSON command surface from `overview.md` §6.1
+- [x] `AppError` (§6.7) with `thiserror` + tagged serde
+- [x] `get_point_cloud` as `ipc::Response` raw bytes: magic + version + count + 16-byte
       aligned header, struct-of-arrays body
-- [ ] `get_feature_column` and `query_samples` on the same binary transport
-- [ ] `protocol/peaks.rs`: register the `abpeaks://` URI scheme; generate and cache
+- [x] `get_feature_column` and `query_samples` on the same binary transport
+- [x] `protocol/peaks.rs`: register the `abpeaks://` URI scheme; generate and cache
       waveform peak summaries; immutable cache headers
-- [ ] `Channel<ScanProgress>` and `Channel<RefitProgress>`, throttled to ≤ 10 Hz, with a
+- [x] `Channel<ScanProgress>` and `Channel<RefitProgress>`, throttled to ≤ 10 Hz, with a
       guaranteed terminal event on complete / cancel / fail
-- [ ] `ts-rs` (12.x) derives on every IPC type; generated output to `src/bindings/`
-- [ ] CI check: fail the build if committed bindings differ from generated
-- [ ] `src/ipc/binary.ts`: ArrayBuffer decoders, alignment assertions, magic/version check
+- [x] `ts-rs` (12.x) derives on every IPC type; generated output to `src/bindings/`
+- [x] CI check: fail the build if committed bindings differ from generated
+- [x] `src/ipc/binary.ts`: ArrayBuffer decoders, alignment assertions, magic/version check
       with a clear error on mismatch
-- [ ] `capabilities/main.json` with the minimum permission set; confirm the `fs` plugin is
+- [x] `capabilities/main.json` with the minimum permission set; confirm the `fs` plugin is
       **not** granted
-- [ ] Integration test: 50k point cloud round-trips and the payload is ≤ 900 KB
+- [x] Integration test: 50k point cloud round-trips and the payload is ≤ 900 KB
 
 **Exit criteria:** the frontend fetches the real 50k point cloud in one call, payload
 **≤ 900 KB**, decoded into typed arrays in **< 300 ms**; progress events arrive at ≤ 10 Hz
 during a live scan; TypeScript types are generated and CI-enforced.
+
+**Deviations, each deliberate:**
+
+1. **`start_refit` returns a job id, not a `runId`.** `overview.md` §3.8 creates the shadow
+   `projection_runs` row only once there are coordinates to write, which is minutes into a
+   50,000-point UMAP fit; a command that returned the run id would have to block for the
+   length of the job. The run id arrives in the terminal `RefitEvent`, which is where the
+   frontend wants it anyway — it identifies the map now on screen, and before the swap there
+   is no such map.
+2. **`cancel_refit` and `cancel_download` are new commands.** §6.1 lists only `cancel_scan`.
+   Cross-cutting rule 6 says every long operation is cancellable, and a minutes-long re-fit
+   and a 200 MB transfer are both long operations. `set_root_enabled` is new for the same
+   kind of reason: `library_roots.enabled` has been in the schema since Phase 1 with nothing
+   able to set it.
+3. **`AppError::InvalidArgument` is a variant §6.7 does not list.** A well-typed argument
+   can still carry an unusable value — a blank tag, an empty collection name — and `NotFound`
+   is about an id the database does not have. Collapsing them produces "Not found: a
+   collection needs a name". The variant names the offending field so the UI highlights an
+   input instead of raising a dialog. It is also what lets the command layer refuse a bad
+   argument *before* the writer sees it, which matters because a durable command commits its
+   transaction even when it fails: `set_tag` on an unknown sample id would otherwise leave
+   behind a `tags` row the user never finished making.
+4. **`AppError::Unavailable` is a variant §6.7 does not list.** `play_sample` and
+   `stop_playback` are in §6.1 and their engine is Phase 8. Omitting them would desynchronize
+   the type surface from §6.1 — which `task.md`'s own parallelism note relies on, since
+   Phase 9's shell is meant to be buildable against these bindings — and returning `Internal`
+   would tell the user something went wrong when nothing did. The variant should have no
+   constructors left once Phase 8 lands.
+5. **`abpeaks://` URLs carry a `?v=<updatedAt>` cache-buster.** §6.4's `immutable` header is
+   right for "sample 1234 at revision N" and wrong for "sample 1234", because a rescanned
+   file is different audio under the same id. The full URL is the cache key, so the query
+   string is what makes the immutable promise true; `src/ipc/peaks.ts` is the only place it
+   is built.
+6. **The waveform summary covers the decoded window, not the file.** `decode` stops at
+   `WINDOW_SECONDS`, so a four-minute loop summarizes to its first ten seconds. The `ABPK`
+   header's reserved word carries `coveredMs` so the frontend can mark where the summary
+   stops rather than drawing ten seconds edge to edge under a label reading "4:07".
+7. **`get_similar` is exact brute force, not the Phase 5 HNSW index.** That index is built
+   inside a re-fit, over a corpus snapshot, tuned for embedding quality rather than query
+   latency, and does not outlive the job. One pass over 50,000 × 512 f16 is 51 MB of
+   sequential page-cache reads; a second persistent index would put an approximate answer's
+   recall between the question and the truth, and would be a cache with a coherence problem.
+8. **`commands/dev.rs` is deleted.** It said Phase 6 would replace it, and it has.
+   `dev_session_info` was the only command with no equivalent on the real surface; forcing
+   the lazy session is now reachable through a scan, and `get_model_status` reports whether
+   it is built without causing it.
+
+**Measured:** payload 800,016 B against 900 KB; decode to typed arrays 0.001 ms against
+300 ms (it is four typed-array views over the received buffer — no parse, no copy). See
+[`BENCHMARKS.md`](BENCHMARKS.md).
 
 ---
 

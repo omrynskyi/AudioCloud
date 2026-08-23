@@ -10,11 +10,17 @@
 
 mod support;
 
-use std::{path::Path, time::Instant};
+use std::{
+    path::Path,
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 
 use audiobank_lib::{
     db::{queries, Database, SampleStatus},
-    pipeline::{scan_root, CancellationToken, ScanReport},
+    pipeline::{
+        scan_root, scan_root_with, CancellationToken, ScanOptions, ScanProgress, ScanReport,
+    },
     EMBEDDING_DIM,
 };
 use support::{noise, sine, write_sine, write_wav, WavFormat};
@@ -547,6 +553,58 @@ fn empty_and_undersized_files_are_ignored_rather_than_quarantined() {
     let report = fx.scan();
     assert_eq!(fx.count(), 1);
     assert_eq!(report.counts.files_failed, 0);
+}
+
+/// The seam Phase 6's `scan_library` returns a `scanId` through (`overview.md` §6.1).
+///
+/// The command has to answer with the id of a scan that is still running, and the id is
+/// assigned by the `INSERT` that opens the `scan_runs` row -- so this must fire before any
+/// file is touched, and it must fire exactly once per root.
+#[test]
+fn a_scan_announces_its_id_before_it_reads_anything() {
+    let fx = Fixture::new();
+    for i in 0..8 {
+        write_sine(
+            &fx.path(&format!("tone_{i}.wav")),
+            220.0 + i as f32 * 20.0,
+            0.2,
+        );
+    }
+
+    let announced: Arc<Mutex<Vec<i64>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen_at_announcement = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+
+    let cancel = CancellationToken::new();
+    let mut options = ScanOptions::new(&cancel);
+    let counters = options.progress();
+    options = options.on_start({
+        let announced = Arc::clone(&announced);
+        let seen_at_announcement = Arc::clone(&seen_at_announcement);
+        let counters = Arc::clone(&counters);
+        move |scan_id| {
+            announced.lock().unwrap().push(scan_id);
+            seen_at_announcement.store(
+                ScanProgress::read(&counters.seen),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    });
+
+    let report = scan_root_with(&fx.db, fx.root_id, &mut options).unwrap();
+
+    let announced = announced.lock().unwrap();
+    assert_eq!(
+        *announced,
+        vec![report.scan_id],
+        "the id was announced {} times",
+        announced.len()
+    );
+    assert_eq!(
+        seen_at_announcement.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "the walker had already started when the id was announced"
+    );
+    assert_eq!(report.counts.files_added, 8);
 }
 
 /// `scan_root` on a root that no longer exists must fail with the typed error, not a panic

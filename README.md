@@ -6,7 +6,7 @@ A spatial browser for large sample libraries. Samples are embedded with CLAP, pr
 - [`overview.md`](overview.md) — the architecture.
 - [`task.md`](task.md) — the implementation roadmap, phase by phase.
 
-**Status: Phase 5 implemented, Phase 3's gate not yet passed.** An empty window builds and
+**Status: Phase 6 implemented, Phase 3's gate not yet passed.** An empty window builds and
 launches, and behind it the ingest pipeline is real and complete: point it at a folder of
 audio and it walks, hashes, deduplicates, decodes, analyzes, computes CLAP's log-mel
 spectrogram, embeds it in batches through one shared `ort` session, and writes both the DSP
@@ -15,10 +15,17 @@ wrote, and a resume that finishes what an interrupted scan started.
 
 Phase 5 turns those vectors into a map. Two projectors behind one trait — a deterministic
 PCA and UMAP over a vendored `annembed` — reduce 512 dimensions to 3, and the layout is kept
-*stable* across re-fits: Procrustes alignment (reflection allowed) onto the previous map, a
+_stable_ across re-fits: Procrustes alignment (reflection allowed) onto the previous map, a
 shadow run swapped in atomically so a reader never sees half a map, and an incremental path
 that places a small import without moving one existing point. A 50,000 × 512 UMAP re-fit
 takes 58 s against a five-minute budget. See [Phase 5 status](#phase-5-status).
+
+Phase 6 opens that up to the frontend. The full command surface of `overview.md` §6.1 is
+implemented and reachable, errors cross the boundary as a typed discriminated union rather
+than as strings, and the payloads that are the size of the library take the binary
+transport: the 50,000-point cloud is **one 800 KB `ArrayBuffer`** that becomes four typed
+arrays with no parse and no copy. TypeScript types are generated from the Rust structs and
+CI-enforced. See [Phase 6 status](#phase-6-status).
 
 What is **not** done is the one thing Phase 3 is actually for. Exporting the ONNX file and
 recording the reference embeddings requires running LAION-CLAP under PyTorch, which is a
@@ -72,32 +79,52 @@ The app data directory — the SQLite database, its WAL, and `embeddings.bin` �
 is a supported reset: every row in it is derived from files on disk, apart from library
 roots, tags, and collections.
 
-### Running a scan
+### Driving it
 
-The real IPC surface is Phase 6. Until then there are three development commands, compiled
-only into debug builds so they cannot quietly become the surface Phase 6 was meant to build.
-From the devtools console under `cargo tauri dev`:
+There is no UI yet — Phase 9 builds the shell. Until then the real IPC surface is reachable
+from the devtools console under `cargo tauri dev`, and it is the same surface the app will
+ship with; the debug-only `dev_*` commands that stood in for it through Phases 2–5 are gone.
 
 ```js
-const { invoke } = window.__TAURI__.core;
+const { invoke, Channel } = window.__TAURI__.core;
 
-await invoke('dev_add_root', { path: '/Users/you/Library/Audio/Samples' });
-await invoke('dev_list_roots');
-await invoke('dev_scan'); // walks, decodes, analyzes, embeds, and returns counts
-await invoke('dev_neighbors', { query: 'kick', limit: 20 }); // nearest neighbors, by cosine
+await invoke('add_library_root', { path: '/Users/you/Library/Audio/Samples' });
+await invoke('list_library_roots');
+
+// Scans are long, so they stream. The promise resolves with a scanId as soon as the run row
+// exists; progress arrives on the channel at <= 10 Hz and always ends in a `finished` event.
+const progress = new Channel();
+progress.onmessage = (e) => console.log(e);
+const scanId = await invoke('scan_library', { rootId: 1, onProgress: progress });
+// await invoke('cancel_scan', { scanId });
+
+// Then build the map. Same shape: a job id now, the run id in the terminal event.
+const refit = new Channel();
+refit.onmessage = (e) => console.log(e);
+await invoke('start_refit', { params: { algorithm: 'umap' }, onProgress: refit });
 ```
 
-`dev_scan` returns files seen / added / skipped / failed, how many were decoded against how
-many were deduplicated against how many were embedded, and the totals in the database
-afterwards. Run it twice: the second run should report everything skipped and finish in a
-fraction of the time.
+`scan_library` embeds if — and only if — a model is installed. A scan with no model is not a
+failure: it leaves its rows at `decoded`, and the next scan with a session finishes them,
+because a library is worth indexing before a 200 MB download is. Run it twice on the same
+folder — the second run should report everything skipped and finish in a fraction of the
+time.
 
-It embeds if — and only if — a model is installed; the `inference` field says which execution
-provider bound, or why no session was used. A scan with no model is not a failure. It leaves
-its rows at `decoded`, and the next scan with a session finishes them, because a library is
-worth indexing before a 200 MB download is.
+Three commands answer in raw bytes rather than JSON, which `invoke` hands back as an
+`ArrayBuffer`:
 
-`dev_neighbors` is the instrument for [risk 5](overview.md#10-risk-register): it ranks every
+```js
+const cloud = await invoke('get_point_cloud'); // 800 KB at 50,000 points
+const bpm = await invoke('get_feature_column', { feature: 'bpm' });
+const ids = await invoke('query_samples', {
+  filter: { rootIds: [], tags: [], exts: ['wav'], features: [], projectedOnly: true },
+});
+```
+
+Decoding those is `src/ipc/binary.ts`, and the typed wrappers around every command are
+`src/ipc/commands.ts` — nothing outside `src/ipc/` calls `invoke` directly.
+
+`get_similar` is the instrument for [risk 5](overview.md#10-risk-register): it ranks every
 stored vector against one sample by exact cosine over the memory-mapped matrix. Brute force
 on purpose — an approximate index would put its own recall between the question and the
 answer. It is what the "do kicks retrieve kicks" evaluation will be run through, and it will
@@ -105,23 +132,22 @@ return nonsense until the real model exists.
 
 ### Model provisioning
 
-Three more debug-only commands cover Phase 3. They do nothing useful until the model has
-been exported and pinned (see [Phase 3 status](#phase-3-status)), and `dev_model_status`
-will say so.
-
 ```js
-await invoke('dev_model_status'); // installed / downloadable / unpinned, and partial bytes
-await invoke('dev_download_model'); // resumable, verified, atomic install
-await invoke('dev_session_info'); // forces the lazy session; reports the bound provider
+await invoke('get_model_status'); // installed / downloadable / unpinned, and partial bytes
+const dl = new Channel();
+dl.onmessage = (e) => console.log(e);
+await invoke('download_model', { onProgress: dl }); // resumable, verified, atomic install
+// await invoke('cancel_download');
 ```
+
+These do nothing useful until the model has been exported and pinned (see
+[Phase 3 status](#phase-3-status)), and `get_model_status` will say so — it reports
+`unpinned`, and `download_model` refuses, because there is nothing safe to fetch. That is the
+correct behaviour for this state, not a bug, and it is what
+[`session.rs`](src-tauri/tests/session.rs) exercises with synthetic graphs instead.
 
 `AUDIOBANK_FORCE_CPU=1` skips CoreML, which is how the "verified CPU fallback" half of the
 Phase 3 exit criteria gets exercised without a machine that lacks a Neural Engine.
-
-Until the model is exported and pinned, `dev_model_status` reports `unpinned`,
-`dev_download_model` refuses (there is nothing safe to fetch), and `dev_session_info` reports
-no model. That is the correct behaviour for this state, not a bug — and it is what
-[`session.rs`](src-tauri/tests/session.rs) exercises with synthetic graphs instead.
 
 Benchmarks are `#[ignore]`d, so they compile on every `cargo test` and run only on request:
 
@@ -185,6 +211,52 @@ embeddings that are the parity oracle. Until then the gate in
    in both Python and Rust rather than committed as 19 MB of wavs, and each carries a
    waveform probe — so a drift between the two generators reports itself instead of arriving
    later disguised as a parity failure.
+
+## Phase 6 status
+
+Phase 6's exit criteria are met. The 50,000-point cloud is one **800,016-byte** payload
+against a 900 KB budget, and it becomes four typed arrays in **0.001 ms** against a 300 ms
+budget — which is not a fast decoder, it is the absence of one. Numbers in
+[`BENCHMARKS.md`](BENCHMARKS.md).
+
+Four things worth knowing before touching this code:
+
+**`get_feature_column` carries no ids, and the order is the contract.** The column is in the
+point cloud's order, and both come from the same `ORDER BY sample_id` over the active
+projection, so index `i` is the same sample in both. Shipping ids alongside would add 200 KB
+to a payload that is refetched every time the user changes what the map is coloured by. The
+`count` in the header is what makes a mismatched pair — a re-fit landing between the two
+fetches — a caught error on the frontend rather than a map coloured by somebody else's
+numbers. A null cell is `NaN`, not zero: zero is a legitimate value for every column in the
+schema, and "no BPM" is not "0 BPM".
+
+**The header is sixteen bytes because `new Float32Array(buffer, offset, n)` throws on an
+unaligned offset.** Sixteen is a multiple of every alignment a typed array can ask for, so
+every column start is aligned by construction and later versions can add an `f64` column
+without moving anything. The fourth word is reserved rather than removed for the same
+reason; `abpeaks://` spends it on `coveredMs`.
+
+**`start_refit` returns a job id, not a run id, and that is forced rather than chosen.**
+`overview.md` §3.8 creates the shadow `projection_runs` row only once there are coordinates
+to write — minutes into a 50,000-point UMAP fit — so a command that answered with the run id
+would have to block for the length of the job. The run id arrives in the terminal event,
+which is where the frontend wants it: it identifies the map that is now on screen, and before
+the swap there is no such map. `task.md` Phase 6 lists this and seven other deliberate
+deviations.
+
+**`src/bindings/` is generated by `cargo test`, not by a build step.** `ts-rs` exports at
+test time; [`bindings.rs`](src-tauri/tests/bindings.rs) is the generator, and CI fails the
+build if what it writes differs from what is committed. Change a Rust IPC struct, run
+`cargo test`, commit the diff. That test uses an explicit `ts_rs::Config` rather than
+`#[ts(export)]` for one reason worth not re-discovering: ts-rs defaults `i64` to `bigint`,
+and every 64-bit value in this app crosses the boundary as a JSON number that JavaScript
+parses into a `number` — a `bigint` type surface would be a lie about the values behind it.
+
+**What is not covered.** Two commands in `overview.md` §6.1 — `play_sample` and
+`stop_playback` — reject with `{ kind: 'unavailable' }` until Phase 8 builds the audio
+engine. Their signatures are here because the generated bindings are Phase 6's deliverable
+and `task.md`'s parallelism note has Phase 9's shell built against them; a command that
+lies about working would be worse than one that says which feature has not landed.
 
 ## Phase 5 status
 

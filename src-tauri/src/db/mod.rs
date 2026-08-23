@@ -12,6 +12,7 @@
 pub mod embeddings;
 pub mod pool;
 pub mod queries;
+pub mod search;
 pub mod writer;
 
 use std::{
@@ -63,6 +64,19 @@ pub enum DbError {
 
     #[error("embedding at byte {offset} (+{bytes}) lies outside embeddings.bin ({size} bytes)")]
     EmbeddingOutOfRange { offset: u64, bytes: u64, size: u64 },
+
+    /// A filter arrived with more values in one `IN (...)` list than the query builder is
+    /// willing to bind.
+    ///
+    /// Typed rather than folded into [`DbError::Sqlite`] because it is not SQLite's
+    /// complaint: it is this crate refusing to build a statement, and the frontend can
+    /// render "too many filters selected" only if it can tell the two apart.
+    #[error("a filter listed {count} {what}, past the {max} this query builder binds")]
+    FilterTooLarge {
+        what: &'static str,
+        count: usize,
+        max: usize,
+    },
 
     /// A `Mutex` guarding a data-layer resource was left poisoned by a panicking holder.
     ///

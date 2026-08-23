@@ -85,6 +85,16 @@ annembed = { path = "vendor/annembed", features = ["macos-accelerate"] }
 # the metric is cosine and that vectors arrive from the mmap a chunk at a time.
 hnsw_rs = "0.3.4"
 
+# TypeScript bindings (`overview.md` §6.8). Chosen over `specta` because `specta` is still
+# on a `2.0.0-rc` line and this project already carries one pre-1.0 dependency on the
+# critical path (`ort`). Derives live on the IPC types; `cargo test` writes `src/bindings/`,
+# and CI fails the build if what it writes differs from what is committed.
+#
+# A normal dependency rather than a dev-dependency: `#[derive(TS)]` sits on types the crate
+# compiles in every profile, so the trait has to be there in every profile too. The export
+# itself is a `#[test]`, and none of it is reachable from a release build.
+ts-rs = "12.0.1"
+
 # One FFI call: `pthread_set_qos_class_self_np`, so a background re-fit is genuinely
 # background and not merely called that. `overview.md` §3.8 asks for "low priority" and on
 # macOS that word means a QoS class, which no portable Rust API exposes. Already in the tree
@@ -95,6 +105,14 @@ libc = "0.2.189"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+# `test` gives the mock runtime, which is the only way to invoke a `#[tauri::command]`
+# without a window. `tests/surface.rs` uses it to prove that the commands in `overview.md`
+# §6.1 are actually reachable -- that they deserialize their arguments, hand back the right
+# transport, and serialize `AppError` as the tagged union the frontend switches on. Nothing
+# else in the crate can check any of that, because none of it exists until Tauri routes a
+# request. Dev-only: `cargo build --release` does not compile dev-dependencies, so the
+# feature is not in the shipped binary.
+tauri = { version = "2.11.5", features = ["test"] }
 # `macros` for `#[tokio::test]`, which the download tests need in order to drive an async
 # `ensure` to completion. The HTTP server they run against is `std::net` on a plain thread
 # -- see `model::download`'s tests for why it is hand-rolled.

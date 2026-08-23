@@ -489,6 +489,163 @@ pub fn search_samples(conn: &Connection, query: &str, limit: u32) -> Result<Vec<
         .map_err(DbError::from)
 }
 
+/// Everything the inspector needs about one sample, minus its features and tags.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SampleRow {
+    pub id: i64,
+    pub root_id: i64,
+    /// Absolute path of the root. Joined here rather than looked up separately so a
+    /// detail fetch is one statement.
+    pub root_path: String,
+    pub rel_path: String,
+    pub filename: String,
+    pub ext: String,
+    pub size_bytes: i64,
+    pub duration_ms: Option<i64>,
+    pub sample_rate: Option<i64>,
+    pub channels: Option<i64>,
+    pub status: SampleStatus,
+    pub error: Option<String>,
+    pub embedded: bool,
+    pub updated_at: i64,
+}
+
+impl SampleRow {
+    /// Where the file actually is.
+    ///
+    /// **The only place a filesystem path is constructed from database contents**, and the
+    /// reason `rel_path` is stored relative to a root: moving a library is a one-row update
+    /// to `library_roots.path`, and nothing the frontend sends is ever part of a path.
+    /// The frontend has no filesystem permission at all (`overview.md` §2) and asks for
+    /// samples by id, which is what keeps path traversal out of the threat model.
+    pub fn absolute_path(&self) -> std::path::PathBuf {
+        std::path::Path::new(&self.root_path).join(&self.rel_path)
+    }
+}
+
+fn sample_row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<SampleRow> {
+    let status: String = r.get(10)?;
+    Ok(SampleRow {
+        id: r.get(0)?,
+        root_id: r.get(1)?,
+        root_path: r.get(2)?,
+        rel_path: r.get(3)?,
+        filename: r.get(4)?,
+        ext: r.get(5)?,
+        size_bytes: r.get(6)?,
+        duration_ms: r.get(7)?,
+        sample_rate: r.get(8)?,
+        channels: r.get(9)?,
+        status: SampleStatus::parse(&status).unwrap_or(SampleStatus::Pending),
+        error: r.get(11)?,
+        embedded: r.get::<_, Option<i64>>(12)?.is_some(),
+        updated_at: r.get(13)?,
+    })
+}
+
+const SAMPLE_ROW_COLUMNS: &str = "s.id, s.root_id, r.path, s.rel_path, s.filename, s.ext,
+     s.size_bytes, s.duration_ms, s.sample_rate, s.channels, s.status, s.error,
+     s.emb_offset, s.updated_at";
+
+/// One sample row, joined to its root so the absolute path can be formed.
+pub fn sample_row(conn: &Connection, sample_id: i64) -> Result<Option<SampleRow>, DbError> {
+    let sql = format!(
+        "SELECT {SAMPLE_ROW_COLUMNS} FROM samples s
+         JOIN library_roots r ON r.id = s.root_id
+         WHERE s.id = ?1"
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let found = stmt
+        .query_row([sample_id], sample_row_from)
+        .map(Some)
+        .or_else(no_rows_is_none)?;
+    Ok(found)
+}
+
+/// How many samples live under one root.
+pub fn count_samples_for_root(conn: &Connection, root_id: i64) -> Result<i64, DbError> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM samples WHERE root_id = ?1",
+        [root_id],
+        |r| r.get(0),
+    )?)
+}
+
+/// Tag names on one sample, alphabetical.
+pub fn tags_for_sample(conn: &Connection, sample_id: i64) -> Result<Vec<String>, DbError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT t.name FROM tags t
+         JOIN sample_tags st ON st.tag_id = t.id
+         WHERE st.sample_id = ?1
+         ORDER BY t.name COLLATE NOCASE",
+    )?;
+    let rows = stmt.query_map([sample_id], |r| r.get::<_, String>(0))?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(DbError::from)
+}
+
+/// A tag row and how many samples carry it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagRow {
+    pub id: i64,
+    pub name: String,
+    pub color: Option<String>,
+    pub sample_count: i64,
+}
+
+/// Every tag, with its usage count, alphabetical.
+///
+/// `LEFT JOIN` rather than an inner one: a tag the user created and then removed from every
+/// sample still exists, and dropping it from the list the moment its count hits zero would
+/// make it look like the app forgot it.
+pub fn all_tags(conn: &Connection) -> Result<Vec<TagRow>, DbError> {
+    let mut stmt = conn.prepare(
+        "SELECT t.id, t.name, t.color, COUNT(st.sample_id)
+         FROM tags t LEFT JOIN sample_tags st ON st.tag_id = t.id
+         GROUP BY t.id ORDER BY t.name COLLATE NOCASE",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(TagRow {
+            id: r.get(0)?,
+            name: r.get(1)?,
+            color: r.get(2)?,
+            sample_count: r.get(3)?,
+        })
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(DbError::from)
+}
+
+/// A collection row and its size.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectionRow {
+    pub id: i64,
+    pub name: String,
+    pub created_at: i64,
+    pub sample_count: i64,
+}
+
+/// One collection by id, with its size.
+pub fn collection(conn: &Connection, id: i64) -> Result<Option<CollectionRow>, DbError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT c.id, c.name, c.created_at, COUNT(m.sample_id)
+         FROM collections c LEFT JOIN collection_members m ON m.collection_id = c.id
+         WHERE c.id = ?1 GROUP BY c.id",
+    )?;
+    let found = stmt
+        .query_row([id], |r| {
+            Ok(CollectionRow {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                created_at: r.get(2)?,
+                sample_count: r.get(3)?,
+            })
+        })
+        .map(Some)
+        .or_else(no_rows_is_none)?;
+    Ok(found)
+}
+
 /// Turns "no rows" into `None`, leaving every other error alone.
 fn no_rows_is_none<T>(e: rusqlite::Error) -> rusqlite::Result<Option<T>> {
     match e {

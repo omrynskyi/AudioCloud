@@ -278,3 +278,53 @@ correspondences across all similarity transforms, and the identity is one of tho
 aligned RMS can never exceed the unaligned RMS — on any layout, on any run. Asserting on the
 effect size instead failed about one run in eight, which is a test that reports the weather.
 The effect size belongs here, as a measurement.
+
+## Phase 6 — IPC bridge
+
+| Measurement                                | Target   | Actual           |
+| ------------------------------------------ | -------- | ---------------- |
+| Point cloud payload, 50,000 points         | ≤ 900 KB | **800,016 B**    |
+| ...the query behind it                     | —        | 7.3 ms           |
+| ...encoding it                             | —        | 1.3 ms           |
+| Decode to typed arrays, 50,000 points      | < 300 ms | **0.001 ms**     |
+| ...interleaving XYZ (Phase 7's, for scale) | —        | 2.0 ms           |
+| Feature column payload, 50,000 values      | —        | 200,016 B        |
+| ...the query behind it                     | —        | 6.6 ms           |
+| Filter result, 18,604 of 50,000 ids        | —        | 74,432 B, 8.2 ms |
+
+`serve_a_fifty_thousand_point_cloud` produces the Rust half and writes the payload to
+`src-tauri/target/point_cloud_50k.bin`; `scripts/decode_point_cloud.mjs` reads that file and
+times the JavaScript half. **Two languages, one criterion, the same bytes** — a hand-written
+fixture on the JS side would have measured a second guess at what the format is rather than
+the format.
+
+### On the decode number
+
+**0.001 ms is not a fast decoder. It is the absence of one**, and that is the entire argument
+of `overview.md` §6.3. Decoding an `ABPC` payload is four `new Float32Array(buffer, offset,
+n)` calls: no parse, no copy, no allocation beyond four view objects. The 300 ms budget exists
+because the alternative — 3–4 MB of JSON, parsed into 50,000 objects, walked to build typed
+arrays — genuinely costs hundreds of milliseconds and a GC spike that shows up as a stutter on
+load. The measurement's job is not to celebrate a small number; it is to establish that the
+number is small **for a structural reason**, so that a future change which reintroduces a copy
+is visible as a regression of three orders of magnitude rather than of thirty percent.
+
+The interleave row is the honest counterweight. Struct-of-arrays on the wire means the
+frontend weaves the three planar columns into one interleaved position attribute on arrival,
+and that loop is 2.0 ms — a real cost, deliberately moved to the frontend so a single column
+can be fetched on its own when the map's colouring changes. It belongs to Phase 7's
+`scene/buffers.ts` and is measured here only so the trade is stated in numbers.
+
+### Where the milliseconds actually are
+
+Every figure above is dominated by SQLite, not by the transport: 7.3 ms to read 50,000 rows of
+`(sample_id, x, y, z)` through a `WITHOUT ROWID` primary key against 1.3 ms to serialize them.
+That ordering is worth knowing before anyone optimizes the encoder. The filter query is the
+slowest of the three at 8.2 ms, and it is doing the most work — a `LEFT JOIN` onto
+`sample_features`, a range predicate, and a join through `projections` to the active run.
+
+Absent from this table, deliberately: **end-to-end load → first frame**, which `overview.md`
+§7 budgets at < 300 ms. That number spans the WebView IPC hop and Phase 7's geometry build,
+neither of which exists yet, and measuring two thirds of it now would be a figure nobody could
+compare against the one Phase 7 will produce. What Phase 6 owes it is the two halves above,
+which sum to about 11 ms.

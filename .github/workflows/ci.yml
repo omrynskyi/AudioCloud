@@ -69,6 +69,24 @@ jobs:
       - name: test
         run: cargo test --manifest-path src-tauri/Cargo.toml --all-features
 
+      # `cargo test` above is what *writes* src/bindings/ -- the export is a test
+      # (src-tauri/tests/bindings.rs), which is how ts-rs works. This step only checks that
+      # what it wrote is what is committed. A Rust IPC struct that changed shape without its
+      # binding being regenerated fails here rather than as a runtime type error in the
+      # WebView (overview.md 6.8).
+      - name: Generated bindings are up to date
+        run: |
+          if ! git diff --quiet --exit-code -- src/bindings; then
+            echo "::error::src/bindings/ is out of date. Run 'cargo test --manifest-path src-tauri/Cargo.toml' and commit the result."
+            git diff -- src/bindings
+            exit 1
+          fi
+          if [ -n "$(git status --porcelain --untracked-files=all -- src/bindings)" ]; then
+            echo "::error::cargo test generated a binding that is not committed:"
+            git status --porcelain --untracked-files=all -- src/bindings
+            exit 1
+          fi
+
   # Apple Silicon only, by decision. The Intel target below built clean as of Phase 0 --
   # uncomment it to bring back universal-binary support (and with it Phase 11's `lipo`
   # merge and the `ort` universal-binary problem, overview.md 8.1).

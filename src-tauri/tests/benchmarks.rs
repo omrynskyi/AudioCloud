@@ -21,7 +21,11 @@ use std::{sync::Arc, time::Instant};
 mod support;
 
 use audiobank_lib::{
-    db::{queries, Database, EmbeddingStore, NewSample, SampleFeatures, SampleStatus},
+    db::{
+        queries,
+        search::{self, Feature, FeatureRange, QueryFilter},
+        Database, EmbeddingStore, NewSample, SampleFeatures, SampleStatus,
+    },
     model::session::ModelSession,
     pipeline::{
         features::Analyzer, scan_root, scan_root_with, BatchConfig, CancellationToken, ScanOptions,
@@ -1112,5 +1116,152 @@ fn incremental_placement_of_a_small_import() {
     assert!(
         elapsed.as_secs_f64() * 10.0 < umap_elapsed.as_secs_f64(),
         "placement took {elapsed:?} against a {umap_elapsed:?} re-fit"
+    );
+}
+
+/// Exit criteria (`task.md` Phase 6): the 50,000-point cloud is one payload of **≤ 900 KB**,
+/// and building it is not something the user waits on.
+///
+/// Also writes the payload to `target/point_cloud_50k.bin`, which is what
+/// `scripts/decode_point_cloud.mjs` times the JavaScript half against -- the two halves of
+/// the "< 300 ms to typed arrays" criterion measured against the *same bytes* rather than
+/// against two independent fabrications of what the format is supposed to be.
+#[test]
+#[ignore = "benchmark; run under --profile perf"]
+fn serve_a_fifty_thousand_point_cloud() {
+    let data = tempfile::tempdir().unwrap();
+    let db = Database::open(data.path(), EMBEDDING_DIM).unwrap();
+    let root = db.writer().add_root("/library", None).unwrap();
+
+    let mut rng = Xorshift(0xC10D);
+    for chunk in (0..CORPUS).collect::<Vec<_>>().chunks(CHUNK) {
+        let rows: Vec<NewSample> = chunk
+            .iter()
+            .map(|&i| NewSample {
+                root_id: root,
+                rel_path: format!("drums/{i:05}.wav"),
+                filename: format!("{i:05}.wav"),
+                ext: "wav".into(),
+                size_bytes: 2048,
+                mtime: 1_700_000_000 + i as i64,
+                content_hash: None,
+                duration_ms: Some(100 + i as i64),
+                sample_rate: Some(48_000),
+                channels: Some(1),
+                status: SampleStatus::Decoded,
+            })
+            .collect();
+        let ids = db.writer().upsert_samples(rows).unwrap();
+        let features: Vec<(i64, SampleFeatures)> = ids
+            .iter()
+            .map(|&id| {
+                (
+                    id,
+                    SampleFeatures {
+                        spectral_centroid: Some(rng.next_f32() * 8000.0),
+                        bpm: Some(120.0 + rng.next_f32() * 20.0),
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        db.writer().set_features(features).unwrap();
+    }
+    db.writer().flush().unwrap();
+
+    let conn = db.read().unwrap();
+    let ids: Vec<i64> = search::sample_ids(&conn, &Default::default()).unwrap();
+    drop(conn);
+    assert_eq!(ids.len(), CORPUS);
+
+    let run = db
+        .writer()
+        .begin_projection_run("pca", "{}", CORPUS as i64)
+        .unwrap();
+    let points: Vec<(i64, Point3)> = ids
+        .iter()
+        .map(|&id| (id, [rng.next_f32(), rng.next_f32(), rng.next_f32()]))
+        .collect();
+    for chunk in points.chunks(CHUNK) {
+        db.writer()
+            .set_projection_points(run, chunk.to_vec())
+            .unwrap();
+    }
+    db.writer().activate_projection_run(run).unwrap();
+    db.writer().flush().unwrap();
+
+    // What `get_point_cloud` does, timed as two halves: the statement, and the encode.
+    let started = Instant::now();
+    let conn = db.read().unwrap();
+    let read = queries::active_projection_points(&conn).unwrap();
+    let query = started.elapsed();
+    drop(conn);
+    assert_eq!(read.len(), CORPUS);
+
+    let started = Instant::now();
+    let payload = audiobank_lib::ipc::binary::point_cloud(&read).unwrap();
+    let encode = started.elapsed();
+
+    // What `get_feature_column` and `query_samples` do.
+    let conn = db.read().unwrap();
+    let started = Instant::now();
+    let column = search::feature_column(&conn, Feature::SpectralCentroid).unwrap();
+    let column_query = started.elapsed();
+
+    let started = Instant::now();
+    let matches = search::sample_ids(
+        &conn,
+        &QueryFilter {
+            features: vec![FeatureRange {
+                feature: Feature::Bpm,
+                min: Some(125.0),
+                max: None,
+            }],
+            projected_only: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let filter = started.elapsed();
+    drop(conn);
+    assert_eq!(column.len(), CORPUS);
+
+    let column_bytes = audiobank_lib::ipc::binary::feature_column(&column);
+    let id_bytes = audiobank_lib::ipc::binary::id_list(&matches).unwrap();
+
+    let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("point_cloud_50k.bin");
+    std::fs::write(&out, &payload).unwrap();
+
+    println!("\n-- ipc payloads at 50k --");
+    println!(
+        "  point cloud      {:>9} bytes  ({:.0} KB, budget 900 KB)",
+        payload.len(),
+        payload.len() as f64 / 1024.0
+    );
+    println!(
+        "    query          {:>8.1} ms\n    encode         {:>8.1} ms",
+        query.as_secs_f64() * 1000.0,
+        encode.as_secs_f64() * 1000.0
+    );
+    println!(
+        "  feature column   {:>9} bytes  (query {:.1} ms)",
+        column_bytes.len(),
+        column_query.as_secs_f64() * 1000.0
+    );
+    println!(
+        "  filter result    {:>9} bytes  ({} of {} ids, {:.1} ms)",
+        id_bytes.len(),
+        matches.len(),
+        CORPUS,
+        filter.as_secs_f64() * 1000.0
+    );
+    println!("  wrote {}", out.display());
+
+    assert!(
+        payload.len() <= 900 * 1024,
+        "point cloud payload is {} bytes",
+        payload.len()
     );
 }
