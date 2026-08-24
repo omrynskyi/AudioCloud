@@ -1,9 +1,12 @@
 //! Per-sample commands: detail, neighbors, tags, collections, and the two audio ones
 //! (`overview.md` §6.1).
 
+use std::sync::Arc;
+
 use tauri::State;
 
 use crate::{
+    audio::AudioPlayer,
     db::{queries, Database},
     error::AppError,
     ipc::types::{Collection, Neighbor, SampleDetail, SampleFeatureBlock, Tag},
@@ -242,27 +245,26 @@ pub async fn reveal_in_finder(db: State<'_, Database>, sample_id: i64) -> Result
         .map_err(|e| AppError::internal("revealing a sample in Finder", e))
 }
 
-/// Starts previewing a sample.
+/// Starts previewing a sample, retriggering cleanly if one is already playing.
 ///
-/// **Phase 8 builds the engine behind this** (`task.md` Phase 8: `cpal` stream, lock-free
-/// ring, no allocation on the audio thread). The command exists now because its contract is
-/// settled and the generated bindings are Phase 6's deliverable -- `task.md`'s parallelism
-/// note has Phase 9's shell built against this surface while Phases 4-6 are still running,
-/// which is only possible if the surface is complete. Returning
-/// [`AppError::Unavailable`] is the honest form of "not yet": the frontend renders the
-/// transport controls disabled rather than discovering at runtime that a command it was
-/// promised does not exist.
+/// Hover-to-audition's debounce and click-to-play's immediacy are both the frontend's call --
+/// `overview.md` §6.1 fixes this command at `(sampleId, gain)`, with nothing on the wire to
+/// tell the two apart -- but every call here is safe to make as fast as the frontend likes:
+/// [`AudioPlayer::play`] always retriggers through a fresh envelope rather than clicking.
 #[tauri::command]
-pub async fn play_sample(_sample_id: i64, _gain: f32) -> Result<(), AppError> {
-    Err(AppError::Unavailable {
-        feature: "audio preview".into(),
-    })
+pub async fn play_sample(
+    player: State<'_, Arc<AudioPlayer>>,
+    db: State<'_, Database>,
+    sample_id: i64,
+    gain: f32,
+) -> Result<(), AppError> {
+    player.play(&db, sample_id, gain).await?;
+    Ok(())
 }
 
-/// Stops whatever is playing. See [`play_sample`] on why this is not built yet.
+/// Stops whatever is playing.
 #[tauri::command]
-pub async fn stop_playback() -> Result<(), AppError> {
-    Err(AppError::Unavailable {
-        feature: "audio preview".into(),
-    })
+pub async fn stop_playback(player: State<'_, Arc<AudioPlayer>>) -> Result<(), AppError> {
+    player.stop()?;
+    Ok(())
 }

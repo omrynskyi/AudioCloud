@@ -461,3 +461,53 @@ is fine in a developer measurement tool that is never bundled; the alternative i
 whose ability to run depends on which window happens to be in front. It also warns on stderr
 if the system reports the window occluded anyway, so a throttled number cannot be recorded as
 a real one.
+
+## Phase 8 — Audio preview engine
+
+| Measurement                                       | Target        | Actual        |
+| -------------------------------------------------- | ------------- | ------------- |
+| `play_pcm` → first audible sample                  | < 50 ms       | **~16–17 ms** |
+| Audio-thread allocations                           | exactly 0     | **enforced**  |
+| Rapid retrigger storm (20× in 300 ms)               | no panic      | **no panic**  |
+| `stop()` mid-clip                                   | no panic      | **no panic**  |
+
+Measured against the real default output device via `cargo test --test audio_hardware --
+--ignored`, which is not run in CI — headless runners have no audio device, and this is the
+one Phase 8 measurement that genuinely needs one. `tests/audio_hardware.rs` opens
+[`Engine`], plays a synthetic sine burst and a real decoded WAV alike, and prints
+`play_pcm -> first audible sample: 16.98ms` (and, on a second run, 16.12ms) on the machine
+this was developed on.
+
+**What the number is, precisely.** Elapsed time from `Engine::play_pcm` being called to the
+real-time callback's first non-silent sample, read off `Transport::first_audible_nanos`. This
+is the half of the hover-to-audible budget the audio engine owns: queueing, the attack ramp,
+and the ring hand-off. It excludes the IPC round trip from a pointer event to the
+`play_sample` command arriving, and it excludes the frontend's 120 ms hover debounce
+(`scene/PointCloud.tsx`), because neither is observable from a Rust test — `overview.md` §7's
+"hover → audio, < 50 ms" is stated as the whole chain, and 17 ms leaves comfortable room for
+the rest of it. There is no in-process way to measure the full chain the way Phase 7's
+`scripts/webview_eval.swift` measures a real WKWebView frame; that would need an instrumented
+build with a real pointer event, which is a Phase 10 Instruments-pass question, not a unit
+test.
+
+**Zero allocations is not measured here — it is enforced**, the same distinction Phase 5's
+2.95 GiB re-fit finding draws between a measured number and a budgeted one, except this one
+actually holds: `audio::guard::GuardedAlloc`, installed as `#[global_allocator]` in debug
+builds, panics the instant `alloc`/`dealloc`/`realloc` runs while an `AudioThreadGuard` is
+active. `tests/audio_guard.rs` proves the panic actually fires — not merely that the flag
+toggles — by installing its own copy of the allocator in a dedicated integration test binary
+and triggering a real allocation from inside a real guard.
+
+### On the retrigger design, and why it needed no buffer clearing from outside the audio thread
+
+`overview.md` §2 forbids the audio thread from locking, same as it forbids allocating.
+Retriggering — a fast hover sweep, or a click while a clip is already playing — needed a way
+to discard whatever the previous clip had queued without either side taking a lock. The
+answer is a generation counter (`Transport::generation`) rather than an explicit clear
+command: [`Engine::play_pcm`] bumps it, the real-time callback notices the mismatch on its
+very next call and calls `RingConsumer::clear()` itself — which it may, because it is that
+ring half's sole owner — and a decode-ahead task mid-push notices the same mismatch and stops
+writing. Nobody ever reaches across the SPSC boundary to touch the other side's half.
+`audio::engine::tests::a_new_generation_clears_the_previous_ones_stale_audio` is the
+unit-level proof, over a plain `HeapRb` with no `cpal` stream involved; `rapid_retriggers_do_not_panic_or_deadlock`
+above is the same property under real hardware and real scheduling.

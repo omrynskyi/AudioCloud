@@ -206,17 +206,18 @@ export function revealInFinder(sampleId: number): Promise<void> {
 }
 
 /**
- * Starts previewing a sample.
+ * Starts (or retriggers) previewing a sample.
  *
- * **Rejects with `{ kind: 'unavailable' }` until Phase 8 builds the audio engine.** The
- * command's contract is settled, which is why it is here; render the transport controls
- * disabled on that variant rather than assuming it works.
+ * Safe to call as fast as hover events arrive: the engine always retriggers through a fresh
+ * attack/release envelope rather than clicking, so debouncing here is about not machine-gunning
+ * the decoder on a fast cursor sweep, not about avoiding an audible glitch (`task.md` Phase 8).
+ * `gain` is clamped to a sane range on the Rust side regardless of what is passed.
  */
 export function playSample(sampleId: number, gain: number): Promise<void> {
   return invoke('play_sample', { sampleId, gain });
 }
 
-/** Stops playback. See `playSample` on why this is not built yet. */
+/** Stops whatever is playing. A no-op, not an error, if nothing is. */
 export function stopPlayback(): Promise<void> {
   return invoke('stop_playback');
 }

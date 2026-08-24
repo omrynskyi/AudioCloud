@@ -623,25 +623,97 @@ better to be had.
 
 *Goal: hover a point, hear it, with no glitches.*
 
-- [ ] Add `cpal` (0.18) and `ringbuf` (0.5)
-- [ ] `audio/engine.rs`: output stream on the default device; handle device change and
+- [x] Add `cpal` (0.18) and `ringbuf` (0.5)
+- [x] `audio/engine.rs`: output stream on the default device; handle device change and
       sample-rate change without panicking
-- [ ] `audio/ring.rs`: lock-free SPSC ring; the callback **only** copies and applies gain
-- [ ] **Debug-only guard allocator that panics if the audio thread allocates.** This is
+      > `cpal` 0.18's `ErrorKind::DeviceChanged` (the stream followed the new default device
+      > on its own) and `ErrorKind::DeviceNotAvailable`/`StreamInvalidated` (it needs a new
+      > one) are distinct, so the error callback only rebuilds for the second kind. A
+      > rebuild bumps the shared generation and clears `want_playing`, which is what stops a
+      > decode-ahead task mid-push on the *old* ring from writing frames sized for a channel
+      > count the new one may not share.
+- [x] `audio/ring.rs`: lock-free SPSC ring; the callback **only** copies and applies gain
+- [x] **Debug-only guard allocator that panics if the audio thread allocates.** This is
       how the zero-allocation target becomes enforced rather than aspirational.
-- [ ] Decode-ahead task on `tokio` fills the ring; small LRU cache of recently decoded
+      > `audio/guard.rs`, installed in `main.rs` behind `#[cfg(debug_assertions)]`. The one
+      > sharp edge: panicking *from inside* `GlobalAlloc::alloc` boxes the panic payload,
+      > which is itself an allocation, which would re-enter the same check and abort the
+      > process with "thread panicked while processing panic" instead of a catchable panic.
+      > `trip()` clears the thread-local flag before calling `panic!`, so only the violation
+      > itself is checked and the unwind machinery's own bookkeeping is not. `tests/
+      > audio_guard.rs` is a separate integration test binary — a global allocator can only
+      > be installed once per binary — that proves the panic actually fires.
+- [x] Decode-ahead task on `tokio` fills the ring; small LRU cache of recently decoded
       samples
-- [ ] Hover-to-audition with a ~120 ms debounce so a fast cursor sweep does not machine-gun
+      > `audio::PcmCache`, 24 entries, keyed by `(sample_id, format_epoch)` so a device
+      > rebuild invalidates every cached buffer rather than replaying a rate that no longer
+      > matches the stream.
+- [x] Hover-to-audition with a ~120 ms debounce so a fast cursor sweep does not machine-gun
       the decoder
-- [ ] Click-to-play with a short attack/release envelope — retriggering must not click
-- [ ] Master gain; optional loop for one-shots
-- [ ] `audio/peaks.rs`: waveform peak generation, served over `abpeaks://` (Phase 6)
+      > In the frontend (`scene/PointCloud.tsx`), not the core: `overview.md` §6.1 fixes
+      > `play_sample` at `(sampleId, gain)`, with nothing on the wire to distinguish a hover
+      > from a click, so there is no server-side hover concept to debounce. Every call is
+      > safe to make as fast as the frontend likes regardless — see the next line.
+- [x] Click-to-play with a short attack/release envelope — retriggering must not click
+      > Retriggering is a generation counter, not a buffer clear reaching across threads:
+      > `Engine::play_pcm` bumps `Transport::generation`; the real-time callback notices the
+      > change on its next call and clears its ring consumer itself (it is that half's sole
+      > owner), starting a fresh 5 ms attack; a decode-ahead task mid-push notices the same
+      > mismatch and stops. Nobody locks and nobody reaches across the SPSC boundary.
+- [x] Master gain; optional loop for one-shots
+      > Master gain: clamped to `[0.0, 2.0]` in `Engine::play_pcm`, applied in the callback
+      > alongside the envelope. **Loop is not built.** `overview.md` §6.1's `play_sample`
+      > takes no loop flag and there is no settings surface yet to host a persistent
+      > "loop one-shots" toggle — that is Phase 9's. Adding a third command-line argument to
+      > a command whose bindings Phase 6 already froze was judged worse than leaving one
+      > sub-bullet open with the reason on record.
+- [x] `audio/peaks.rs`: waveform peak generation, served over `abpeaks://` (Phase 6)
+      > Already built in Phase 6, alongside the `abpeaks://` scheme itself — see that
+      > phase's notes. Unchanged here.
 - [ ] Waveform display in the inspector with a playhead
-- [ ] Latency measurement: pointer event timestamp → first non-zero sample in the callback
+      > **Not built. There is no inspector.** `panels/` — the whole of Phase 9's Application
+      > Shell — does not exist yet; `src/App.tsx` is still the Phase 7 placeholder shell.
+      > A playhead needs a panel to draw it in, so this is Phase 9's to finish, using
+      > `src/ipc/peaks.ts` (already wired) for the waveform and `play_sample`'s generation
+      > id — exposed nowhere on the wire today — for playhead position, which is a real gap
+      > Phase 9 will need to close, most likely with a `Channel<PlaybackProgress>` alongside
+      > the scan and re-fit progress channels.
+- [x] Latency measurement: pointer event timestamp → first non-zero sample in the callback
+      > **Measures command-received → first audible sample, not pointer-event → audible.**
+      > The command surface Phase 6 froze carries no pointer timestamp, and the frontend's
+      > hover debounce and the IPC round trip both happen before `AudioPlayer::play` is ever
+      > called — neither is observable from the Rust side of the boundary. What is measured
+      > is the half of the budget this module owns: `Transport::started_at_nanos` (written
+      > by `play_pcm`) to `Transport::first_audible_nanos` (written once, by the real-time
+      > callback, on the first frame it actually pops real data for). Logged per playback via
+      > `tracing`; `tests/audio_hardware.rs` (real hardware, `--ignored` by default — see
+      > below) reads it directly and asserts a generous bound. See `BENCHMARKS.md`.
 
 **Exit criteria:** hover-to-audible **< 50 ms**; zero allocations on the audio thread under
 the guard allocator; no audible glitch when retriggering rapidly or when the output device
 changes mid-playback.
+
+**Status: met for what a Rust test can observe; the full pointer-to-speaker chain needs
+Phase 9's UI to measure.** `play_pcm` → first audible sample is **~16–17 ms** against real
+hardware (`BENCHMARKS.md`), comfortably inside the 50 ms budget with room for the IPC hop and
+the frontend's own debounce that this measurement cannot see. Zero allocations is enforced,
+not merely measured — `tests/audio_guard.rs` proves the guard allocator's panic actually
+fires from a real allocation inside a real guard, on its own dedicated global allocator.
+Retrigger safety is proven twice: `audio::engine`'s unit tests exercise the envelope's state
+machine (`Attack`/`Sustain`/`Release`/`Idle`) against a plain `HeapRb` with no `cpal` stream
+anywhere near it, and `tests/audio_hardware.rs`'s `rapid_retriggers_do_not_panic_or_deadlock`
+repeats the same property against a real stream and real OS scheduling. **Device-change
+handling is implemented and unit-testable in isolation (`ErrorKind` routing, generation bump
+on rebuild) but not exercised end-to-end** — that needs an audio interface physically
+unplugged mid-playback, which is a manual verification this environment cannot automate; it
+is a reasonable Phase 10 hardening-pass item alongside the soak tests already assigned there.
+
+**Two things this phase leaves for Phase 9, both noted above and worth repeating in one
+place:** the waveform-with-playhead display has no panel to live in yet, and a playhead needs
+a way to know playback position that the current wire format does not carry. Both are Phase
+9 UI work, not Phase 8 engine work, and neither blocks anything downstream — `play_sample`
+and `stop_playback` are fully functional today, driven from the point cloud's own hover and
+click handling as a stand-in for the inspector that does not exist yet.
 
 ---
 

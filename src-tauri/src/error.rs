@@ -21,6 +21,7 @@ use serde::Serialize;
 use ts_rs::TS;
 
 use crate::{
+    audio::{engine::AudioError, PlaybackError},
     db::DbError,
     model::{download::ModelError, ModelStatus},
     pipeline::PipelineError,
@@ -120,16 +121,22 @@ pub enum AppError {
     /// built yet.
     ///
     /// **A deviation from `overview.md` §6.7's variant list, added deliberately.** The audio
-    /// commands in §6.1 are Phase 8's; their signatures belong in Phase 6 because the
-    /// bindings and the frontend wrappers are Phase 6's deliverable and Phase 9's shell is
-    /// meant to be buildable against them. That leaves three options: omit the commands and
-    /// desynchronize the type surface from §6.1, return `Internal` and tell the user
-    /// something went wrong when nothing did, or say plainly which feature has not landed.
-    /// This is the third. It is expected to have no remaining constructors once Phase 8 is
-    /// done, and its absence from the frontend's switch is then a compile error rather than
-    /// something to remember.
+    /// commands in §6.1 were Phase 6's to type and Phase 8's to build; before Phase 8 landed
+    /// this was `play_sample`'s and `stop_playback`'s only possible answer. Its remaining
+    /// constructor is `start_download`'s "a second download is already running" -- see
+    /// `commands::Jobs::begin_download` -- which is a request refused because the feature it
+    /// asked for is already in flight, not a subsystem that is missing.
     #[error("{feature} is not available in this build yet")]
     Unavailable { feature: String },
+
+    /// No audio output device could be opened, or the one in use disappeared and a
+    /// replacement could not be built.
+    ///
+    /// Distinct from [`AppError::Internal`] on purpose: a machine with no output device (or
+    /// one mid-permission-dialog) is an environment condition a user can plausibly fix --
+    /// plug something in, grant the permission -- not a bug to file a correlation id about.
+    #[error("no audio output device is available: {0}")]
+    AudioDevice(String),
 
     /// A bug, or an environment failure nobody can act on. The only variant the frontend
     /// renders as "something went wrong", and it carries a log correlation id.
@@ -224,6 +231,29 @@ impl From<ProjectionError> for AppError {
             // states no button fixes: they describe the *data*, and the honest rendering is
             // "the map could not be built", with the reason in the log.
             other => AppError::internal("the projection could not be built", other),
+        }
+    }
+}
+
+impl From<AudioError> for AppError {
+    fn from(e: AudioError) -> Self {
+        AppError::AudioDevice(e.to_string())
+    }
+}
+
+impl From<PlaybackError> for AppError {
+    fn from(e: PlaybackError) -> Self {
+        match e {
+            PlaybackError::NotFound(id) => AppError::not_found("sample", id),
+            PlaybackError::Db(db) => db.into(),
+            PlaybackError::Decode { path, reason } => AppError::Decode { path, reason },
+            PlaybackError::Device(audio) => audio.into(),
+            // A resample failure is a `rubato` internal error over a well-formed buffer this
+            // crate built -- nothing about it is the user's file or the user's device, so it
+            // gets the same treatment as any other "should not happen" failure.
+            PlaybackError::Resample(reason) => {
+                AppError::internal("resampling audio for playback", reason)
+            }
         }
     }
 }

@@ -97,6 +97,8 @@ export function describe(error: AppError): string {
       return `${error.detail.field}: ${error.detail.reason}`;
     case 'unavailable':
       return `${error.detail.feature} is not available in this build yet.`;
+    case 'audioDevice':
+      return `No audio output is available: ${error.detail}`;
     case 'internal':
       return `Something went wrong (${error.detail}).`;
   }

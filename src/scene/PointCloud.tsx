@@ -30,6 +30,7 @@ import {
   type WebGLRenderer,
 } from 'three';
 
+import { playSample, stopPlayback } from '../ipc';
 import { useSceneStore } from '../store/scene';
 import { CloudBuffers, DEFAULT_POINT_COLOR, type CloudBufferOptions } from './buffers';
 import { readCaps, type GlCaps } from './caps';
@@ -92,6 +93,18 @@ export interface PointCloudProps {
 
 /** A pointer that moved less than this many CSS pixels between down and up is a click. */
 const CLICK_SLOP_PX = 4;
+
+/**
+ * Debounce before a hover starts audition (`task.md` Phase 8).
+ *
+ * The engine itself never clicks on a retrigger -- every `play_sample` fades through a fresh
+ * envelope -- so this is not here to avoid a glitch. It is here so a cursor sweeping across a
+ * dense cluster does not machine-gun the decoder with one request per point it crosses.
+ */
+const HOVER_AUDITION_DEBOUNCE_MS = 120;
+
+/** A flat default until Phase 9's settings panel exposes a gain control. */
+const PREVIEW_GAIN = 0.85;
 
 export function PointCloud({
   source,
@@ -261,6 +274,43 @@ export function PointCloud({
     [buffers, materials, invalidate],
   );
 
+  // ── Audio preview ─────────────────────────────────────────────────────────────
+  //
+  // Hover auditions after a debounce; a click plays immediately. Both just call the command --
+  // retriggering is always safe, so there is no local "is something already playing" state to
+  // keep in sync with the engine's.
+
+  useEffect(() => {
+    let pending: ReturnType<typeof setTimeout> | null = null;
+    const clearPending = () => {
+      if (pending !== null) {
+        clearTimeout(pending);
+        pending = null;
+      }
+    };
+
+    const unsubscribe = useSceneStore.subscribe(
+      (state) => state.hoveredSampleId,
+      (sampleId) => {
+        clearPending();
+        if (sampleId === null) {
+          // Leaving the cloud entirely stops audition; moving from one point to another does
+          // not need to -- the new hover's debounced `playSample` retriggers cleanly on its own.
+          stopPlayback().catch(() => {});
+          return;
+        }
+        pending = setTimeout(() => {
+          playSample(sampleId, PREVIEW_GAIN).catch(() => {});
+        }, HOVER_AUDITION_DEBOUNCE_MS);
+      },
+    );
+
+    return () => {
+      clearPending();
+      unsubscribe();
+    };
+  }, []);
+
   // ── Picking ───────────────────────────────────────────────────────────────────
 
   const pickAt = useCallback(
@@ -303,11 +353,17 @@ export function PointCloud({
       if (down && Math.hypot(x - down.x, y - down.y) > CLICK_SLOP_PX) return;
 
       const index = pickAt(x, y);
+      const sampleId = index === NO_PICK ? null : (buffers.sampleAt(index) ?? null);
       // Clicking empty space clears the selection, which is what makes the map feel like a
       // canvas rather than a list that happens to be drawn in 3D.
-      useSceneStore
-        .getState()
-        .select(index === NO_PICK ? null : (buffers.sampleAt(index) ?? null));
+      useSceneStore.getState().select(sampleId);
+      // Immediate, not debounced: a click is a deliberate request to hear this one now, not a
+      // cursor passing through.
+      if (sampleId !== null) {
+        playSample(sampleId, PREVIEW_GAIN).catch(() => {});
+      } else {
+        stopPlayback().catch(() => {});
+      }
     };
 
     canvas.addEventListener('pointerdown', onPointerDown);

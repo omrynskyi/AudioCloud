@@ -14,9 +14,17 @@ pub mod pipeline;
 pub mod projection;
 pub mod protocol;
 
+use std::sync::Arc;
+
 use tauri::Manager;
 
-use crate::{audio::peaks::PeakCache, commands::Jobs, db::Database, model::Model, protocol::peaks};
+use crate::{
+    audio::{peaks::PeakCache, AudioPlayer},
+    commands::Jobs,
+    db::Database,
+    model::Model,
+    protocol::peaks,
+};
 
 /// Dimensionality of a CLAP audio-tower embedding (`overview.md` §3.4).
 ///
@@ -101,11 +109,13 @@ pub fn run() {
             // `model::session::LazySession`.
             app.manage(Model::new(&data_dir));
 
-            // Both are empty containers. `Jobs` is three mutexes; `PeakCache` holds one
-            // decoder whose buffer pool allocates lazily -- neither reads a file, and
-            // neither is on the path from launch to first frame.
+            // Three empty containers. `Jobs` is three mutexes; `PeakCache` holds one decoder
+            // whose buffer pool allocates lazily; `AudioPlayer` holds a `LazyEngine` that does
+            // not open an audio device until the first `play_sample`. None of the three reads
+            // a file, touches the network, or opens a device during setup.
             app.manage(Jobs::new());
             app.manage(PeakCache::new());
+            app.manage(Arc::new(AudioPlayer::new()));
             Ok(())
         })
         .build(tauri::generate_context!())

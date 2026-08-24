@@ -14,8 +14,10 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use std::sync::Arc;
+
 use audiobank_lib::{
-    audio::peaks::PeakCache,
+    audio::{peaks::PeakCache, AudioPlayer},
     commands::Jobs,
     db::{Database, NewSample, SampleStatus},
     ipc::binary,
@@ -46,6 +48,7 @@ fn app() -> (TempDir, WebviewWindow<tauri::test::MockRuntime>) {
     app.manage(model);
     app.manage(Jobs::new());
     app.manage(PeakCache::new());
+    app.manage(Arc::new(AudioPlayer::new()));
 
     let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
         .build()
@@ -197,16 +200,17 @@ fn a_failing_command_rejects_with_the_tagged_error_union() {
     assert_eq!(err["kind"], json!("notFound"));
     assert_eq!(err["detail"], json!("sample 999"));
 
-    // Struct-variant fields are camelCase too, which needs `rename_all_fields` and not just
-    // `rename_all` -- a distinction that is invisible until a variant has fields.
+    // `play_sample` checks the database before it ever touches an audio device -- see
+    // `audio::AudioPlayer::play` -- so a stale or made-up sample id fails the same way
+    // `get_sample_detail` does, deterministically, on a machine with no audio hardware at all.
     let err = invoke(
         &webview,
         "play_sample",
         json!({ "sampleId": 1, "gain": 1.0 }),
     )
     .unwrap_err();
-    assert_eq!(err["kind"], json!("unavailable"));
-    assert_eq!(err["detail"]["feature"], json!("audio preview"));
+    assert_eq!(err["kind"], json!("notFound"));
+    assert_eq!(err["detail"], json!("sample 1"));
 }
 
 /// Tags are real user work: the command must commit before it answers, so the list it

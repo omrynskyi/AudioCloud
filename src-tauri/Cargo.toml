@@ -94,6 +94,8 @@ hnsw_rs = "0.3.4"
 # compiles in every profile, so the trait has to be there in every profile too. The export
 # itself is a `#[test]`, and none of it is reachable from a release build.
 ts-rs = "12.0.1"
+cpal = "0.18"
+ringbuf = "0.5"
 
 # One FFI call: `pthread_set_qos_class_self_np`, so a background re-fit is genuinely
 # background and not merely called that. `overview.md` §3.8 asks for "low priority" and on
