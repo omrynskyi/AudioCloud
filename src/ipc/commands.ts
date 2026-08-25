@@ -122,17 +122,21 @@ export function cancelScan(scanId: number): Promise<void> {
 // ── The binary transports ───────────────────────────────────────────────────────
 
 /**
- * Fetches the whole active layout in one call.
+ * Fetches the whole active layout in one call, for one `dims` (2 or 3).
+ *
+ * A 2D map and a 3D map are independently-active layouts (`idx_projection_active` is scoped
+ * per `dims`), so the mode switcher's current view decides which one comes back — there is
+ * no single "the" active layout any more.
  *
  * Returns the decoded views **and** the buffer they are views onto. Hold the buffer: the
  * arrays borrow it, and a `webglcontextlost` rebuild is meant to reuse it rather than
  * refetch (`task.md` Phase 7).
  */
-export async function getPointCloud(): Promise<{
+export async function getPointCloud(dims: 2 | 3 = 3): Promise<{
   cloud: PointCloud;
   buffer: ArrayBuffer;
 }> {
-  const buffer = await invoke<ArrayBuffer>('get_point_cloud');
+  const buffer = await invoke<ArrayBuffer>('get_point_cloud', { dims });
   return { cloud: decodePointCloud(buffer), buffer };
 }
 
@@ -251,7 +255,7 @@ export function startRefit(
   const channel = new Channel<RefitEvent>();
   channel.onmessage = onEvent;
   return invoke('start_refit', {
-    params: { algorithm: 'umap', forceFull: false, ...params },
+    params: { algorithm: 'umap', dims: 3, forceFull: false, ...params },
     onProgress: channel,
   });
 }

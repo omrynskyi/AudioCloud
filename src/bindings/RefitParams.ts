@@ -6,6 +6,11 @@ import type { Algorithm } from "./Algorithm";
  */
 export type RefitParams = { algorithm: Algorithm, 
 /**
+ * Which independently-active layout this re-fit builds: 2 or 3. The mode switcher's
+ * current view, in practice -- "the map you build is the map you're looking at."
+ */
+dims: number, 
+/**
  * UMAP's neighbourhood size. Ignored by PCA. `None` takes the vendored default.
  */
 nNeighbors?: number, 

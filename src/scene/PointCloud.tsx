@@ -35,7 +35,7 @@ import { useSceneStore } from '../store/scene';
 import { CloudBuffers, DEFAULT_POINT_COLOR, type CloudBufferOptions } from './buffers';
 import { readCaps, type GlCaps } from './caps';
 import { EMBER, colorsFromColumn, featureDomain, featureRamp } from './colors';
-import { fadeRange, frameBounds } from './framing';
+import { fadeRange, frameBounds, updateClipPlanes } from './framing';
 import { maskFrom } from './mask';
 import {
   createCloudMaterials,
@@ -79,6 +79,17 @@ export interface PointCloudProps {
   /** An `ABPC` payload. Held for the lifetime of the cloud — see `CloudBuffers.source`. */
   source: ArrayBuffer;
   /**
+   * `'3d'` (default) is the orbiting starfield. `'2d'` locks the camera to look straight down
+   * the world Z axis at a layout whose z is uniformly `0.0` (a real 2D UMAP/PCA fit, not the
+   * 3D layout with a coordinate dropped — see `store/shell.ts`'s `ViewMode`).
+   *
+   * Because every point then shares one view-space depth, perspective projection of that
+   * plane introduces zero relative distortion: screen position becomes a linear function of
+   * world x/y, and the existing depth-driven size/fade shader code needs no branch for it —
+   * only the camera direction, `OrbitControls`' rotation, and the fade uniforms below change.
+   */
+  mode?: '2d' | '3d';
+  /**
    * The active colour-by column, in the cloud's order, or `null` for the flat default.
    *
    * Fetched by the shell through `getFeatureColumn`, not here: the scene does not do IPC.
@@ -106,8 +117,22 @@ const HOVER_AUDITION_DEBOUNCE_MS = 120;
 /** A flat default until Phase 9's settings panel exposes a gain control. */
 const PREVIEW_GAIN = 0.85;
 
+/**
+ * Fade planes for 2D mode, comfortably beyond any real framing distance so
+ * `smoothstep(uFadeNear, uFadeFar, depth)` evaluates to `0` for every point. A flat map has
+ * no "far side" to recede — every point sits at the same view-space depth by construction —
+ * so this holds the whole cloud at full brightness/size rather than uniformly dimming it by
+ * whatever `fadeRange` would have computed for the 3D case's framing distance.
+ */
+const FADE_DISABLED_NEAR = 1e6;
+const FADE_DISABLED_FAR = 1e6 + 1;
+
+/** Looks straight down the world Z axis, for `frameBounds` in 2D mode. */
+const TOP_DOWN_DIRECTION = [0, 0, 1] as const;
+
 export function PointCloud({
   source,
+  mode = '3d',
   featureValues = null,
   matchedIds = null,
   options,
@@ -169,19 +194,34 @@ export function PointCloud({
   useFrame(() => {
     const uniforms = shared.current;
     if (!uniforms) return;
+    // Clip planes first: they gate whether anything below is visible at all, and they have
+    // to track the *live* camera distance, not the one from when the cloud was last framed —
+    // see `updateClipPlanes`'s doc comment for the "zoom in and the whole cloud vanishes" bug
+    // this closes.
+    updateClipPlanes(camera, buffers.bounds);
     gl.getDrawingBufferSize(drawingBuffer.current);
     uniforms.uSizeScale.value = pixelsPerWorldUnit(camera.fov, drawingBuffer.current.y);
-    const { near, far } = fadeRange(camera, buffers.bounds, fade.current);
-    uniforms.uFadeNear.value = near;
-    uniforms.uFadeFar.value = far;
+    if (mode === '2d') {
+      uniforms.uFadeNear.value = FADE_DISABLED_NEAR;
+      uniforms.uFadeFar.value = FADE_DISABLED_FAR;
+    } else {
+      const { near, far } = fadeRange(camera, buffers.bounds, fade.current);
+      uniforms.uFadeNear.value = near;
+      uniforms.uFadeFar.value = far;
+    }
   });
 
   // ── Framing ───────────────────────────────────────────────────────────────────
 
   const frameAll = useCallback(() => {
-    frameBounds(camera, controlsRef.current, buffers.bounds);
+    frameBounds(
+      camera,
+      controlsRef.current,
+      buffers.bounds,
+      mode === '2d' ? { direction: TOP_DOWN_DIRECTION } : undefined,
+    );
     invalidate();
-  }, [camera, buffers, invalidate]);
+  }, [camera, buffers, invalidate, mode]);
 
   useEffect(() => {
     frameAll();
@@ -472,6 +512,10 @@ export function PointCloud({
         rotateSpeed={0.6}
         zoomSpeed={0.8}
         panSpeed={0.7}
+        // 2D mode is pan/zoom only. Rotating a flat map out of its top-down lock would
+        // reintroduce exactly the depth ambiguity this mode exists to remove — screen-space
+        // distance stops meaning anything the moment the camera tilts off the plane's normal.
+        enableRotate={mode !== '2d'}
         // `invalidate()` on interaction only: drei calls it from the controls' `change`
         // event, which is the only thing that moves the camera. An idle canvas costs zero
         // frames, which for a tool that sits open next to a DAW all day is the difference

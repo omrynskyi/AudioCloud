@@ -56,16 +56,27 @@ function toQueryFilter(draft: FilterDraft): Partial<QueryFilter> {
 
 let debounceHandle: ReturnType<typeof setTimeout> | null = null;
 
+export type ViewMode = '2d' | '3d';
+
 interface ShellState {
   settingsOpen: boolean;
   inspectorCollapsed: boolean;
   filterDraft: FilterDraft;
+  /**
+   * Which independently-active layout the map shows — the header switcher's setting.
+   *
+   * Global UI chrome, not per-point scene data, which is why it lives here rather than in
+   * `store/scene.ts`: that store is reserved for map coloring/filter/selection intent (see
+   * its own docstring), and this is closer kin to `settingsOpen`/`inspectorCollapsed`.
+   */
+  viewMode: ViewMode;
 
   // Arrow-typed rather than method shorthand — see `store/scene.ts`'s note on
   // `@typescript-eslint/unbound-method`.
   openSettings: () => void;
   closeSettings: () => void;
   toggleInspector: () => void;
+  setViewMode: (mode: ViewMode) => void;
 
   setDraft: (patch: Partial<FilterDraft>) => void;
   clearDraft: () => void;
@@ -75,11 +86,13 @@ export const useShellStore = create<ShellState>()((set, get) => ({
   settingsOpen: false,
   inspectorCollapsed: false,
   filterDraft: EMPTY_DRAFT,
+  viewMode: '3d',
 
   openSettings: () => set({ settingsOpen: true }),
   closeSettings: () => set({ settingsOpen: false }),
   toggleInspector: () =>
     set((state) => ({ inspectorCollapsed: !state.inspectorCollapsed })),
+  setViewMode: (viewMode) => set({ viewMode }),
 
   setDraft: (patch) => {
     const draft = { ...get().filterDraft, ...patch };

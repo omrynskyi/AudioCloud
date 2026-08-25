@@ -25,7 +25,7 @@ import { SceneCanvas } from '../scene/SceneCanvas';
 import { useLibraryStore } from '../store/library';
 import { useProjectionStore } from '../store/projection';
 import { useSceneStore } from '../store/scene';
-import { useShellStore } from '../store/shell';
+import { useShellStore, type ViewMode } from '../store/shell';
 import { Collections } from './Collections';
 import { Filters } from './Filters';
 import { Inspector } from './Inspector';
@@ -60,6 +60,8 @@ export function Shell() {
   const inspectorCollapsed = useShellStore((s) => s.inspectorCollapsed);
   const toggleInspector = useShellStore((s) => s.toggleInspector);
   const openSettings = useShellStore((s) => s.openSettings);
+  const viewMode = useShellStore((s) => s.viewMode);
+  const setViewMode = useShellStore((s) => s.setViewMode);
   const modelStatus = useLibraryStore((s) => s.modelStatus);
   const refreshModelStatus = useLibraryStore((s) => s.refreshModelStatus);
   const lastRefitOutcome = useProjectionStore((s) => s.lastRefitOutcome);
@@ -73,12 +75,13 @@ export function Shell() {
 
   useEffect(() => {
     let cancelled = false;
-    // Refetches on mount, and again every time a re-fit finishes — `lastRefitOutcome` is a
-    // fresh object each time `store/projection.ts` sets it, so this effect re-runs exactly
-    // when there is a reason to believe the active projection changed. Without this
-    // dependency, a re-fit that ran (even successfully) after the first fetch would leave
-    // this screen showing whatever it showed before the re-fit was ever started.
-    getPointCloud()
+    // Refetches on mount, again every time a re-fit finishes — `lastRefitOutcome` is a fresh
+    // object each time `store/projection.ts` sets it, so this effect re-runs exactly when
+    // there is a reason to believe the active projection changed — and again on a switcher
+    // toggle. The previous mode's cloud stays on screen until the new one resolves rather
+    // than flashing a loading state in between; fetching the cloud is a single indexed
+    // statement plus a memcpy (`overview.md` §6.3), so the gap is not worth the flash.
+    getPointCloud(viewMode === '2d' ? 2 : 3)
       .then(({ cloud, buffer }) => {
         if (cancelled) return;
         setLoad(
@@ -93,7 +96,7 @@ export function Shell() {
     return () => {
       cancelled = true;
     };
-  }, [lastRefitOutcome]);
+  }, [lastRefitOutcome, viewMode]);
 
   const count = load.status === 'ready' ? load.count : 0;
 
@@ -129,16 +132,33 @@ export function Shell() {
 
   return (
     <div className="grid h-full w-full grid-cols-[280px_1fr_320px] grid-rows-[auto_1fr]">
-      <header className="col-span-3 flex items-center justify-between border-b border-neutral-900 px-3 py-1.5">
-        <span className="font-mono text-[11px] text-neutral-600">AudioBank</span>
-        <button
-          type="button"
-          onClick={openSettings}
-          className="text-neutral-500 hover:text-neutral-200"
-          aria-label="Settings"
-        >
-          ⚙
-        </button>
+      {/* `data-tauri-drag-region` is what makes this draggable at all: `titleBarStyle:
+          "Overlay"` (tauri.conf.json) removes the native title bar, so nothing responds to a
+          window drag unless something explicitly opts in. `core:window:allow-start-dragging`
+          in capabilities/main.json is the permission side of this, granted back in Phase 6
+          for exactly this header and unused until now. `pl-20` clears the macOS traffic-light
+          buttons, which float over the top-left corner independent of this header's own
+          layout and would otherwise sit on top of the "AudioBank" label. The settings button
+          stays clickable — the drag region only intercepts an actual press-and-drag, not a
+          click, and doesn't need its own opt-out. */}
+      <header
+        data-tauri-drag-region
+        className="col-span-3 flex items-center justify-between border-b border-neutral-900 py-1.5 pr-3 pl-20"
+      >
+        <span data-tauri-drag-region className="font-mono text-[11px] text-neutral-600">
+          AudioBank
+        </span>
+        <div className="flex items-center gap-3">
+          <ViewModeSwitch mode={viewMode} onChange={setViewMode} />
+          <button
+            type="button"
+            onClick={openSettings}
+            className="text-neutral-500 hover:text-neutral-200"
+            aria-label="Settings"
+          >
+            ⚙
+          </button>
+        </div>
       </header>
 
       <aside className="space-y-4 overflow-y-auto border-r border-neutral-900 p-3">
@@ -153,12 +173,17 @@ export function Shell() {
       <main className="relative min-w-0">
         {load.status === 'loading' && <Centered>Loading the map…</Centered>}
         {load.status === 'empty' && (
-          <EmptyMap modelStatus={modelStatus} openSettings={openSettings} />
+          <EmptyMap
+            viewMode={viewMode}
+            modelStatus={modelStatus}
+            openSettings={openSettings}
+          />
         )}
         {load.status === 'failed' && <Centered>{describe(load.error)}</Centered>}
         {load.status === 'ready' && (
           <>
             <SceneCanvas
+              mode={viewMode}
               source={load.source}
               featureValues={featureValues}
               matchedIds={matchedIds}
@@ -210,17 +235,21 @@ function Readout({ count }: { count: number }) {
  * actual blocker here is cheaper than making the user find it via a failed re-fit.
  */
 function EmptyMap({
+  viewMode,
   modelStatus,
   openSettings,
 }: {
+  viewMode: ViewMode;
   modelStatus: ModelStatus | null;
   openSettings: () => void;
 }) {
+  const label = viewMode === '2d' ? '2D' : '3D';
   if (!modelStatus || modelStatus.state === 'installed') {
     return (
       <Centered>
         <p className="max-w-md">
-          No map yet. Build it from Settings once your library has embedded samples.
+          No {label} map yet. Build it from Settings once your library has embedded
+          samples.
         </p>
         <PanelButton onClick={openSettings}>Open Settings</PanelButton>
       </Centered>
@@ -229,12 +258,46 @@ function EmptyMap({
   return (
     <Centered>
       <p className="max-w-md">
-        No map yet — the audio model isn&rsquo;t installed, so nothing scanned so far has
-        been embedded. Download it from Settings, then rescan your library and build the
-        map.
+        No {label} map yet — the audio model isn&rsquo;t installed, so nothing scanned so
+        far has been embedded. Download it from Settings, then rescan your library and
+        build the map.
       </p>
       <PanelButton onClick={openSettings}>Open Settings</PanelButton>
     </Centered>
+  );
+}
+
+/** The header's "3D / 2D" segmented control. */
+function ViewModeSwitch({
+  mode,
+  onChange,
+}: {
+  mode: ViewMode;
+  onChange: (mode: ViewMode) => void;
+}) {
+  return (
+    <div
+      role="radiogroup"
+      aria-label="Map view"
+      className="flex overflow-hidden rounded border border-neutral-800 text-[11px]"
+    >
+      {(['3d', '2d'] as const).map((option) => (
+        <button
+          key={option}
+          type="button"
+          role="radio"
+          aria-checked={mode === option}
+          onClick={() => onChange(option)}
+          className={
+            mode === option
+              ? 'bg-neutral-200 px-2 py-0.5 font-medium text-neutral-900'
+              : 'px-2 py-0.5 text-neutral-500 hover:text-neutral-200'
+          }
+        >
+          {option.toUpperCase()}
+        </button>
+      ))}
+    </div>
   );
 }
 

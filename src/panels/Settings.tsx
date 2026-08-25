@@ -72,19 +72,23 @@ function ProjectionSection() {
   const lastRefitOutcome = useProjectionStore((s) => s.lastRefitOutcome);
   const startRefit = useProjectionStore((s) => s.startRefit);
   const cancelRefit = useProjectionStore((s) => s.cancelRefit);
+  // Re-fits whichever layout the header switcher is showing — "the map you build is the map
+  // you're looking at," rather than a second, independent dims control here to keep in sync.
+  const viewMode = useShellStore((s) => s.viewMode);
+  const dims = viewMode === '2d' ? 2 : 3;
 
   return (
-    <Section title="Map">
+    <Section title={`Map (${viewMode.toUpperCase()})`}>
       <div className="flex gap-2">
         <PanelButton
           disabled={!!activeRefit}
-          onClick={() => startRefit({ forceFull: false })}
+          onClick={() => startRefit({ dims, forceFull: false })}
         >
           Re-fit
         </PanelButton>
         <PanelButton
           disabled={!!activeRefit}
-          onClick={() => startRefit({ forceFull: true })}
+          onClick={() => startRefit({ dims, forceFull: true })}
         >
           Full re-fit
         </PanelButton>
