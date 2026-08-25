@@ -28,8 +28,14 @@ export default function App() {
 }
 
 function Centered({ children }: { children: React.ReactNode }) {
+  // The window has no native title bar (`titleBarStyle: "Overlay"`), so nothing is
+  // draggable unless something opts in — see `Shell.tsx`'s header for the fuller note.
+  // Nothing in this screen is interactive, so the whole thing can be a drag region.
   return (
-    <main className="flex h-full w-full items-center justify-center">
+    <main
+      data-tauri-drag-region
+      className="flex h-full w-full items-center justify-center"
+    >
       <p className="max-w-md text-center text-sm text-neutral-500">{children}</p>
     </main>
   );

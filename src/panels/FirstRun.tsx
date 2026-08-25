@@ -170,8 +170,15 @@ export function FirstRun({ onComplete }: { onComplete: () => void }) {
 }
 
 function Centered({ children }: { children: React.ReactNode }) {
+  // Draggable window background, like `App.tsx`'s loading screen and `Shell.tsx`'s header —
+  // safe even with buttons/inputs among `children`, because Tauri v2 only drags on the exact
+  // element clicked, not on an ancestor's attribute (verified against the pinned Tauri
+  // version; this was a real behavior change from v1 worth not assuming).
   return (
-    <main className="flex h-full w-full flex-col items-center justify-center gap-3 px-6 text-center">
+    <main
+      data-tauri-drag-region
+      className="flex h-full w-full flex-col items-center justify-center gap-3 px-6 text-center"
+    >
       {children}
     </main>
   );
