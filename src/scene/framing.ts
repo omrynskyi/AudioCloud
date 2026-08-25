@@ -102,6 +102,41 @@ export function frameBounds(
 }
 
 /**
+ * Recomputes the camera's near/far clip planes for its **current** distance from the cloud.
+ *
+ * `frameBounds` sets `camera.near`/`camera.far` once, tightly around the cloud, at the
+ * distance needed to fit the whole thing in frame. That is correct at that exact moment and
+ * silently wrong the instant `OrbitControls` moves the camera anywhere else: zooming in
+ * dollies the camera *toward* the cloud, and the near plane — fixed at the original framing
+ * distance minus the radius — stays put. The moment the live distance drops below that fixed
+ * near plane, every point in the cloud is behind it and the whole cloud clips at once, which
+ * is exactly the "zoom in and everything disappears" bug this function exists to fix.
+ *
+ * Kept outside `fadeRange` despite computing the same `distance`/`radius` pair: fade near/far
+ * are alpha thresholds a point crosses gradually, clip near/far are a hard GPU boundary nothing
+ * should ever reach, so the clip pair is deliberately padded wider than the fade pair — a point
+ * still fading toward `uFarAlpha` must never be clipped before it finishes fading.
+ *
+ * Call every frame the camera might have moved, exactly like `fadeRange`. `updateProjectionMatrix`
+ * is only called when the planes actually changed, since it is not free and this runs inside
+ * `useFrame`.
+ */
+export function updateClipPlanes(camera: PerspectiveCamera, bounds: CloudBounds): void {
+  const distance = camera.position.distanceTo(bounds.center);
+  const radius = Math.max(bounds.radius, 1e-3);
+  // 1.2/1.5 rather than `fadeRange`'s 1.0/1.15: comfortably outside the fade range in both
+  // directions, so nothing is ever GPU-clipped before the fade shader has already dimmed it
+  // toward invisible on its own terms.
+  const near = Math.max(distance - radius * 1.2, distance / 1000);
+  const far = distance + radius * 1.5;
+  if (camera.near !== near || camera.far !== far) {
+    camera.near = near;
+    camera.far = far;
+    camera.updateProjectionMatrix();
+  }
+}
+
+/**
  * View-space depths to fade between, for the current camera.
  *
  * Cheap enough to redo every frame — a distance and two adds — and it has to be, because
