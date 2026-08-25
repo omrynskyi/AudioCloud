@@ -60,6 +60,13 @@ const RELEASE_MS: f32 = 8.0;
 /// that and keeps a full ring from becoming a busy-loop.
 const PUSH_BACKOFF: Duration = Duration::from_millis(2);
 
+/// Requested device callback period, in frames. `cpal`'s `BufferSize::Default` leaves this to
+/// the OS, which on a typical desktop interface lands around 512 frames (~10.7 ms at
+/// [`TARGET_SAMPLE_RATE`]) -- most of hover-to-audible latency is waiting for that callback to
+/// next run, not decode or IPC. 256 frames (~5.3 ms) halves that wait while staying well above
+/// what starves a callback doing this little work per frame.
+const PREFERRED_BUFFER_FRAMES: cpal::FrameCount = 256;
+
 /// Sane bounds on `gain`, independent of whatever the caller asked for. `2.0` is +6 dB of
 /// headroom over unity, which is enough for "this file was recorded quiet" without being
 /// enough to turn a typo into a speaker-damaging blast.
@@ -330,6 +337,18 @@ fn choose_config(device: &cpal::Device) -> Result<SupportedStreamConfig, AudioEr
         .map_err(|e| AudioError::Config(e.to_string()))
 }
 
+/// [`PREFERRED_BUFFER_FRAMES`], clamped to what `supported` actually allows -- a fixed request
+/// outside the device's own range is a config error, not a hint `cpal` rounds for us. Falls back
+/// to [`cpal::BufferSize::Default`] when the device does not report a usable range at all.
+fn preferred_buffer_size(supported: &SupportedStreamConfig) -> cpal::BufferSize {
+    match supported.buffer_size() {
+        cpal::SupportedBufferSize::Range { min, max } if min <= max => {
+            cpal::BufferSize::Fixed(PREFERRED_BUFFER_FRAMES.clamp(*min, *max))
+        }
+        _ => cpal::BufferSize::Default,
+    }
+}
+
 /// Picks `preferred` by name if it is still attached, falling back to the host default when it
 /// is absent, gone, or `None` -- the same fallback `overview.md` §6.1's device commands
 /// document: a device unplugged since the user chose it must not turn every play into an
@@ -365,7 +384,8 @@ fn build_stream(
 ) -> Result<(cpal::Stream, RingProducer, DeviceFormat), AudioError> {
     let device = choose_device(host, preferred)?;
     let supported = choose_config(&device)?;
-    let config = supported.config();
+    let mut config = supported.config();
+    config.buffer_size = preferred_buffer_size(&supported);
     let channels = config.channels;
     let sample_rate = config.sample_rate;
 
@@ -917,5 +937,58 @@ mod tests {
             cpal::SampleFormat::F32,
         )];
         assert!(preferred_rate(ranges.into_iter()).is_none());
+    }
+
+    fn config_with_buffer_range(min: u32, max: u32) -> SupportedStreamConfig {
+        SupportedStreamConfigRange::new(
+            2,
+            44_100,
+            96_000,
+            cpal::SupportedBufferSize::Range { min, max },
+            cpal::SampleFormat::F32,
+        )
+        .try_with_sample_rate(TARGET_SAMPLE_RATE)
+        .expect("48 kHz is within the tested range")
+    }
+
+    #[test]
+    fn preferred_buffer_size_is_used_as_is_when_the_device_allows_it() {
+        let supported = config_with_buffer_range(64, 1_024);
+        assert_eq!(
+            preferred_buffer_size(&supported),
+            cpal::BufferSize::Fixed(PREFERRED_BUFFER_FRAMES)
+        );
+    }
+
+    #[test]
+    fn preferred_buffer_size_clamps_down_to_the_devices_max() {
+        let supported = config_with_buffer_range(16, 64);
+        assert_eq!(
+            preferred_buffer_size(&supported),
+            cpal::BufferSize::Fixed(64)
+        );
+    }
+
+    #[test]
+    fn preferred_buffer_size_clamps_up_to_the_devices_min() {
+        let supported = config_with_buffer_range(1_024, 4_096);
+        assert_eq!(
+            preferred_buffer_size(&supported),
+            cpal::BufferSize::Fixed(1_024)
+        );
+    }
+
+    #[test]
+    fn preferred_buffer_size_falls_back_to_default_when_the_device_reports_no_range() {
+        let unknown = SupportedStreamConfigRange::new(
+            2,
+            44_100,
+            96_000,
+            cpal::SupportedBufferSize::Unknown,
+            cpal::SampleFormat::F32,
+        )
+        .try_with_sample_rate(TARGET_SAMPLE_RATE)
+        .expect("48 kHz is within the tested range");
+        assert_eq!(preferred_buffer_size(&unknown), cpal::BufferSize::Default);
     }
 }
