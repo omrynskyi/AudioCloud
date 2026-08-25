@@ -82,9 +82,18 @@ export interface MaterialOptions {
 }
 
 const DEFAULTS = {
-  // Just under a pixel. High enough that a sprite the rasterizer would only alias is
-  // dropped, low enough that zooming out does not thin the corpus into a different shape.
-  minPointSize: 0.9,
+  // Under a pixel. High enough that a sprite the rasterizer would only alias is dropped, low
+  // enough that zooming out does not thin the corpus into a different shape.
+  //
+  // This also sets the width of `points.frag.glsl`'s sub-pixel dimming ramp — a point is
+  // dimmed toward `alpha *= 0.35` for anything under `2 * uMinPointSize`. At the framing
+  // distance `framing.ts`'s `frameBounds` puts the camera by default, an ordinary point
+  // renders at only about a pixel across (`radiusFraction`'s own doc comment on why this is
+  // independent of library size or coordinate scale), which used to sit deep inside that
+  // dimming zone — the map read as "faint," which was this constant doing exactly what its
+  // comment said and being too conservative about it. Lower, so a point at its natural
+  // framed size lands outside the ramp instead of at the dim end of it.
+  minPointSize: 0.6,
   farAlpha: 0.22,
   farSizeScale: 0.55,
   emphasisScale: 1.9,
@@ -113,7 +122,11 @@ export function createCloudMaterials(
     uHoverId: { value: 0 },
     uSelectedId: { value: 0 },
     uEmphasisScale: { value: settings.emphasisScale },
-    uCoreRadius: { value: 0.35 },
+    // Fraction of the sprite's radius that reads as solid before `points.frag.glsl`'s
+    // falloff begins. 0.35 spent most of a small sprite's few pixels on soft edge and almost
+    // none on solid colour, which reads as a smudge rather than a point; 0.5 gives it an
+    // actual visible core at the sizes this cloud renders at in practice.
+    uCoreRadius: { value: 0.5 },
     uRingInner: { value: 0.62 },
     uRingOuter: { value: 0.92 },
     uHoverColor: { value: new Color(0.98, 0.98, 1.0) },

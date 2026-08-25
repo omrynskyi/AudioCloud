@@ -63,7 +63,13 @@ export interface CloudBufferOptions {
 }
 
 const DEFAULTS = {
-  radiusFraction: 1 / 260,
+  // `1/260` put an ordinary point at roughly a pixel across at `framing.ts`'s default framed
+  // distance — independent of library size, since both this radius and the viewing distance
+  // scale with the cloud's own bounding radius — which read as "tiny" well before it read as
+  // dense. `1/190` is a real fill-rate cost at 50,000 overlapping sprites (`overview.md` §7's
+  // 60 fps target), so this is a size increase, not a decision to stop caring about that
+  // budget — re-check `npm run profile` after moving this again.
+  radiusFraction: 1 / 190,
   filteredScale: 0.42,
   filteredSaturation: 0.12,
   filteredBrightness: 0.3,
