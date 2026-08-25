@@ -118,7 +118,7 @@ fn seed(webview: &WebviewWindow<tauri::test::MockRuntime>, count: usize) -> Vec<
 
     let run = db
         .writer()
-        .begin_projection_run("pca", "{}", count as i64)
+        .begin_projection_run("pca", "{}", count as i64, 3)
         .unwrap();
     let points: Vec<(i64, [f32; 3])> = ids
         .iter()
@@ -137,7 +137,7 @@ fn the_point_cloud_arrives_as_raw_bytes_through_a_real_invoke() {
     let (_dir, webview) = app();
     let ids = seed(&webview, 32);
 
-    let bytes = raw_of(invoke(&webview, "get_point_cloud", json!({})).unwrap());
+    let bytes = raw_of(invoke(&webview, "get_point_cloud", json!({ "dims": 3 })).unwrap());
     let header = binary::header(&bytes).unwrap();
     assert_eq!(header.magic, binary::MAGIC_POINT_CLOUD);
     assert_eq!(header.count, ids.len());
@@ -294,7 +294,7 @@ fn a_blank_name_is_an_invalid_argument_and_says_which_field() {
 fn an_empty_library_answers_rather_than_failing() {
     let (_dir, webview) = app();
 
-    let bytes = raw_of(invoke(&webview, "get_point_cloud", json!({})).unwrap());
+    let bytes = raw_of(invoke(&webview, "get_point_cloud", json!({ "dims": 3 })).unwrap());
     assert_eq!(bytes.len(), binary::HEADER_BYTES);
     assert_eq!(binary::header(&bytes).unwrap().count, 0);
 

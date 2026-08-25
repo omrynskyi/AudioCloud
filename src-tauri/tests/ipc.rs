@@ -82,7 +82,7 @@ fn projected_library(count: usize) -> (TempDir, Database, Vec<i64>) {
 
     let run = db
         .writer()
-        .begin_projection_run("pca", "{}", count as i64)
+        .begin_projection_run("pca", "{}", count as i64, 3)
         .unwrap();
     let points: Vec<(i64, [f32; 3])> = ids
         .iter()
@@ -102,7 +102,7 @@ fn fifty_thousand_points_round_trip_in_one_payload() {
     let (_dir, db, ids) = projected_library(50_000);
 
     let conn = db.read().unwrap();
-    let points = queries::active_projection_points(&conn).unwrap();
+    let points = queries::active_projection_points(&conn, 3).unwrap();
     drop(conn);
     assert_eq!(points.len(), 50_000);
 
@@ -150,7 +150,7 @@ fn a_feature_column_lines_up_with_the_point_cloud() {
     let (_dir, db, _ids) = projected_library(1_000);
 
     let conn = db.read().unwrap();
-    let points = queries::active_projection_points(&conn).unwrap();
+    let points = queries::active_projection_points(&conn, 3).unwrap();
     let centroids = search::feature_column(&conn, Feature::SpectralCentroid).unwrap();
     drop(conn);
 
@@ -321,7 +321,7 @@ fn an_unprojected_library_yields_an_empty_payload_rather_than_an_error() {
     let db = Database::open(dir.path(), DIM).unwrap();
 
     let conn = db.read().unwrap();
-    let points = queries::active_projection_points(&conn).unwrap();
+    let points = queries::active_projection_points(&conn, 3).unwrap();
     let column = search::feature_column(&conn, Feature::Bpm).unwrap();
     drop(conn);
 

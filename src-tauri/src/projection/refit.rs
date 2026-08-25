@@ -74,14 +74,14 @@ pub enum Plan {
     Full { new: usize, total: usize },
 }
 
-/// Decides between incremental placement and a full re-fit.
+/// Decides between incremental placement and a full re-fit, for one `dims` layout.
 ///
 /// Reads two counts, not two corpora: this is called after every scan and must not be a
 /// reason to touch `embeddings.bin`.
-pub fn plan(db: &Database) -> Result<Plan, ProjectionError> {
+pub fn plan(db: &Database, dims: i64) -> Result<Plan, ProjectionError> {
     let conn = db.read()?;
     let total = queries::count_embedded_samples(&conn)? as usize;
-    let Some(active) = queries::active_projection_run(&conn)? else {
+    let Some(active) = queries::active_projection_run(&conn, dims)? else {
         return Ok(Plan::Full { new: total, total });
     };
     let placed = queries::count_projection_points(&conn, active.id)? as usize;
@@ -199,6 +199,11 @@ pub struct Refit<'a> {
     fallback: Option<&'a dyn Projector>,
     cancel: &'a CancellationToken,
     align: bool,
+    /// Which independently-active layout (`idx_projection_active` is scoped per `dims`) this
+    /// run reads its previous layout from and writes its result into. Must agree with what
+    /// `projector` actually outputs -- the caller's responsibility, the same way `algorithm`
+    /// is recorded from `projector.name()` rather than re-derived.
+    dims: i64,
     progress: Arc<RefitProgress>,
     #[allow(clippy::type_complexity)]
     sink: Option<Box<dyn FnMut(RefitSnapshot) + Send + 'static>>,
@@ -211,6 +216,7 @@ impl std::fmt::Debug for Refit<'_> {
             .field("fallback", &self.fallback.map(Projector::name))
             .field("cancelled", &self.cancel.is_cancelled())
             .field("align", &self.align)
+            .field("dims", &self.dims)
             .field("ticking", &self.sink.is_some())
             .finish()
     }
@@ -223,9 +229,16 @@ impl<'a> Refit<'a> {
             fallback: None,
             cancel,
             align: true,
+            dims: 3,
             progress: Arc::new(RefitProgress::new()),
             sink: None,
         }
+    }
+
+    /// Which layout this run belongs to: 2 or 3. Defaults to 3.
+    pub fn with_dims(mut self, dims: i64) -> Self {
+        self.dims = dims;
+        self
     }
 
     /// A second projector to try if the first one fails.
@@ -386,6 +399,7 @@ pub fn refit(db: &Database, options: Refit<'_>) -> Result<RefitReport, Projectio
         fallback,
         cancel,
         align,
+        dims,
         progress,
         sink,
     } = options;
@@ -395,7 +409,7 @@ pub fn refit(db: &Database, options: Refit<'_>) -> Result<RefitReport, Projectio
         sink.map(|sink| Ticker::watch(Arc::clone(&progress), RefitProgress::snapshot, sink));
     // A terminal snapshot is guaranteed by `Ticker`'s `Drop`, but only if the phase is
     // right when it runs -- so every exit from here forward goes through `finish`.
-    let result = run(db, projector, fallback, cancel, align, &progress, started);
+    let result = run(db, projector, fallback, cancel, align, dims, &progress, started);
     progress.enter(RefitPhase::Done);
     if let Some(ticker) = ticker.as_mut() {
         ticker.finish();
@@ -409,6 +423,7 @@ fn run(
     fallback: Option<&dyn Projector>,
     cancel: &CancellationToken,
     align: bool,
+    dims: i64,
     progress: &RefitProgress,
     started: Instant,
 ) -> Result<RefitReport, ProjectionError> {
@@ -417,7 +432,7 @@ fn run(
 
     let conn = db.read()?;
     let rows: Vec<(i64, EmbeddingLoc)> = queries::all_embedding_locs(&conn)?;
-    let previous = queries::active_projection_run(&conn)?;
+    let previous = queries::active_projection_run(&conn, dims)?;
     // Read regardless of `align`: the previous layout is what displacement is *measured*
     // against, and an unaligned re-fit still owes that number -- it is the number that says
     // what alignment is worth.
@@ -454,12 +469,12 @@ fn run(
             distinct.len()
         )));
     }
-    let mut points = fan_out(&rows, &members, &fitted);
+    let mut points = fan_out(&rows, &members, &fitted, dims);
     EmbeddingSet::check_cancelled(cancel)?;
 
     progress.enter(RefitPhase::Aligning);
     let (alignment, correspondences) = if align {
-        align_onto_previous(&rows, &points, &previous_points)
+        align_onto_previous(&rows, &points, &previous_points, dims)
     } else {
         (Alignment::identity(), 0)
     };
@@ -478,6 +493,7 @@ fn run(
         projector.name(),
         &projector.params_json(),
         rows.len() as i64,
+        dims,
     )?;
 
     // Everything past this point owns a shadow row that must not outlive a failure.
@@ -550,7 +566,12 @@ fn group_by_vector(rows: &[(i64, EmbeddingLoc)]) -> (Vec<(i64, EmbeddingLoc)>, V
 /// The first row holding a vector gets the fitted position exactly; the rest get it nudged,
 /// so that a file and its six copies are six pickable dots rather than one. The nudge is
 /// keyed by `sample_id`, so it is the same on every re-fit.
-fn fan_out(rows: &[(i64, EmbeddingLoc)], members: &[Vec<usize>], fitted: &[Point3]) -> Vec<Point3> {
+fn fan_out(
+    rows: &[(i64, EmbeddingLoc)],
+    members: &[Vec<usize>],
+    fitted: &[Point3],
+    dims: i64,
+) -> Vec<Point3> {
     let extent = BoundingBox::of(fitted).map_or(0.0, |b| b.diagonal());
     let mut points = vec![[0.0f32; 3]; rows.len()];
     for (vector, sharing) in members.iter().enumerate() {
@@ -558,7 +579,7 @@ fn fan_out(rows: &[(i64, EmbeddingLoc)], members: &[Vec<usize>], fitted: &[Point
             points[row] = if n == 0 {
                 fitted[vector]
             } else {
-                super::incremental::jitter(fitted[vector], rows[row].0, extent)
+                super::incremental::jitter(fitted[vector], rows[row].0, extent, dims as usize)
             };
         }
     }
@@ -603,6 +624,7 @@ fn align_onto_previous(
     rows: &[(i64, EmbeddingLoc)],
     points: &[Point3],
     previous: &HashMap<i64, Point3>,
+    dims: i64,
 ) -> (Alignment, usize) {
     if previous.is_empty() {
         return (Alignment::identity(), 0);
@@ -616,7 +638,15 @@ fn align_onto_previous(
         }
     }
     let n = source.len();
-    (procrustes::fit(&source, &target), n)
+    // A 2D layout's z is always 0.0 on both sides, which leaves the 3D fit's rotation about
+    // z formally underdetermined (see `procrustes::fit_2d`'s doc comment); confining the fit
+    // to x/y sidesteps that rather than relying on it resolving itself.
+    let alignment = if dims == 2 {
+        procrustes::fit_2d(&source, &target)
+    } else {
+        procrustes::fit(&source, &target)
+    };
+    (alignment, n)
 }
 
 /// Median distance a pre-existing point moved, after alignment.
@@ -721,7 +751,7 @@ mod tests {
     fn a_first_fit_has_no_correspondences_and_does_not_move() {
         let rows = vec![(1i64, EmbeddingLoc { offset: 0, dims: 4 })];
         let points = vec![[3.0, 4.0, 5.0]];
-        let (alignment, n) = align_onto_previous(&rows, &points, &HashMap::new());
+        let (alignment, n) = align_onto_previous(&rows, &points, &HashMap::new(), 3);
         assert_eq!(n, 0);
         assert!(alignment.is_identity());
     }
@@ -769,7 +799,7 @@ mod tests {
         let (_, members) = group_by_vector(&rows);
         let fitted = vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]];
 
-        let points = fan_out(&rows, &members, &fitted);
+        let points = fan_out(&rows, &members, &fitted, 3);
 
         assert_eq!(points.len(), 3);
         assert_eq!(
@@ -787,7 +817,7 @@ mod tests {
             points[2]
         );
         // Deterministic: the same rows fan out the same way every time.
-        assert_eq!(points, fan_out(&rows, &members, &fitted));
+        assert_eq!(points, fan_out(&rows, &members, &fitted, 3));
     }
 
     /// The projector is named in the report, so a run built by the fallback cannot be

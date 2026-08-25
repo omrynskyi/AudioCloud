@@ -985,7 +985,7 @@ fn refit_50k_by_512() {
     let (umap_elapsed, umap_rss) = timed_refit(&db, &UmapProjector::default());
 
     let conn = db.read().unwrap();
-    let points = queries::active_projection_points(&conn).unwrap();
+    let points = queries::active_projection_points(&conn, 3).unwrap();
     assert_eq!(points.len(), CORPUS);
     assert!(points.iter().all(|(_, p)| p.iter().all(|v| v.is_finite())));
 
@@ -1056,7 +1056,7 @@ fn incremental_placement_of_a_small_import() {
 
     let before: std::collections::HashMap<i64, Point3> = {
         let conn = db.read().unwrap();
-        queries::active_projection_points(&conn)
+        queries::active_projection_points(&conn, 3)
             .unwrap()
             .into_iter()
             .collect()
@@ -1065,7 +1065,7 @@ fn incremental_placement_of_a_small_import() {
     let rss_before = rss_bytes();
     let watcher = PeakRss::watch();
     let started = Instant::now();
-    let report = place_incremental(&db, &cancel).unwrap();
+    let report = place_incremental(&db, &cancel, 3).unwrap();
     let elapsed = started.elapsed();
     let rss = watcher.finish().saturating_sub(rss_before);
 
@@ -1074,10 +1074,11 @@ fn incremental_placement_of_a_small_import() {
     // The claim the whole path exists for, checked rather than asserted in prose: not one
     // pre-existing coordinate changed.
     let conn = db.read().unwrap();
-    let after: std::collections::HashMap<i64, Point3> = queries::active_projection_points(&conn)
-        .unwrap()
-        .into_iter()
-        .collect();
+    let after: std::collections::HashMap<i64, Point3> =
+        queries::active_projection_points(&conn, 3)
+            .unwrap()
+            .into_iter()
+            .collect();
     assert_eq!(after.len(), CORPUS + new);
     for (id, old) in &before {
         assert_eq!(
@@ -1176,7 +1177,7 @@ fn serve_a_fifty_thousand_point_cloud() {
 
     let run = db
         .writer()
-        .begin_projection_run("pca", "{}", CORPUS as i64)
+        .begin_projection_run("pca", "{}", CORPUS as i64, 3)
         .unwrap();
     let points: Vec<(i64, Point3)> = ids
         .iter()
@@ -1193,7 +1194,7 @@ fn serve_a_fifty_thousand_point_cloud() {
     // What `get_point_cloud` does, timed as two halves: the statement, and the encode.
     let started = Instant::now();
     let conn = db.read().unwrap();
-    let read = queries::active_projection_points(&conn).unwrap();
+    let read = queries::active_projection_points(&conn, 3).unwrap();
     let query = started.elapsed();
     drop(conn);
     assert_eq!(read.len(), CORPUS);

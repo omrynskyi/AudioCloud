@@ -88,7 +88,8 @@ fn run(
     channel: &Channel<RefitEvent>,
     started: std::time::Instant,
 ) -> Result<RefitOutcome, AppError> {
-    let decision = plan(db)?;
+    let dims = i64::from(params.dims);
+    let decision = plan(db, dims)?;
 
     // Incremental placement is additive and fast -- there is nothing to stream, and no
     // shadow run to swap. It reports as a single terminal event with `incremental: true`,
@@ -97,7 +98,7 @@ fn run(
         match decision {
             Plan::UpToDate => {
                 let conn = db.read()?;
-                let active = crate::db::queries::active_projection_run(&conn)?
+                let active = crate::db::queries::active_projection_run(&conn, dims)?
                     .ok_or(AppError::NoProjection)?;
                 return Ok(RefitOutcome {
                     run_id: active.id,
@@ -110,7 +111,7 @@ fn run(
                 });
             }
             Plan::Incremental { .. } => {
-                let report = place_incremental(db, cancel)?;
+                let report = place_incremental(db, cancel, dims)?;
                 return Ok(RefitOutcome {
                     run_id: report.run_id,
                     algorithm: "incremental".into(),
@@ -125,11 +126,16 @@ fn run(
         }
     }
 
-    let pca = PcaProjector::new();
+    let pca = if params.dims == 2 {
+        PcaProjector::with_dims(2)
+    } else {
+        PcaProjector::new()
+    };
     let umap = UmapProjector::new(UmapParams {
         n_neighbors: params
             .n_neighbors
             .unwrap_or_else(|| UmapParams::default().n_neighbors),
+        target_dim: params.dims as usize,
         ..Default::default()
     });
     let primary: &dyn Projector = match params.algorithm {
@@ -142,6 +148,7 @@ fn run(
     // is worse than a library with a plainer one (`overview.md` §3.7).
     let options = Refit::new(primary, cancel)
         .with_fallback(&pca)
+        .with_dims(dims)
         .with_progress({
             let channel = channel.clone();
             move |snapshot| {

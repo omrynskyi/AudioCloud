@@ -35,9 +35,6 @@ use crate::{
     projection::{EmbeddingSet, Point3, ProjectionError, Projector},
 };
 
-/// Components extracted. Three, because the renderer draws three.
-const COMPONENTS: usize = 3;
-
 /// Below this there is no cloud to find axes in.
 ///
 /// Four rather than three: with exactly three points the top three components describe the
@@ -54,13 +51,27 @@ const MIN_SAMPLES: usize = 4;
 /// wrong, rather than invisibly meaningless.
 const RANK_EPSILON: f64 = 1e-9;
 
-/// PCA onto the three directions of greatest variance.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct PcaProjector;
+/// PCA onto the directions of greatest variance -- two or three of them, whichever the
+/// mode switcher is showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PcaProjector {
+    dims: usize,
+}
+
+impl Default for PcaProjector {
+    fn default() -> Self {
+        Self { dims: 3 }
+    }
+}
 
 impl PcaProjector {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// A projector fitting `dims` components (2 or 3) rather than the default three.
+    pub fn with_dims(dims: usize) -> Self {
+        Self { dims }
     }
 }
 
@@ -87,7 +98,7 @@ impl Projector for PcaProjector {
 
         let mean = mean_vector(data, cancel)?;
         let covariance = covariance_matrix(data, &mean, cancel)?;
-        let axes = principal_axes(&covariance)?;
+        let axes = principal_axes(&covariance, self.dims)?;
         project(data, &mean, &axes, cancel)
     }
 
@@ -96,7 +107,7 @@ impl Projector for PcaProjector {
     }
 
     fn params_json(&self) -> String {
-        format!(r#"{{"components":{COMPONENTS}}}"#)
+        format!(r#"{{"components":{}}}"#, self.dims)
     }
 }
 
@@ -227,12 +238,15 @@ fn covariance_matrix(
     Ok(covariance)
 }
 
-/// The three eigenvectors of largest eigenvalue, sign-canonicalized, largest first.
+/// The `dims` eigenvectors of largest eigenvalue, sign-canonicalized, largest first.
 ///
 /// An axis whose eigenvalue is below [`RANK_EPSILON`] of the leading one is returned as a
 /// zero vector: a row projected onto it lands at zero, so the cloud is drawn flat in that
 /// direction instead of being smeared along a numerically arbitrary one.
-fn principal_axes(covariance: &DMatrix<f64>) -> Result<Vec<DVector<f64>>, ProjectionError> {
+fn principal_axes(
+    covariance: &DMatrix<f64>,
+    dims: usize,
+) -> Result<Vec<DVector<f64>>, ProjectionError> {
     let eigen = covariance.clone().symmetric_eigen();
 
     let mut order: Vec<usize> = (0..eigen.eigenvalues.len()).collect();
@@ -247,7 +261,7 @@ fn principal_axes(covariance: &DMatrix<f64>) -> Result<Vec<DVector<f64>>, Projec
 
     Ok(order
         .into_iter()
-        .take(COMPONENTS)
+        .take(dims)
         .map(|k| {
             if eigen.eigenvalues[k] / leading <= RANK_EPSILON {
                 return DVector::zeros(covariance.nrows());
@@ -301,7 +315,10 @@ fn project(
                     EmbeddingSet::check_cancelled(cancel)?;
                 }
                 data.row_into(i, &mut row)?;
-                let mut coord = [0.0f32; COMPONENTS];
+                // Fixed at three regardless of `axes.len()`: a 2D fit leaves `coord[2]` at
+                // its initial `0.0`, which is the padding that keeps `Point3` -- the wire
+                // format, the buffers, Procrustes -- unchanged for the 2D path.
+                let mut coord: Point3 = [0.0; 3];
                 for (k, axis) in axes.iter().enumerate() {
                     let mut acc = 0.0f64;
                     for ((v, m), a) in row.iter().zip(mean.iter()).zip(axis.iter()) {
@@ -353,6 +370,31 @@ mod tests {
         let y_span = bbox.max[1] - bbox.min[1];
         assert!(x_span > 30.0, "x span was {x_span}");
         assert!(y_span < 0.1, "y span was {y_span}, expected a thin axis");
+    }
+
+    /// A 2D fit is a real fit onto the top two axes -- not the 3D fit with a coordinate
+    /// dropped -- and it must pad `z` to exactly `0.0` rather than leaving it whatever the
+    /// third axis would have produced.
+    #[test]
+    fn with_dims_2_finds_the_top_two_axes_and_pads_z_to_zero() {
+        let vectors: Vec<Vec<f32>> = (0..40)
+            .map(|i| {
+                let t = i as f32 - 20.0;
+                let mut v = vec![0.0f32; 8];
+                v[0] = t;
+                v[1] = 0.5 * t;
+                v[2] = 0.01 * ((i % 3) as f32 - 1.0);
+                v
+            })
+            .collect();
+
+        let points = projected(&PcaProjector::with_dims(2), &vectors);
+
+        for p in &points {
+            assert_eq!(p[2], 0.0, "a 2D fit must not write a third coordinate");
+        }
+        let bbox = BoundingBox::of(&points).unwrap();
+        assert!(bbox.max[0] - bbox.min[0] > 30.0, "the first axis should still find the dominant direction");
     }
 
     /// Determinism is not "it happened to match": the same input twice must produce the

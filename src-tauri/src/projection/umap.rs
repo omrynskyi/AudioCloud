@@ -61,9 +61,6 @@ use crate::{
     projection::{EmbeddingSet, Point3, ProjectionError, Projector},
 };
 
-/// Target dimensionality. Three, because the renderer draws three.
-const TARGET_DIM: usize = 3;
-
 /// Rows read from the mmap before they are handed to the index and dropped.
 ///
 /// 1024 x 512 f32 is 2 MB, which is the whole transient cost of feeding a 102 MB index.
@@ -91,6 +88,10 @@ pub struct UmapParams {
     /// Gradient batches. `annembed`'s default is 20; the cost of the fit is close to linear
     /// in this.
     pub n_epochs: usize,
+    /// Output dimensionality: 2 or 3. The renderer draws whichever the mode switcher is
+    /// showing; the map's `dims` column and this must agree, which is the caller's job
+    /// (`commands/projection.rs` sets it from the same value it threads through `Refit`).
+    pub target_dim: usize,
 }
 
 impl Default for UmapParams {
@@ -99,6 +100,7 @@ impl Default for UmapParams {
             n_neighbors: 15,
             min_dist: 0.1,
             n_epochs: 20,
+            target_dim: 3,
         }
     }
 }
@@ -186,8 +188,9 @@ impl Projector for UmapProjector {
             )));
         }
 
+        let target_dim = self.params.target_dim;
         let mut params = EmbedderParams::default();
-        params.set_dim(TARGET_DIM);
+        params.set_dim(target_dim);
         params.scale_rho = self.params.scale_rho();
         params.nb_grad_batch = self.params.n_epochs.max(1);
 
@@ -206,7 +209,7 @@ impl Projector for UmapProjector {
         // that looks perfectly plausible and is wired to the wrong files.
         let embedded = embedder.get_embedded_reindexed();
         let (rows, cols) = embedded.dim();
-        if rows != n || cols != TARGET_DIM {
+        if rows != n || cols != target_dim {
             return Err(ProjectionError::Umap(format!(
                 "annembed produced a {rows} x {cols} layout for {n} vectors"
             )));
@@ -214,7 +217,11 @@ impl Projector for UmapProjector {
 
         let mut points = Vec::with_capacity(n);
         for i in 0..n {
-            let point = [embedded[[i, 0]], embedded[[i, 1]], embedded[[i, 2]]];
+            // A 2D fit pads z to 0.0 rather than changing what `Projector::fit_transform`
+            // returns everywhere else -- the wire format, the buffers, and Procrustes'
+            // `Point3` shape all stay exactly as they are for the 3D path.
+            let z = if target_dim >= 3 { embedded[[i, 2]] } else { 0.0 };
+            let point = [embedded[[i, 0]], embedded[[i, 1]], z];
             if point.iter().any(|v| !v.is_finite()) {
                 return Err(ProjectionError::Umap(format!(
                     "row {i} of the layout is not finite: {point:?}"
@@ -231,11 +238,12 @@ impl Projector for UmapProjector {
 
     fn params_json(&self) -> String {
         format!(
-            r#"{{"n_neighbors":{},"min_dist":{},"n_epochs":{},"metric":"cosine","scale_rho":{}}}"#,
+            r#"{{"n_neighbors":{},"min_dist":{},"n_epochs":{},"metric":"cosine","scale_rho":{},"target_dim":{}}}"#,
             self.params.n_neighbors,
             self.params.min_dist,
             self.params.n_epochs,
             self.params.scale_rho(),
+            self.params.target_dim,
         )
     }
 }

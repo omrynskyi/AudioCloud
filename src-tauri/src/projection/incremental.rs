@@ -67,12 +67,13 @@ pub struct IncrementalReport {
 pub fn place_incremental(
     db: &Database,
     cancel: &CancellationToken,
+    dims: i64,
 ) -> Result<IncrementalReport, ProjectionError> {
     EmbeddingSet::check_cancelled(cancel)?;
 
     let conn = db.read()?;
-    let active =
-        queries::active_projection_run(&conn)?.ok_or(ProjectionError::NoActiveProjection)?;
+    let active = queries::active_projection_run(&conn, dims)?
+        .ok_or(ProjectionError::NoActiveProjection)?;
     let placed_points = queries::projection_point_map(&conn, active.id)?;
     let newcomers = queries::embedding_locs_missing_from_run(&conn, active.id)?;
     let all = queries::all_embedding_locs(&conn)?;
@@ -116,7 +117,7 @@ pub fn place_incremental(
     };
 
     let k = PLACEMENT_NEIGHBORS.min(anchors.len());
-    let placements = place_all(&matrix, &anchors, &newcomers, k, extent, cancel)?;
+    let placements = place_all(&matrix, &anchors, &newcomers, k, extent, dims as usize, cancel)?;
     drop(matrix);
 
     let placed = placements.len();
@@ -160,6 +161,7 @@ fn place_all(
     newcomers: &[(i64, EmbeddingLoc)],
     k: usize,
     extent: f32,
+    dims: usize,
     cancel: &CancellationToken,
 ) -> Result<Vec<(i64, Point3)>, ProjectionError> {
     let queries: Vec<Vec<f32>> = newcomers
@@ -210,7 +212,7 @@ fn place_all(
     let mut placements = Vec::with_capacity(newcomers.len());
     for ((sample_id, _), best) in newcomers.iter().zip(merged.iter()) {
         if let Some(point) = barycenter(&best.entries) {
-            placements.push((*sample_id, jitter(point, *sample_id, extent)));
+            placements.push((*sample_id, jitter(point, *sample_id, extent, dims)));
         }
     }
     Ok(placements)
@@ -337,7 +339,7 @@ fn barycenter(neighbors: &[(f32, Point3)]) -> Option<Point3> {
 ///
 /// Shared with [`super::refit`], which needs the same nudge for the same reason: rows that
 /// borrowed a twin's vector get one coordinate between them and have to be separable.
-pub(crate) fn jitter(point: Point3, sample_id: i64, extent: f32) -> Point3 {
+pub(crate) fn jitter(point: Point3, sample_id: i64, extent: f32, dims: usize) -> Point3 {
     if extent <= 0.0 {
         return point;
     }
@@ -349,11 +351,20 @@ pub(crate) fn jitter(point: Point3, sample_id: i64, extent: f32) -> Point3 {
         state ^= state << 17;
         ((state >> 40) as f32 / 8_388_608.0) - 1.0
     };
-    [
+    // A 2D layout's z must stay exactly 0.0 -- that is the whole point of it -- so only the
+    // axes the active run actually uses are perturbed. `next()` is still called for the
+    // unused axis when `dims == 2` so `sample_id`'s stream advances the same way regardless
+    // of dims, keeping the x/y jitter for a given sample identical in both modes.
+    let jittered = [
         point[0] + amplitude * next(),
         point[1] + amplitude * next(),
         point[2] + amplitude * next(),
-    ]
+    ];
+    if dims >= 3 {
+        jittered
+    } else {
+        [jittered[0], jittered[1], 0.0]
+    }
 }
 
 #[cfg(test)]
@@ -396,11 +407,11 @@ mod tests {
     #[test]
     fn the_jitter_separates_twins_and_repeats_itself() {
         let extent = 100.0;
-        let a = jitter([1.0, 2.0, 3.0], 41, extent);
-        let b = jitter([1.0, 2.0, 3.0], 42, extent);
+        let a = jitter([1.0, 2.0, 3.0], 41, extent, 3);
+        let b = jitter([1.0, 2.0, 3.0], 42, extent, 3);
 
         assert_ne!(a, b, "two samples landed on the same pixel");
-        assert_eq!(a, jitter([1.0, 2.0, 3.0], 41, extent), "not deterministic");
+        assert_eq!(a, jitter([1.0, 2.0, 3.0], 41, extent, 3), "not deterministic");
         assert!(
             crate::projection::distance(a, [1.0, 2.0, 3.0]) < extent * JITTER_FRACTION * 2.0,
             "the nudge became a move: {a:?}"
@@ -411,7 +422,15 @@ mod tests {
     /// honest answer rather than a NaN.
     #[test]
     fn a_flat_cloud_is_not_jittered() {
-        assert_eq!(jitter([1.0, 2.0, 3.0], 7, 0.0), [1.0, 2.0, 3.0]);
+        assert_eq!(jitter([1.0, 2.0, 3.0], 7, 0.0, 3), [1.0, 2.0, 3.0]);
+    }
+
+    /// A 2D layout's z must never be perturbed -- it has to stay exactly `0.0`, which is the
+    /// entire point of a 2D map's screenspace-proximity guarantee.
+    #[test]
+    fn a_2d_placement_never_jitters_z() {
+        let point = jitter([1.0, 2.0, 0.0], 41, 100.0, 2);
+        assert_eq!(point[2], 0.0);
     }
 
     /// A/B for the lane split, since a comment claiming a speedup should be able to show
@@ -538,6 +557,7 @@ mod tests {
             &newcomers,
             3,
             0.0,
+            3,
             &CancellationToken::new(),
         )
         .unwrap();

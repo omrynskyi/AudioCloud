@@ -418,8 +418,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            applied_first, 2,
-            "V1 and V2 should be the only migrations so far"
+            applied_first, 3,
+            "V1, V2, and V3 should be the only migrations so far"
         );
         assert_eq!(
             applied_first, applied_second,

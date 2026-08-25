@@ -298,6 +298,9 @@ pub enum Algorithm {
 #[ts(export_to = "RefitParams.ts")]
 pub struct RefitParams {
     pub algorithm: Algorithm,
+    /// Which independently-active layout this re-fit builds: 2 or 3. The mode switcher's
+    /// current view, in practice -- "the map you build is the map you're looking at."
+    pub dims: u8,
     /// UMAP's neighbourhood size. Ignored by PCA. `None` takes the vendored default.
     #[ts(optional)]
     pub n_neighbors: Option<usize>,
@@ -316,6 +319,7 @@ impl Default for RefitParams {
     fn default() -> Self {
         Self {
             algorithm: Algorithm::Umap,
+            dims: 3,
             n_neighbors: None,
             force_full: false,
         }

@@ -33,9 +33,9 @@ use crate::{
 /// a real state with a real screen behind it, and `NoProjection` would make the renderer
 /// treat "no map yet" as a failure.
 #[tauri::command]
-pub async fn get_point_cloud(db: State<'_, Database>) -> Result<Response, AppError> {
+pub async fn get_point_cloud(db: State<'_, Database>, dims: u8) -> Result<Response, AppError> {
     let conn = db.read()?;
-    let points = queries::active_projection_points(&conn)?;
+    let points = queries::active_projection_points(&conn, i64::from(dims))?;
     drop(conn);
 
     let buf = binary::point_cloud(&points)?;
