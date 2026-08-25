@@ -1,5 +1,5 @@
-//! Per-sample commands: detail, neighbors, tags, collections, and the two audio ones
-//! (`overview.md` §6.1).
+//! Per-sample commands: detail, neighbors, tags, and the two audio ones (`overview.md` §6.1).
+//! Collection commands are `commands::collections`.
 
 use std::sync::Arc;
 
@@ -9,7 +9,7 @@ use crate::{
     audio::AudioPlayer,
     db::{queries, Database},
     error::AppError,
-    ipc::types::{Collection, Neighbor, SampleDetail, SampleFeatureBlock, Tag},
+    ipc::types::{Neighbor, SampleDetail, SampleFeatureBlock, Tag},
 };
 
 /// Everything the inspector shows for one sample.
@@ -173,7 +173,9 @@ fn require_tag_name(tag_name: &str) -> Result<&str, AppError> {
 
 /// Rejects a sample id the database does not have. See [`set_tag`] on why this is not left
 /// to the foreign key.
-fn require_sample(db: &Database, sample_id: i64) -> Result<(), AppError> {
+///
+/// `pub(crate)`: `commands::collections` validates the same way before touching the writer.
+pub(crate) fn require_sample(db: &Database, sample_id: i64) -> Result<(), AppError> {
     let conn = db.read()?;
     if queries::sample_row(&conn, sample_id)?.is_none() {
         return Err(AppError::not_found("sample", sample_id));
@@ -185,43 +187,34 @@ fn require_sample(db: &Database, sample_id: i64) -> Result<(), AppError> {
 #[tauri::command]
 pub async fn list_tags(db: State<'_, Database>) -> Result<Vec<Tag>, AppError> {
     let conn = db.read()?;
-    Ok(queries::all_tags(&conn)?
-        .into_iter()
-        .map(|t| Tag {
-            id: t.id,
-            name: t.name,
-            color: t.color,
-            sample_count: t.sample_count,
-        })
-        .collect())
+    Ok(queries::all_tags(&conn)?.into_iter().map(tag_dto).collect())
 }
 
-/// Creates a collection over the given samples, preserving their order.
+/// Sets (or clears, for `None`) a tag's display color.
 #[tauri::command]
-pub async fn create_collection(
+pub async fn set_tag_color(
     db: State<'_, Database>,
-    name: String,
-    sample_ids: Vec<i64>,
-) -> Result<Collection, AppError> {
-    if name.trim().is_empty() {
-        return Err(AppError::invalid("name", "a collection needs a name"));
-    }
-    // Same reasoning as `set_tag`: a durable command commits even when it fails, so an
-    // unknown id would leave a half-populated collection behind rather than nothing.
-    for &sample_id in &sample_ids {
-        require_sample(&db, sample_id)?;
-    }
-    let id = db.writer().create_collection(name, sample_ids)?;
+    tag_id: i64,
+    color: Option<String>,
+) -> Result<Tag, AppError> {
+    let conn = db.read()?;
+    queries::tag(&conn, tag_id)?.ok_or_else(|| AppError::not_found("tag", tag_id))?;
+    drop(conn);
+
+    db.writer().set_tag_color(tag_id, color)?;
 
     let conn = db.read()?;
-    let row =
-        queries::collection(&conn, id)?.ok_or_else(|| AppError::not_found("collection", id))?;
-    Ok(Collection {
+    let row = queries::tag(&conn, tag_id)?.ok_or_else(|| AppError::not_found("tag", tag_id))?;
+    Ok(tag_dto(row))
+}
+
+fn tag_dto(row: queries::TagRow) -> Tag {
+    Tag {
         id: row.id,
         name: row.name,
-        created_at: row.created_at,
+        color: row.color,
         sample_count: row.sample_count,
-    })
+    }
 }
 
 /// Selects the sample's file in Finder.

@@ -34,8 +34,8 @@ use audiobank_lib::{
     ipc::{
         events::{DownloadEvent, RefitEvent, ScanEvent},
         types::{
-            Collection, Feature, LibraryRoot, ModelStatus, Neighbor, QueryFilter, RefitParams,
-            SampleDetail, Tag,
+            AppSettings, AudioDeviceInfo, Collection, CollectionDetail, Feature, LibraryRoot,
+            ModelStatus, Neighbor, QueryFilter, RefitParams, SampleDetail, Tag,
         },
         BINDINGS_DIR,
     },
@@ -57,6 +57,9 @@ fn export_bindings() {
     Neighbor::export_all(&cfg).unwrap();
     Tag::export_all(&cfg).unwrap();
     Collection::export_all(&cfg).unwrap();
+    CollectionDetail::export_all(&cfg).unwrap();
+    AudioDeviceInfo::export_all(&cfg).unwrap();
+    AppSettings::export_all(&cfg).unwrap();
     Feature::export_all(&cfg).unwrap();
     QueryFilter::export_all(&cfg).unwrap();
     ModelStatus::export_all(&cfg).unwrap();

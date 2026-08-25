@@ -721,24 +721,28 @@ click handling as a stand-in for the inspector that does not exist yet.
 
 *Goal: the parts around the canvas that make it a tool rather than a demo.*
 
-- [ ] Tailwind layout: canvas center, collapsible inspector right, library/filters left
-- [ ] First-run flow: welcome → add library root → model download with progress → scan
-- [ ] Library management: add / remove / rescan / enable-disable roots; show per-root counts
-- [ ] Scan progress UI driven by the throttled `Channel`; cancel button that actually
+- [x] Tailwind layout: canvas center, collapsible inspector right, library/filters left
+- [x] First-run flow: welcome → add library root → model download with progress → scan
+- [x] Library management: add / remove / rescan / enable-disable roots; show per-root counts
+- [x] Scan progress UI driven by the throttled `Channel`; cancel button that actually
       cancels
-- [ ] Search over FTS5 with debounced input; results both listed and highlighted in 3D
-- [ ] Filter panel: duration, BPM, key, loudness, spectral centroid, tags, format
-- [ ] Inspector: filename, path, format, duration, DSP features, waveform, tags,
+- [x] Search over FTS5 with debounced input; results both listed and highlighted in 3D
+- [x] Filter panel: duration, BPM, key, loudness, spectral centroid, tags, format
+- [x] Inspector: filename, path, format, duration, DSP features, waveform, tags,
       nearest neighbors (`get_similar`), reveal-in-Finder
-- [ ] Tagging: create, assign, bulk-assign to a selection, color per tag
-- [ ] Collections: create from selection, reorder, export the file list
-- [ ] Settings: projection params + re-fit trigger, audio device and gain, model status and
+- [x] Tagging: create, assign, bulk-assign to a selection, color per tag
+- [x] Collections: create from selection, reorder, export the file list
+- [x] Settings: projection params + re-fit trigger, audio device and gain, model status and
       re-download, data dir with reveal, reset-database
-- [ ] Empty, loading, and error states for every panel — including "model not downloaded,"
+- [x] Empty, loading, and error states for every panel — including "model not downloaded,"
       "no roots added," "scan failed," and "0 results"
-- [ ] Keyboard: space to audition, arrows to step neighbors, `/` to focus search, escape to
+- [x] Keyboard: space to audition, arrows to step neighbors, `/` to focus search, escape to
       clear selection
-- [ ] Drag a sample out of the app into a DAW (macOS file promise)
+- [ ] Drag a sample out of the app into a DAW (macOS file promise) — **deferred.** The one
+      crate that can start a native OS drag from Rust (`drag`) is unverified against this
+      Tauri version, and doing it properly means owning the drag session server-side so the
+      file's path never crosses to the WebView, the same way `reveal_in_finder` already does.
+      Worth its own pass rather than folding into this one.
 
 **Exit criteria:** a new user can go from first launch to auditioning a sample from their
 own library without reading documentation; every `AppError` variant has a rendered state

@@ -37,6 +37,8 @@ use crate::{
 
 use engine::{AudioError, DeviceFormat, Engine};
 
+pub use engine::{list_output_devices, AudioDeviceInfo};
+
 /// Resampler chunk size, matched to `pipeline::decode`'s own -- see that module for the
 /// reasoning; it applies identically here.
 const RESAMPLE_CHUNK: usize = 1024;
@@ -99,6 +101,10 @@ impl PcmCache {
 #[derive(Debug, Default)]
 pub struct LazyEngine {
     cell: Mutex<Option<Arc<Engine>>>,
+    /// The device Settings has asked for, remembered even before an engine exists to tell it
+    /// to -- a device chosen on the first-run screen, before anything has ever played, must
+    /// still be the one the first `play_sample` opens.
+    preferred: Mutex<Option<String>>,
 }
 
 impl LazyEngine {
@@ -106,7 +112,7 @@ impl LazyEngine {
         Self::default()
     }
 
-    /// The engine, opening the default output device if this is the first call.
+    /// The engine, opening the preferred (or default) output device if this is the first call.
     pub fn get(&self) -> Result<Arc<Engine>, AudioError> {
         let mut cell = self
             .cell
@@ -115,7 +121,12 @@ impl LazyEngine {
         if let Some(engine) = cell.as_ref() {
             return Ok(Arc::clone(engine));
         }
-        let engine = Engine::open()?;
+        let preferred = self
+            .preferred
+            .lock()
+            .map_err(|_| AudioError::Stream("the preferred-device cell is poisoned".into()))?
+            .clone();
+        let engine = Engine::open(preferred)?;
         *cell = Some(Arc::clone(&engine));
         Ok(engine)
     }
@@ -124,6 +135,18 @@ impl LazyEngine {
     /// stopping playback that was never started does not itself open a device.
     pub fn is_initialized(&self) -> bool {
         self.cell.lock().map(|c| c.is_some()).unwrap_or(false)
+    }
+
+    /// Records the preferred device and, if an engine is already open, switches it live.
+    pub fn set_preferred(&self, name: Option<String>) {
+        if let Ok(mut preferred) = self.preferred.lock() {
+            *preferred = name.clone();
+        }
+        if let Ok(cell) = self.cell.lock() {
+            if let Some(engine) = cell.as_ref() {
+                engine.set_preferred(name);
+            }
+        }
     }
 }
 
@@ -206,6 +229,12 @@ impl AudioPlayer {
             self.lazy.get()?.stop();
         }
         Ok(())
+    }
+
+    /// Sets the preferred output device by name (or `None` for the OS default). Switches a
+    /// live stream immediately; otherwise just remembered for the next `play`.
+    pub fn set_preferred_device(&self, name: Option<String>) {
+        self.lazy.set_preferred(name);
     }
 
     /// Decodes, resamples and caches an already-fetched sample row for `format`, off the async

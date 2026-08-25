@@ -30,6 +30,17 @@ export interface SceneState {
   /** The sample the inspector is showing, or none. */
   selectedSampleId: number | null;
   /**
+   * Every sample the user has multi-selected, for bulk tagging and "create a collection
+   * from this selection." Still an id set, not point data — the same justification the
+   * module docstring gives for hover and `selectedSampleId` living here rather than in a
+   * panel-local store: a handful of ids, not one value per point.
+   *
+   * `selectedSampleId` and this are independent: the inspector always targets the single
+   * id, and a multi-select does not have to include it (or vice versa). Panels that act on
+   * "the current selection" fall back to `selectedSampleId` when this is empty.
+   */
+  selectedIds: Set<number>;
+  /**
    * The sample under the cursor.
    *
    * Written at up to 20 Hz by the picker. Subscribe to it narrowly — a component that
@@ -43,11 +54,21 @@ export interface SceneState {
   /** A global multiplier on point size, for the size slider. */
   pointSizeMultiplier: number;
 
-  select(sampleId: number | null): void;
-  hover(sampleId: number | null): void;
-  setColorBy(feature: Feature | null): void;
-  setFilter(filter: Partial<QueryFilter> | null): void;
-  setPointSizeMultiplier(multiplier: number): void;
+  // Typed as arrow-function properties rather than method shorthand (`select(id): void`)
+  // deliberately: a method-typed member is exactly what `@typescript-eslint/unbound-method`
+  // flags the moment a component does `useSceneStore((s) => s.select)` and calls the result
+  // later — a completely ordinary selector pattern, and these never use `this` anyway.
+  select: (sampleId: number | null) => void;
+  hover: (sampleId: number | null) => void;
+  setColorBy: (feature: Feature | null) => void;
+  setFilter: (filter: Partial<QueryFilter> | null) => void;
+  setPointSizeMultiplier: (multiplier: number) => void;
+
+  /** Replaces the multi-selection outright — a fresh drag-select or click with no modifier. */
+  setSelectedIds: (ids: Iterable<number>) => void;
+  /** Adds or removes one id from the multi-selection — a shift/cmd-click. */
+  toggleSelected: (sampleId: number) => void;
+  clearSelectedIds: () => void;
 }
 
 export const useSceneStore = create<SceneState>()(
@@ -56,6 +77,7 @@ export const useSceneStore = create<SceneState>()(
   // colour array because the filter panel opened.
   subscribeWithSelector((set) => ({
     selectedSampleId: null,
+    selectedIds: new Set<number>(),
     hoveredSampleId: null,
     colorBy: null,
     filter: null,
@@ -73,5 +95,15 @@ export const useSceneStore = create<SceneState>()(
     setColorBy: (colorBy) => set({ colorBy }),
     setFilter: (filter) => set({ filter }),
     setPointSizeMultiplier: (pointSizeMultiplier) => set({ pointSizeMultiplier }),
+
+    setSelectedIds: (ids) => set({ selectedIds: new Set(ids) }),
+    toggleSelected: (sampleId) =>
+      set((state) => {
+        const next = new Set(state.selectedIds);
+        if (next.has(sampleId)) next.delete(sampleId);
+        else next.add(sampleId);
+        return { selectedIds: next };
+      }),
+    clearSelectedIds: () => set({ selectedIds: new Set() }),
   })),
 );

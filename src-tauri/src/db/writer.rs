@@ -162,10 +162,29 @@ enum Command {
         tag_name: String,
         reply: Reply<()>,
     },
+    SetTagColor {
+        tag_id: i64,
+        color: Option<String>,
+        reply: Reply<()>,
+    },
     CreateCollection {
         name: String,
         sample_ids: Vec<i64>,
         reply: Reply<i64>,
+    },
+    ReorderCollection {
+        collection_id: i64,
+        sample_ids: Vec<i64>,
+        reply: Reply<()>,
+    },
+    DeleteCollection {
+        collection_id: i64,
+        reply: Reply<()>,
+    },
+    SetSetting {
+        key: String,
+        value: String,
+        reply: Reply<()>,
     },
     Flush {
         reply: Reply<()>,
@@ -213,7 +232,14 @@ impl Command {
                 // transaction or search would disagree with the sidebar.
                 | Command::SetTag { .. }
                 | Command::UnsetTag { .. }
+                | Command::SetTagColor { .. }
                 | Command::CreateCollection { .. }
+                | Command::ReorderCollection { .. }
+                | Command::DeleteCollection { .. }
+                // A setting a user just changed in the Settings panel must not appear to
+                // have taken effect and then evaporate on a crash before the next batch
+                // flushes -- the same reasoning as a tag.
+                | Command::SetSetting { .. }
                 | Command::Flush { .. }
         )
     }
@@ -417,6 +443,15 @@ impl WriterHandle {
         })
     }
 
+    /// Sets (or clears, for `None`) a tag's display color.
+    pub fn set_tag_color(&self, tag_id: i64, color: Option<String>) -> Result<(), DbError> {
+        self.request(|reply| Command::SetTagColor {
+            tag_id,
+            color,
+            reply,
+        })
+    }
+
     /// Creates a collection holding the given samples, in the order given.
     pub fn create_collection(
         &self,
@@ -429,6 +464,43 @@ impl WriterHandle {
             sample_ids,
             reply,
         })
+    }
+
+    /// Rewrites a collection's member order to match `sample_ids`.
+    ///
+    /// The caller -- `commands::collections::reorder_collection` -- has already checked
+    /// `sample_ids` is exactly the collection's current membership; this just writes the new
+    /// positions.
+    pub fn reorder_collection(
+        &self,
+        collection_id: i64,
+        sample_ids: Vec<i64>,
+    ) -> Result<(), DbError> {
+        self.request(|reply| Command::ReorderCollection {
+            collection_id,
+            sample_ids,
+            reply,
+        })
+    }
+
+    /// Deletes a collection and, by cascade, its membership rows. The samples themselves are
+    /// untouched -- a collection is a saved arrangement, not ownership.
+    pub fn delete_collection(&self, collection_id: i64) -> Result<(), DbError> {
+        self.request(|reply| Command::DeleteCollection {
+            collection_id,
+            reply,
+        })
+    }
+
+    /// Writes one key in the `app_settings` table, creating or overwriting it.
+    pub fn set_setting(
+        &self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Result<(), DbError> {
+        let key = key.into();
+        let value = value.into();
+        self.request(|reply| Command::SetSetting { key, value, reply })
     }
 
     /// Commits the open batch and returns once it is durable.
@@ -605,11 +677,28 @@ impl Writer {
                 tag_name,
                 reply,
             } => answer(reply, unset_tag(conn, sample_id, &tag_name)),
+            Command::SetTagColor {
+                tag_id,
+                color,
+                reply,
+            } => answer(reply, set_tag_color(conn, tag_id, color.as_deref())),
             Command::CreateCollection {
                 name,
                 sample_ids,
                 reply,
             } => answer(reply, create_collection(conn, &name, &sample_ids)),
+            Command::ReorderCollection {
+                collection_id,
+                sample_ids,
+                reply,
+            } => answer(reply, reorder_collection(conn, collection_id, &sample_ids)),
+            Command::DeleteCollection {
+                collection_id,
+                reply,
+            } => answer(reply, delete_collection(conn, collection_id)),
+            Command::SetSetting { key, value, reply } => {
+                answer(reply, set_setting(conn, &key, &value))
+            }
             Command::Flush { reply } => answer(reply, Ok(())),
             Command::Shutdown => Box::new(|| {}),
         }
@@ -1013,6 +1102,13 @@ fn unset_tag(conn: &Connection, sample_id: i64, tag_name: &str) -> Result<(), Db
     reindex_sample(conn, sample_id, &old_tags)
 }
 
+/// Sets or clears one tag's display color.
+fn set_tag_color(conn: &Connection, tag_id: i64, color: Option<&str>) -> Result<(), DbError> {
+    conn.prepare_cached("UPDATE tags SET color = ?2 WHERE id = ?1")?
+        .execute((tag_id, color))?;
+    Ok(())
+}
+
 /// Creates a collection over the given samples, preserving the order they were given in.
 ///
 /// `position` is that order, and it is the reason a collection is not just a tag: a tag is a
@@ -1032,6 +1128,39 @@ fn create_collection(conn: &Connection, name: &str, sample_ids: &[i64]) -> Resul
     }
 
     Ok(collection_id)
+}
+
+/// Rewrites `position` for every member of `collection_id` to match `sample_ids`'s order.
+fn reorder_collection(
+    conn: &Connection,
+    collection_id: i64,
+    sample_ids: &[i64],
+) -> Result<(), DbError> {
+    let mut update = conn.prepare_cached(
+        "UPDATE collection_members SET position = ?3
+         WHERE collection_id = ?1 AND sample_id = ?2",
+    )?;
+    for (position, sample_id) in sample_ids.iter().enumerate() {
+        update.execute((collection_id, sample_id, position as i64))?;
+    }
+    Ok(())
+}
+
+/// Deletes a collection. `collection_members` cascades via its foreign key.
+fn delete_collection(conn: &Connection, collection_id: i64) -> Result<(), DbError> {
+    conn.prepare_cached("DELETE FROM collections WHERE id = ?1")?
+        .execute([collection_id])?;
+    Ok(())
+}
+
+/// Upserts one `app_settings` row.
+fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<(), DbError> {
+    conn.prepare_cached(
+        "INSERT INTO app_settings (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )?
+    .execute((key, value))?;
+    Ok(())
 }
 
 fn add_root(conn: &Connection, path: &str, label: Option<&str>) -> Result<i64, DbError> {

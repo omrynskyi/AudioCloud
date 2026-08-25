@@ -7,10 +7,12 @@
 //! -- the pipeline is a function, and a function has no opinion about being called twice.
 
 pub mod cloud;
+pub mod collections;
 pub mod library;
 pub mod model;
 pub mod projection;
 pub mod samples;
+pub mod settings;
 
 use std::sync::{
     atomic::{AtomicI64, Ordering},
@@ -247,6 +249,23 @@ impl Jobs {
             cancel.cancel();
         }
         Ok(())
+    }
+
+    /// Whether a scan, re-fit or download is running.
+    ///
+    /// What `settings::reset_database` refuses to run over: deleting the database out from
+    /// under a job that is mid-write would not just fail that job, it would race the delete
+    /// itself against whatever the writer thread is doing.
+    pub fn any_running(&self) -> bool {
+        let scan = self.inner.scan.lock().map(|s| s.is_some()).unwrap_or(true);
+        let refit = self.inner.refit.lock().map(|s| s.is_some()).unwrap_or(true);
+        let download = self
+            .inner
+            .download
+            .lock()
+            .map(|s| s.is_some())
+            .unwrap_or(true);
+        scan || refit || download
     }
 }
 

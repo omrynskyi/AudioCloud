@@ -417,7 +417,10 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(applied_first, 1, "V1 should be the only migration so far");
+        assert_eq!(
+            applied_first, 2,
+            "V1 and V2 should be the only migrations so far"
+        );
         assert_eq!(
             applied_first, applied_second,
             "the second run applied a migration it should have skipped"

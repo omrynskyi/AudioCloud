@@ -44,7 +44,7 @@ fn sine_burst(sample_rate: u32, channels: u16, seconds: f32, hz: f32) -> Vec<f32
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a real audio output device"]
 async fn hover_to_audible_is_under_the_budget() {
-    let engine = Engine::open().expect("no default output device on this machine");
+    let engine = Engine::open(None).expect("no default output device on this machine");
     let format = engine.format();
     println!(
         "opened {} Hz, {} channel(s)",
@@ -83,7 +83,7 @@ async fn hover_to_audible_is_under_the_budget() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a real audio output device"]
 async fn stop_releases_without_a_panic() {
-    let engine = Engine::open().expect("no default output device on this machine");
+    let engine = Engine::open(None).expect("no default output device on this machine");
     let format = engine.format();
     let pcm = Arc::new(sine_burst(format.sample_rate, format.channels, 2.0, 220.0));
     engine.play_pcm(pcm, 0.5);
@@ -139,7 +139,7 @@ async fn a_real_sample_plays_end_to_end() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a real audio output device"]
 async fn rapid_retriggers_do_not_panic_or_deadlock() {
-    let engine = Engine::open().expect("no default output device on this machine");
+    let engine = Engine::open(None).expect("no default output device on this machine");
     let format = engine.format();
     let pcm = Arc::new(sine_burst(format.sample_rate, format.channels, 1.0, 330.0));
 

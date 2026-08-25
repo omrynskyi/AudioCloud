@@ -13,7 +13,10 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
-use crate::db::{queries, SampleFeatures};
+use crate::{
+    audio,
+    db::{queries, SampleFeatures},
+};
 
 /// A library root as the UI shows it.
 #[derive(Debug, Clone, Serialize, TS)]
@@ -153,6 +156,85 @@ pub struct Collection {
     pub name: String,
     pub created_at: i64,
     pub sample_count: i64,
+}
+
+/// One sample inside a collection, in display order (`overview.md` §6.1, Phase 9).
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "CollectionMember.ts")]
+pub struct CollectionMember {
+    pub sample_id: i64,
+    pub rel_path: String,
+    pub filename: String,
+    pub duration_ms: Option<i64>,
+}
+
+impl From<queries::CollectionMemberRow> for CollectionMember {
+    fn from(row: queries::CollectionMemberRow) -> Self {
+        Self {
+            sample_id: row.sample_id,
+            rel_path: row.rel_path,
+            filename: row.filename,
+            duration_ms: row.duration_ms,
+        }
+    }
+}
+
+/// A collection with its members, in the order the user arranged them.
+///
+/// A DTO distinct from [`Collection`] rather than an optional field on it: the collection
+/// list only ever needs a name and a count, and fetching every member of every collection to
+/// answer `list_collections` would be a query nobody asked for.
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "CollectionDetail.ts")]
+pub struct CollectionDetail {
+    pub id: i64,
+    pub name: String,
+    pub created_at: i64,
+    pub members: Vec<CollectionMember>,
+}
+
+impl CollectionDetail {
+    pub fn new(row: queries::CollectionRow, members: Vec<queries::CollectionMemberRow>) -> Self {
+        Self {
+            id: row.id,
+            name: row.name,
+            created_at: row.created_at,
+            members: members.into_iter().map(CollectionMember::from).collect(),
+        }
+    }
+}
+
+/// One output device the Settings panel can offer.
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "AudioDeviceInfo.ts")]
+pub struct AudioDeviceInfo {
+    pub name: String,
+    pub is_default: bool,
+}
+
+impl From<audio::AudioDeviceInfo> for AudioDeviceInfo {
+    fn from(d: audio::AudioDeviceInfo) -> Self {
+        Self {
+            name: d.name,
+            is_default: d.is_default,
+        }
+    }
+}
+
+/// The settings that survive a restart (`task.md` Phase 9). Everything else Settings shows --
+/// model status, projection params -- is either derived or lives on its own durable row
+/// already, and does not belong in this key/value store.
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "AppSettings.ts")]
+pub struct AppSettings {
+    /// `None` means "the OS default," which is also the initial state before anyone has
+    /// chosen a device.
+    pub audio_device: Option<String>,
+    pub gain: f32,
 }
 
 pub use crate::db::search::{Feature, FeatureRange, QueryFilter};

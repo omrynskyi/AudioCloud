@@ -593,6 +593,26 @@ pub struct TagRow {
     pub sample_count: i64,
 }
 
+/// One tag by id, with its usage count.
+pub fn tag(conn: &Connection, id: i64) -> Result<Option<TagRow>, DbError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT t.id, t.name, t.color, COUNT(st.sample_id)
+         FROM tags t LEFT JOIN sample_tags st ON st.tag_id = t.id
+         WHERE t.id = ?1 GROUP BY t.id",
+    )?;
+    stmt.query_row([id], |r| {
+        Ok(TagRow {
+            id: r.get(0)?,
+            name: r.get(1)?,
+            color: r.get(2)?,
+            sample_count: r.get(3)?,
+        })
+    })
+    .map(Some)
+    .or_else(no_rows_is_none)
+    .map_err(DbError::from)
+}
+
 /// Every tag, with its usage count, alphabetical.
 ///
 /// `LEFT JOIN` rather than an inner one: a tag the user created and then removed from every
@@ -652,4 +672,83 @@ fn no_rows_is_none<T>(e: rusqlite::Error) -> rusqlite::Result<Option<T>> {
         rusqlite::Error::QueryReturnedNoRows => Ok(None),
         other => Err(other),
     }
+}
+
+/// Every collection, newest first, with its size.
+pub fn all_collections(conn: &Connection) -> Result<Vec<CollectionRow>, DbError> {
+    let mut stmt = conn.prepare(
+        "SELECT c.id, c.name, c.created_at, COUNT(m.sample_id)
+         FROM collections c LEFT JOIN collection_members m ON m.collection_id = c.id
+         GROUP BY c.id ORDER BY c.created_at DESC, c.id DESC",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(CollectionRow {
+            id: r.get(0)?,
+            name: r.get(1)?,
+            created_at: r.get(2)?,
+            sample_count: r.get(3)?,
+        })
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(DbError::from)
+}
+
+/// One member of a collection, in display order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectionMemberRow {
+    pub sample_id: i64,
+    pub rel_path: String,
+    pub filename: String,
+    pub duration_ms: Option<i64>,
+}
+
+/// A collection's samples, in the order the user arranged them.
+///
+/// `position` is not part of the row: the array index a caller gets back already carries it,
+/// the same way `create_collection` and `reorder_collection` never hand the number back
+/// either -- it is bookkeeping for the query, not a value the frontend renders.
+pub fn collection_members(
+    conn: &Connection,
+    collection_id: i64,
+) -> Result<Vec<CollectionMemberRow>, DbError> {
+    let mut stmt = conn.prepare(
+        "SELECT s.id, s.rel_path, s.filename, s.duration_ms
+         FROM collection_members m JOIN samples s ON s.id = m.sample_id
+         WHERE m.collection_id = ?1
+         ORDER BY m.position",
+    )?;
+    let rows = stmt.query_map([collection_id], |r| {
+        Ok(CollectionMemberRow {
+            sample_id: r.get(0)?,
+            rel_path: r.get(1)?,
+            filename: r.get(2)?,
+            duration_ms: r.get(3)?,
+        })
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(DbError::from)
+}
+
+/// The sample ids currently in a collection, unordered -- what [`reorder_collection`]
+/// validates a reorder request against before touching the writer.
+///
+/// [`reorder_collection`]: super::writer::WriterHandle::reorder_collection
+pub fn collection_member_ids(conn: &Connection, collection_id: i64) -> Result<Vec<i64>, DbError> {
+    let mut stmt =
+        conn.prepare_cached("SELECT sample_id FROM collection_members WHERE collection_id = ?1")?;
+    let rows = stmt.query_map([collection_id], |r| r.get::<_, i64>(0))?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(DbError::from)
+}
+
+/// One setting, or `None` if it has never been written -- the caller supplies the default.
+pub fn setting(conn: &Connection, key: &str) -> Result<Option<String>, DbError> {
+    conn.query_row(
+        "SELECT value FROM app_settings WHERE key = ?1",
+        [key],
+        |r| r.get(0),
+    )
+    .map(Some)
+    .or_else(no_rows_is_none)
+    .map_err(DbError::from)
 }

@@ -368,7 +368,13 @@ fn every_command_in_the_surface_is_reachable() {
         "set_tag",
         "unset_tag",
         "list_tags",
+        "set_tag_color",
         "create_collection",
+        "list_collections",
+        "get_collection",
+        "reorder_collection",
+        "delete_collection",
+        "export_collection",
         "reveal_in_finder",
         "play_sample",
         "stop_playback",
@@ -377,6 +383,17 @@ fn every_command_in_the_surface_is_reachable() {
         "get_model_status",
         "download_model",
         "cancel_download",
+        "get_settings",
+        "list_audio_devices",
+        "set_audio_device",
+        "set_gain",
+        // `reveal_data_dir` and `reset_database` are deliberately not invoked here. Every
+        // other command in this list either takes an argument `{}` fails to deserialize, or
+        // is a harmless no-arg read -- but both of these take no JSON arguments at all, so
+        // `{}` would not be "deliberately wrong," it would be a real call: `reveal_data_dir`
+        // would pop a Finder window and `reset_database` would spawn a copy of this test
+        // binary and exit the process. Their registration is still checked at compile time,
+        // by name, in `command_handler`'s `generate_handler!` list.
     ] {
         if let Err(err) = invoke(&webview, cmd, json!({})) {
             let message = err.to_string();

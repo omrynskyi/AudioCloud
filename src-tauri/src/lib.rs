@@ -60,15 +60,27 @@ pub fn command_handler<R: tauri::Runtime>(
         commands::samples::set_tag,
         commands::samples::unset_tag,
         commands::samples::list_tags,
-        commands::samples::create_collection,
+        commands::samples::set_tag_color,
         commands::samples::reveal_in_finder,
         commands::samples::play_sample,
         commands::samples::stop_playback,
+        commands::collections::create_collection,
+        commands::collections::list_collections,
+        commands::collections::get_collection,
+        commands::collections::reorder_collection,
+        commands::collections::delete_collection,
+        commands::collections::export_collection,
         commands::projection::start_refit,
         commands::projection::cancel_refit,
         commands::model::get_model_status,
         commands::model::download_model,
         commands::model::cancel_download,
+        commands::settings::get_settings,
+        commands::settings::list_audio_devices,
+        commands::settings::set_audio_device,
+        commands::settings::set_gain,
+        commands::settings::reveal_data_dir,
+        commands::settings::reset_database,
     ]
 }
 
@@ -91,6 +103,10 @@ pub fn run() {
     #[allow(clippy::expect_used)]
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        // Folder picker for "add a library root" and the destination picker for
+        // "export collection" (`task.md` Phase 9) -- see `capabilities/main.json` for why
+        // this was not a dependency before this phase.
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(command_handler())
         // Transport 3 (`overview.md` §6.4). Registered on the builder rather than served
         // from a command so waveform fetches get the WebView's own HTTP cache and never
@@ -115,7 +131,22 @@ pub fn run() {
             // a file, touches the network, or opens a device during setup.
             app.manage(Jobs::new());
             app.manage(PeakCache::new());
-            app.manage(Arc::new(AudioPlayer::new()));
+
+            let player = AudioPlayer::new();
+            // Priming the preference is a Mutex write, not a device open -- `AudioPlayer`
+            // stays lazy (`overview.md` §7's cold-start budget), and the name just sits
+            // ready for whenever the first `play_sample` actually opens a stream.
+            //
+            // `db` was already moved into `app.manage` above, so this reads it back through
+            // the app handle rather than the local binding.
+            if let Ok(conn) = app.state::<Database>().read() {
+                if let Ok(Some(name)) = crate::db::queries::setting(&conn, "audio_device") {
+                    if !name.is_empty() {
+                        player.set_preferred_device(Some(name));
+                    }
+                }
+            }
+            app.manage(Arc::new(player));
             Ok(())
         })
         .build(tauri::generate_context!())

@@ -16,9 +16,13 @@
 
 import { invoke as tauriInvoke, Channel } from '@tauri-apps/api/core';
 
+import type { AppSettings } from '../bindings/AppSettings';
+import type { AudioDeviceInfo } from '../bindings/AudioDeviceInfo';
 import type { Collection } from '../bindings/Collection';
+import type { CollectionDetail } from '../bindings/CollectionDetail';
 import type { DownloadEvent } from '../bindings/DownloadEvent';
 import type { Feature } from '../bindings/Feature';
+import type { FeatureRange } from '../bindings/FeatureRange';
 import type { LibraryRoot } from '../bindings/LibraryRoot';
 import type { ModelStatus } from '../bindings/ModelStatus';
 import type { Neighbor } from '../bindings/Neighbor';
@@ -37,9 +41,13 @@ import {
 import { IpcError, toAppError } from './errors';
 
 export type {
+  AppSettings,
+  AudioDeviceInfo,
   Collection,
+  CollectionDetail,
   DownloadEvent,
   Feature,
+  FeatureRange,
   LibraryRoot,
   ModelStatus,
   Neighbor,
@@ -191,8 +199,9 @@ export function listTags(): Promise<Tag[]> {
   return invoke('list_tags');
 }
 
-export function createCollection(name: string, sampleIds: number[]): Promise<Collection> {
-  return invoke('create_collection', { name, sampleIds });
+/** Sets (or clears, for `null`) a tag's display color. */
+export function setTagColor(tagId: number, color: string | null): Promise<Tag> {
+  return invoke('set_tag_color', { tagId, color });
 }
 
 /**
@@ -273,4 +282,85 @@ export function downloadModel(onEvent: (event: DownloadEvent) => void): Promise<
 /** Stops the download, keeping the partial so the next call resumes rather than restarts. */
 export function cancelDownload(): Promise<void> {
   return invoke('cancel_download');
+}
+
+// ── Collections ─────────────────────────────────────────────────────────────────
+
+export function createCollection(name: string, sampleIds: number[]): Promise<Collection> {
+  return invoke('create_collection', { name, sampleIds });
+}
+
+/** Every collection, newest first. */
+export function listCollections(): Promise<Collection[]> {
+  return invoke('list_collections');
+}
+
+/** One collection with its members, in the order the user arranged them. */
+export function getCollection(collectionId: number): Promise<CollectionDetail> {
+  return invoke('get_collection', { collectionId });
+}
+
+/**
+ * Rewrites a collection's member order. `sampleIds` must be exactly the collection's current
+ * membership, reordered -- the core rejects anything else rather than silently reconciling it.
+ */
+export function reorderCollection(
+  collectionId: number,
+  sampleIds: number[],
+): Promise<CollectionDetail> {
+  return invoke('reorder_collection', { collectionId, sampleIds });
+}
+
+/** Deletes a collection. The samples themselves are untouched. */
+export function deleteCollection(collectionId: number): Promise<void> {
+  return invoke('delete_collection', { collectionId });
+}
+
+/**
+ * Writes a collection's absolute file paths, one per line, to `destPath`.
+ *
+ * `destPath` must come from the frontend's own save dialog (`@tauri-apps/plugin-dialog`'s
+ * `save()`) -- a path the user picked through native OS UI, the same shape `addLibraryRoot`
+ * already takes. Never construct or guess one.
+ */
+export function exportCollection(collectionId: number, destPath: string): Promise<void> {
+  return invoke('export_collection', { collectionId, destPath });
+}
+
+// ── Settings ────────────────────────────────────────────────────────────────────
+
+/** The settings that survive a restart. */
+export function getSettings(): Promise<AppSettings> {
+  return invoke('get_settings');
+}
+
+/** Every audio output device this machine can see. */
+export function listAudioDevices(): Promise<AudioDeviceInfo[]> {
+  return invoke('list_audio_devices');
+}
+
+/** Persists a preferred output device, or `null` for the OS default, and switches live. */
+export function setAudioDevice(name: string | null): Promise<AppSettings> {
+  return invoke('set_audio_device', { name });
+}
+
+/** Persists the master gain the Settings slider remembers across restarts. */
+export function setGain(gain: number): Promise<AppSettings> {
+  return invoke('set_gain', { gain });
+}
+
+/** Reveals the app's data directory (the database, the embedding store) in Finder. */
+export function revealDataDir(): Promise<void> {
+  return invoke('reveal_data_dir');
+}
+
+/**
+ * Deletes the whole library and relaunches the app.
+ *
+ * **This call's promise may never settle.** The process exits before Tauri can serialize a
+ * reply back. Fire it, then show a static "restarting…" screen rather than awaiting it for
+ * the happy path.
+ */
+export function resetDatabase(): Promise<void> {
+  return invoke('reset_database');
 }

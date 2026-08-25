@@ -76,6 +76,35 @@ pub enum AudioError {
     Stream(String),
 }
 
+/// One enumerable output device, for the Settings picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioDeviceInfo {
+    pub name: String,
+    pub is_default: bool,
+}
+
+/// Every output device `cpal` can see on this host, default first.
+///
+/// A name, not a stable id: this `cpal` gives a device's name through `Display` rather than a
+/// persistent identifier, and a name is exactly what [`choose_device`] needs back to find the
+/// same device again.
+pub fn list_output_devices() -> Result<Vec<AudioDeviceInfo>, AudioError> {
+    let host = cpal::default_host();
+    let default_name = host.default_output_device().map(|d| d.to_string());
+
+    let mut devices: Vec<AudioDeviceInfo> = host
+        .output_devices()
+        .map_err(|e| AudioError::Config(e.to_string()))?
+        .map(|d| {
+            let name = d.to_string();
+            let is_default = Some(&name) == default_name.as_ref();
+            AudioDeviceInfo { name, is_default }
+        })
+        .collect();
+    devices.sort_by(|a, b| b.is_default.cmp(&a.is_default).then(a.name.cmp(&b.name)));
+    Ok(devices)
+}
+
 /// The output format a built stream ended up with, and which build it came from.
 ///
 /// `epoch` is what lets [`crate::audio::PcmCache`] know a cached, device-formatted buffer is
@@ -301,6 +330,25 @@ fn choose_config(device: &cpal::Device) -> Result<SupportedStreamConfig, AudioEr
         .map_err(|e| AudioError::Config(e.to_string()))
 }
 
+/// Picks `preferred` by name if it is still attached, falling back to the host default when it
+/// is absent, gone, or `None` -- the same fallback `overview.md` §6.1's device commands
+/// document: a device unplugged since the user chose it must not turn every play into an
+/// error.
+fn choose_device(host: &cpal::Host, preferred: Option<&str>) -> Result<cpal::Device, AudioError> {
+    if let Some(name) = preferred {
+        if let Ok(mut devices) = host.output_devices() {
+            if let Some(device) = devices.find(|d| d.to_string() == name) {
+                return Ok(device);
+            }
+        }
+        tracing::warn!(
+            device = name,
+            "preferred output device not found; using the default"
+        );
+    }
+    host.default_output_device().ok_or(AudioError::NoDevice)
+}
+
 /// Builds one stream: picks a device and config, allocates a fresh ring sized for it, and wires
 /// the real-time callback to the given [`Transport`]. Used both for the very first stream and
 /// for every rebuild after a device change, so the two paths cannot drift apart.
@@ -310,11 +358,12 @@ fn choose_config(device: &cpal::Device) -> Result<SupportedStreamConfig, AudioEr
 /// stop rather than write frames that no longer line up with the channel count.
 fn build_stream(
     host: &cpal::Host,
+    preferred: Option<&str>,
     transport: &Arc<Transport>,
     rebuild: &Arc<Notify>,
     epoch: Instant,
 ) -> Result<(cpal::Stream, RingProducer, DeviceFormat), AudioError> {
-    let device = host.default_output_device().ok_or(AudioError::NoDevice)?;
+    let device = choose_device(host, preferred)?;
     let supported = choose_config(&device)?;
     let config = supported.config();
     let channels = config.channels;
@@ -382,6 +431,11 @@ fn build_stream(
 /// parts a rebuild replaces, behind locks that only ever see control-side contention.
 pub struct Engine {
     host: cpal::Host,
+    /// The device name Settings last asked for, or `None` for "whatever the OS default is."
+    /// Read by every rebuild, not just the first build, so a device chosen while the app is
+    /// running survives a later `DeviceChanged`/`DeviceNotAvailable` rebuild rather than being
+    /// silently forgotten in favor of the default.
+    preferred: Mutex<Option<String>>,
     stream: Mutex<Option<cpal::Stream>>,
     producer: AsyncMutex<RingProducer>,
     transport: Arc<Transport>,
@@ -402,18 +456,20 @@ impl std::fmt::Debug for Engine {
 }
 
 impl Engine {
-    /// Opens the default output device and starts the background task that rebuilds the stream
-    /// when `cpal` reports it needs one.
-    pub fn open() -> Result<Arc<Self>, AudioError> {
+    /// Opens `preferred`'s device (or the OS default, if `None` or not found) and starts the
+    /// background task that rebuilds the stream when `cpal` reports it needs one.
+    pub fn open(preferred: Option<String>) -> Result<Arc<Self>, AudioError> {
         let host = cpal::default_host();
         let transport = Arc::new(Transport::new());
         let rebuild = Arc::new(Notify::new());
         let epoch = Instant::now();
 
-        let (stream, producer, format) = build_stream(&host, &transport, &rebuild, epoch)?;
+        let (stream, producer, format) =
+            build_stream(&host, preferred.as_deref(), &transport, &rebuild, epoch)?;
 
         let engine = Arc::new(Self {
             host,
+            preferred: Mutex::new(preferred),
             stream: Mutex::new(Some(stream)),
             producer: AsyncMutex::new(producer),
             transport,
@@ -424,6 +480,23 @@ impl Engine {
 
         tokio::spawn(watch_for_rebuild(Arc::clone(&engine)));
         Ok(engine)
+    }
+
+    /// Switches the stream to a named device (or back to the OS default, for `None`),
+    /// rebuilding immediately rather than waiting for the next `DeviceChanged` error.
+    ///
+    /// Reuses the same [`Notify`] the error callback signals on: a device switch and a device
+    /// failure both mean "the current stream is no longer the right one," and
+    /// [`rebuild_stream`] already knows how to open a fresh one against whatever `preferred`
+    /// currently says.
+    ///
+    /// [`rebuild_stream`]: Engine::rebuild_stream
+    pub fn set_preferred(&self, name: Option<String>) {
+        *self
+            .preferred
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = name;
+        self.rebuild.notify_one();
     }
 
     /// The format the currently open stream renders to, for [`crate::audio::PcmCache`] to key
@@ -525,7 +598,18 @@ impl Engine {
     }
 
     async fn rebuild_stream(self: &Arc<Self>) {
-        match build_stream(&self.host, &self.transport, &self.rebuild, self.epoch) {
+        let preferred = self
+            .preferred
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        match build_stream(
+            &self.host,
+            preferred.as_deref(),
+            &self.transport,
+            &self.rebuild,
+            self.epoch,
+        ) {
             Ok((stream, producer, format)) => {
                 *self.producer.lock().await = producer;
                 *self
