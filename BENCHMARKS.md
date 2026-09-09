@@ -212,7 +212,7 @@ missing a row and Phase 10 should add it.
 Where it goes: `hnsw_rs` stores the vectors it is given, so the index alone is 102 MB of f32
 plus its graph; `annembed` then builds a sparse Laplacian, runs a randomized SVD over it, and
 keeps gradient state per edge — 50,000 nodes × 15 neighbours is 750,000 edges. None of that
-is under AudioBank's control. The mmap discipline in `projection/umap.rs` covers the part
+is under AudioCloud's control. The mmap discipline in `projection/umap.rs` covers the part
 that is: vectors reach the index 1,024 rows at a time and no second copy of the matrix is
 ever materialized, which is why PCA over the same corpus peaks at 95 MiB.
 

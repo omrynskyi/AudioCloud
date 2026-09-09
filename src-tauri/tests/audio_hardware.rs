@@ -18,7 +18,7 @@ mod support;
 
 use std::{sync::Arc, time::Duration};
 
-use audiobank_lib::{
+use audiocloud_lib::{
     audio::{engine::Engine, AudioPlayer},
     db::Database,
     pipeline::{scan_root, CancellationToken},

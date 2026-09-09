@@ -23,7 +23,7 @@ use std::sync::{
     Arc,
 };
 
-use audiobank_lib::{
+use audiocloud_lib::{
     db::{queries, Database, NewSample, SampleStatus},
     pipeline::CancellationToken,
     projection::{
@@ -125,7 +125,7 @@ fn vector(i: usize, clusters: usize, seed: u64) -> Vec<f32> {
     v
 }
 
-fn run_refit(db: &Database, projector: &dyn Projector) -> audiobank_lib::projection::RefitReport {
+fn run_refit(db: &Database, projector: &dyn Projector) -> audiocloud_lib::projection::RefitReport {
     let cancel = CancellationToken::new();
     refit(db, Refit::new(projector, &cancel)).unwrap()
 }
@@ -897,7 +897,7 @@ fn duplicate_rows_share_one_fit_and_still_get_their_own_coordinate() {
         store.sync().unwrap();
         locs
     };
-    let mut assignments: Vec<(i64, audiobank_lib::db::EmbeddingLoc)> = ids[..originals]
+    let mut assignments: Vec<(i64, audiocloud_lib::db::EmbeddingLoc)> = ids[..originals]
         .iter()
         .copied()
         .zip(locs.iter().copied())

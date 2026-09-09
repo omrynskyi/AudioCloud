@@ -27,7 +27,7 @@
 //! given, so a 50k x 512 index is ~102 MB of f32 for the duration of the fit and there is
 //! no version of this that is not. What the mmap buys is everything *around* that: rows
 //! arrive from the page cache a [`INSERT_CHUNK`]-sized block at a time and the block is
-//! dropped before the next one is read, so AudioBank never holds a second copy of the
+//! dropped before the next one is read, so AudioCloud never holds a second copy of the
 //! matrix alongside the index. Peak is the index plus a chunk, not the index plus the
 //! corpus.
 //!

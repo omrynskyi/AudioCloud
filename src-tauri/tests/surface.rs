@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 
-use audiobank_lib::{
+use audiocloud_lib::{
     audio::{peaks::PeakCache, AudioPlayer},
     commands::Jobs,
     db::{Database, NewSample, SampleStatus},
@@ -38,7 +38,7 @@ fn app() -> (TempDir, WebviewWindow<tauri::test::MockRuntime>) {
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open(dir.path(), DIM).unwrap();
     let app = mock_builder()
-        .invoke_handler(audiobank_lib::command_handler())
+        .invoke_handler(audiocloud_lib::command_handler())
         .build(mock_context(noop_assets()))
         .unwrap();
     app.manage(db);

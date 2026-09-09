@@ -20,7 +20,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use audiobank_lib::{
+use audiocloud_lib::{
     db::{
         queries, search,
         search::{Feature, FeatureRange, QueryFilter},
@@ -347,7 +347,7 @@ fn an_absurd_filter_is_refused_with_a_reason() {
     )
     .unwrap_err();
     assert!(
-        matches!(err, audiobank_lib::db::DbError::FilterTooLarge { .. }),
+        matches!(err, audiocloud_lib::db::DbError::FilterTooLarge { .. }),
         "got {err:?}"
     );
 }

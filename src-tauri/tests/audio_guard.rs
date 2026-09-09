@@ -10,7 +10,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use audiobank_lib::audio::guard::{AudioThreadGuard, GuardedAlloc};
+use audiocloud_lib::audio::guard::{AudioThreadGuard, GuardedAlloc};
 
 #[global_allocator]
 static GUARD_ALLOC: GuardedAlloc = GuardedAlloc;

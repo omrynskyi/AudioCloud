@@ -164,7 +164,7 @@ webView.navigationDelegate = bridge
 
 let window = NSWindow(contentRect: frame, styleMask: [.titled], backing: .buffered, defer: false)
 window.contentView = webView
-window.title = "audiobank measurement"
+window.title = "audiocloud measurement"
 // Frame timing only means anything if this window is genuinely being composited, and
 // getting that right cost more attempts than it should have. WebKit suspends
 // `requestAnimationFrame` whenever it believes the page is hidden, and it decides that from

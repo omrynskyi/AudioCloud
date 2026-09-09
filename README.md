@@ -1,4 +1,4 @@
-# AudioBank
+# AudioCloud
 
 A spatial browser for large sample libraries. Samples are embedded with a handcrafted spectral
 fingerprint, projected to
@@ -92,7 +92,7 @@ does not run in a window macOS considers occluded, and a frame time measured in 
 a fiction. `npm run profile` exits non-zero if an exit criterion fails.
 
 The app data directory — the SQLite database, its WAL, and `embeddings.bin` — is
-`~/Library/Application Support/com.audiobank.app/`, created 0700 on first run. Deleting it
+`~/Library/Application Support/com.audiocloud.app/`, created 0700 on first run. Deleting it
 is a supported reset: every row in it is derived from files on disk, apart from library
 roots, tags, and collections.
 
@@ -164,7 +164,7 @@ These do nothing useful until the model has been exported and pinned (see
 correct behaviour for this state, not a bug, and it is what
 [`session.rs`](src-tauri/tests/session.rs) exercises with synthetic graphs instead.
 
-`AUDIOBANK_FORCE_CPU=1` skips CoreML, which is how the "verified CPU fallback" half of the
+`AUDIOCLOUD_FORCE_CPU=1` skips CoreML, which is how the "verified CPU fallback" half of the
 Phase 3 exit criteria gets exercised without a machine that lacks a Neural Engine.
 
 Benchmarks are `#[ignore]`d, so they compile on every `cargo test` and run only on request:
@@ -529,7 +529,7 @@ that module is `f32`, a `Provider`, and a `SessionError`.
   merge — which removes the second half of both approaches it proposes. The `lipo`
   verification stays; there is simply less to verify.
 - **The graph takes log-mel, not a waveform**, so `overview.md` §3.3's shared STFT actually
-  saves a transform. The cost is that the front-end becomes AudioBank's responsibility
+  saves a transform. The cost is that the front-end becomes AudioCloud's responsibility
   rather than the checkpoint's, which is what the parity gate exists to police. The tensor
   layout is read off the graph at session init rather than assumed: §3.4 writes the input as
   `[B, 1, 64, T]` and HTSAT's own layout is `[B, 1, T, 64]`, and rather than pick a winner on

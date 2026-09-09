@@ -89,7 +89,7 @@ pub fn run() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "audiobank=info,warn".into()),
+                .unwrap_or_else(|_| "audiocloud=info,warn".into()),
         )
         .init();
 
@@ -140,7 +140,7 @@ pub fn run() {
             Ok(())
         })
         .build(tauri::generate_context!())
-        .expect("error while starting AudioBank");
+        .expect("error while starting AudioCloud");
 
     app.run(|app, event| {
         // The writer holds up to 250 ms of uncommitted rows by design. Exiting without

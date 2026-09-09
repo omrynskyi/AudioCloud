@@ -4,8 +4,8 @@
 //! real data directory (never the live one -- `Database::open` migrates, read-write):
 //!
 //! ```text
-//! cp -r "$HOME/Library/Application Support/com.audiobank.app" /tmp/audiobank-copy
-//! cargo run --release --example preview_latency -- /tmp/audiobank-copy
+//! cp -r "$HOME/Library/Application Support/com.audiocloud.app" /tmp/audiocloud-copy
+//! cargo run --release --example preview_latency -- /tmp/audiocloud-copy
 //! ```
 //!
 //! This produced the decode numbers in `BENCHMARKS.md`'s Phase 8 section. What it deliberately
@@ -16,14 +16,14 @@
 
 use std::{path::PathBuf, time::Instant};
 
-use audiobank_lib::{
+use audiocloud_lib::{
     db::{queries, Database},
     pipeline::{decode::TARGET_SAMPLE_RATE, BufferPool, Decoder},
 };
 
 fn main() {
     let dir = PathBuf::from(std::env::args().nth(1).expect("usage: <data dir>"));
-    let db = Database::open(&dir, audiobank_lib::EMBEDDING_DIM).expect("open db");
+    let db = Database::open(&dir, audiocloud_lib::EMBEDDING_DIM).expect("open db");
     let conn = db.read().unwrap();
     let ids: Vec<i64> = conn
         .prepare("select id from samples order by id")

@@ -275,7 +275,7 @@ impl WriterHandle {
             batch: None,
         };
         let thread = std::thread::Builder::new()
-            .name("audiobank-db-writer".into())
+            .name("audiocloud-db-writer".into())
             .spawn(move || writer.run(rx))
             .map_err(|e| {
                 io_error(

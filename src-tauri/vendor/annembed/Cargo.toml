@@ -45,7 +45,7 @@ publish = false
 
 [features]
 default = []
-# The only backend AudioBank builds. `lax` is a hard dependency of this crate and its
+# The only backend AudioCloud builds. `lax` is a hard dependency of this crate and its
 # LAPACK symbols have to resolve against something; on macOS that something already ships
 # with the OS. `build.rs` emits the framework link line.
 macos-accelerate = ["blas-src", "ndarray/blas"]

@@ -7,9 +7,9 @@
 // lives at the binary root rather than in the library crate the test targets also link.
 #[cfg(debug_assertions)]
 #[global_allocator]
-static GUARD_ALLOC: audiobank_lib::audio::guard::GuardedAlloc =
-    audiobank_lib::audio::guard::GuardedAlloc;
+static GUARD_ALLOC: audiocloud_lib::audio::guard::GuardedAlloc =
+    audiocloud_lib::audio::guard::GuardedAlloc;
 
 fn main() {
-    audiobank_lib::run();
+    audiocloud_lib::run();
 }

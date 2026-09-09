@@ -29,7 +29,7 @@
 
 use ts_rs::{Config, TS};
 
-use audiobank_lib::{
+use audiocloud_lib::{
     error::AppError,
     ipc::{
         events::{RefitEvent, ScanEvent},

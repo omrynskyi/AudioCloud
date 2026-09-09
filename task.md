@@ -1,4 +1,4 @@
-# AudioBank — Implementation Roadmap
+# AudioCloud — Implementation Roadmap
 
 Companion to `overview.md`. That document is the architecture; this one is the order of
 operations.
@@ -156,7 +156,7 @@ front-end matches the graph.*
       > The warmup *is* the verification: a session is not returned until a real `run()` has
         succeeded on it, so CoreML registering and then rejecting the graph on first
         inference falls back at init instead of halfway into a 50,000-file scan.
-        `AUDIOBANK_FORCE_CPU=1` forces the CPU path without a rebuild.
+        `AUDIOCLOUD_FORCE_CPU=1` forces the CPU path without a rebuild.
 - [x] Lazy init — session construction must not be on the cold-start path
       (`overview.md` §7)
       > `LazySession`, `.manage()`d during setup; construction is two path joins and an
@@ -344,7 +344,7 @@ criterion asks for.
         for a dependency, but whose `clap`/`bincode`/`byteorder`/`num_cpus` dependencies it
         did), the `python` feature, and the `cdylib`. The LAPACK backend is
         `macos-accelerate` — `lax` is a hard dependency of the crate and its symbols have to
-        resolve against something, and on the only platform AudioBank ships to that
+        resolve against something, and on the only platform AudioCloud ships to that
         something is already installed.
 - [x] `projection/umap.rs`: HNSW kNN graph → `annembed` → 3D; expose `n_neighbors`,
       `min_dist`, cosine metric
@@ -356,7 +356,7 @@ criterion asks for.
         `annembed`'s own default (1.0). The numbers do not transfer from a Python notebook,
         and the `params_json` records the derived value alongside the asked-for one.
 - [x] Read the embedding matrix via `mmap`, not a heap load
-      > True of everything AudioBank owns, and **not** true of the HNSW index: `hnsw_rs`
+      > True of everything AudioCloud owns, and **not** true of the HNSW index: `hnsw_rs`
         stores the vectors it is given, so a 50k × 512 index is ~102 MB for the duration of
         a UMAP fit and there is no version of that which is not. What the mmap buys is
         everything around it — rows reach the index 1024 at a time and the block is dropped

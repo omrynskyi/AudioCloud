@@ -1,4 +1,4 @@
-# AudioBank — System Architecture & Design
+# AudioCloud — System Architecture & Design
 
 A desktop ML sample visualizer for macOS. Scans a user's sample library, embeds every
 file with a CLAP audio encoder, projects the embedding space to 3D, and renders the
@@ -11,7 +11,7 @@ implementation roadmap.
 
 ## 1. System Overview
 
-AudioBank turns a folder of audio files into a navigable space. Similar-sounding samples
+AudioCloud turns a folder of audio files into a navigable space. Similar-sounding samples
 land near each other, so a user finds "that kind of kick" by flying to a region rather
 than by remembering a filename.
 
@@ -166,7 +166,7 @@ the threat model.
 
 ### Why the app is not App-Sandboxed
 
-AudioBank's core function is scanning arbitrary user-chosen folders, typically large
+AudioCloud's core function is scanning arbitrary user-chosen folders, typically large
 sample libraries on external drives. The macOS App Sandbox permits this only through
 security-scoped bookmarks, which must be re-resolved per launch and are fragile across
 volume remounts — exactly the failure mode that would make a library silently empty
@@ -1045,7 +1045,7 @@ a 220 MB delta.
 ## 9. Repository Layout
 
 ```
-audiobank/
+audiocloud/
 ├── overview.md                 # this document
 ├── task.md                     # implementation roadmap
 ├── package.json                # build-time only: vite, react, tailwind, three, r3f

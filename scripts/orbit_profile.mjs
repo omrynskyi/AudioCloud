@@ -42,15 +42,15 @@ const jsonPath = flag('json', null);
 const width = Number(flag('width', 1440));
 const height = Number(flag('height', 900));
 
-// The harness publishes `window.audiobankHarness` from a React effect, which lands after
+// The harness publishes `window.audiocloudHarness` from a React effect, which lands after
 // `didFinish`. Polling on animation frames rather than a fixed sleep, so a slow first
 // shader compile delays the run instead of failing it.
 const expression = `(async () => {
-  for (let i = 0; i < 600 && !window.audiobankHarness; i++) {
+  for (let i = 0; i < 600 && !window.audiocloudHarness; i++) {
     await new Promise((r) => requestAnimationFrame(r));
   }
-  if (!window.audiobankHarness) throw new Error('the harness never came up');
-  return await window.audiobankHarness.run({ durationMs: ${durationMs} });
+  if (!window.audiocloudHarness) throw new Error('the harness never came up');
+  return await window.audiocloudHarness.run({ durationMs: ${durationMs} });
 })()`;
 
 const report = await runInWebView({

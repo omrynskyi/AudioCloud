@@ -674,7 +674,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
-        let data_dir = dir.path().join("AudioBank");
+        let data_dir = dir.path().join("AudioCloud");
         prepare_data_dir(&data_dir).unwrap();
 
         let mode = std::fs::metadata(&data_dir).unwrap().permissions().mode();

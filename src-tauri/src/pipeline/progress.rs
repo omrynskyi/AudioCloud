@@ -280,7 +280,7 @@ impl Ticker {
         let flag = Arc::clone(&stop);
 
         let handle = std::thread::Builder::new()
-            .name("audiobank-progress".into())
+            .name("audiocloud-progress".into())
             .spawn(move || {
                 let mut last: Option<S> = None;
                 loop {

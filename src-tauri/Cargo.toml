@@ -1,14 +1,14 @@
 [package]
-name = "audiobank"
+name = "audiocloud"
 version = "0.1.0"
 description = "Spatial browser for large sample libraries"
-authors = ["AudioBank"]
+authors = ["AudioCloud"]
 edition = "2021"
 rust-version = "1.88"
 
 [lib]
 # Tauri's mobile entry point requires a cdylib; the desktop binary links the rlib.
-name = "audiobank_lib"
+name = "audiocloud_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
@@ -58,7 +58,7 @@ nalgebra = { version = "0.35.0", default-features = false, features = ["std"] }
 # decides the layout of the user's entire map, so a yank must not be able to break a build.
 # See that directory's Cargo.toml for what was changed (the manifest, nothing else).
 #
-# `macos-accelerate` is the LAPACK backend. AudioBank is a macOS application and Accelerate
+# `macos-accelerate` is the LAPACK backend. AudioCloud is a macOS application and Accelerate
 # is already on every machine it runs on; the alternative features build or link OpenBLAS.
 annembed = { path = "vendor/annembed", features = ["macos-accelerate"] }
 

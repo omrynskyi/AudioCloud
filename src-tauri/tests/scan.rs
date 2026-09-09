@@ -16,7 +16,7 @@ use std::{
     time::Instant,
 };
 
-use audiobank_lib::{
+use audiocloud_lib::{
     db::{queries, Database, SampleStatus},
     pipeline::{
         scan_root, scan_root_with, CancellationToken, ScanOptions, ScanProgress, ScanReport,
@@ -136,7 +136,7 @@ fn a_folder_of_audio_scans_to_rows_with_metadata_and_features() {
     assert_eq!(fx.count(), 2, "only the two audio files should have rows");
     assert_eq!(report.counts.files_added, 2);
     assert_eq!(report.counts.files_failed, 0);
-    assert_eq!(report.status, audiobank_lib::db::ScanStatus::Completed);
+    assert_eq!(report.status, audiocloud_lib::db::ScanStatus::Completed);
 
     let kick = fx.row("drums/kick.wav");
     assert_eq!(kick.filename, "kick.wav");
@@ -191,7 +191,7 @@ fn unreadable_files_are_quarantined_and_the_scan_continues() {
     let report = fx.scan();
 
     assert_eq!(fx.count(), 4, "quarantined files still get rows");
-    assert_eq!(report.status, audiobank_lib::db::ScanStatus::Completed);
+    assert_eq!(report.status, audiocloud_lib::db::ScanStatus::Completed);
     assert_eq!(report.counts.files_failed, 2);
 
     for name in ["truncated.wav", "lying.flac"] {
@@ -418,7 +418,7 @@ fn a_cancelled_scan_stops_cleanly_and_keeps_partial_results() {
     cancel.cancel();
 
     let report = scan_root(&fx.db, fx.root_id, &cancel).unwrap();
-    assert_eq!(report.status, audiobank_lib::db::ScanStatus::Cancelled);
+    assert_eq!(report.status, audiocloud_lib::db::ScanStatus::Cancelled);
 
     let conn = fx.db.read().unwrap();
     let status: String = conn
@@ -441,7 +441,7 @@ fn a_cancelled_scan_stops_cleanly_and_keeps_partial_results() {
 
     // ...and the next scan picks up the rest.
     let resumed = fx.scan();
-    assert_eq!(resumed.status, audiobank_lib::db::ScanStatus::Completed);
+    assert_eq!(resumed.status, audiocloud_lib::db::ScanStatus::Completed);
     assert_eq!(fx.count(), 40);
 }
 
@@ -522,7 +522,7 @@ fn a_symlink_loop_does_not_trap_the_walker() {
     std::os::unix::fs::symlink(fx.library.path(), fx.path("real/loop")).unwrap();
 
     let report = fx.scan();
-    assert_eq!(report.status, audiobank_lib::db::ScanStatus::Completed);
+    assert_eq!(report.status, audiocloud_lib::db::ScanStatus::Completed);
     // The one real file is found; the loop contributes nothing beyond it.
     assert!(fx.count() >= 1);
     assert_eq!(fx.row("real/kick.wav").status, "decoded");
@@ -624,7 +624,7 @@ fn scanning_a_missing_root_is_a_typed_error() {
     assert!(
         matches!(
             err,
-            audiobank_lib::pipeline::PipelineError::RootUnreadable { .. }
+            audiocloud_lib::pipeline::PipelineError::RootUnreadable { .. }
         ),
         "got {err:?}"
     );

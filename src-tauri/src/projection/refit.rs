@@ -350,7 +350,7 @@ pub fn refit_at_low_priority(
     options: Refit<'_>,
 ) -> Result<RefitReport, ProjectionError> {
     let pool = rayon::ThreadPoolBuilder::new()
-        .thread_name(|i| format!("audiobank-refit-{i}"))
+        .thread_name(|i| format!("audiocloud-refit-{i}"))
         .start_handler(|_| set_background_qos())
         .build();
 
@@ -372,7 +372,7 @@ pub fn refit_at_low_priority(
 /// silicon this class is what parks it on the efficiency cores instead of contending with
 /// the render loop for a performance one.
 ///
-/// Apple-only, and gated rather than assumed. AudioBank targets nothing else, but a QoS
+/// Apple-only, and gated rather than assumed. AudioCloud targets nothing else, but a QoS
 /// class is not a portable idea and a `#[cfg]` says so where a link error would only imply
 /// it. Everywhere else the re-fit simply runs at whatever priority it was given, which is
 /// the pre-Phase-5 behaviour.

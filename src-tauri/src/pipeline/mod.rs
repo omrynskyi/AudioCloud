@@ -630,7 +630,7 @@ fn run_stages(
 
     std::thread::scope(|scope| -> Result<(u64, u64), PipelineError> {
         let persist = std::thread::Builder::new()
-            .name("audiobank-persist".into())
+            .name("audiocloud-persist".into())
             .spawn_scoped(scope, || persist_stage(db, done_rx, progress))
             .map_err(|e| DbError::Io {
                 context: "spawning the persist stage".into(),
@@ -638,7 +638,7 @@ fn run_stages(
             })?;
 
         let embedder = std::thread::Builder::new()
-            .name("audiobank-embed".into())
+            .name("audiocloud-embed".into())
             .spawn_scoped(scope, {
                 let embedder = embedder.clone();
                 move || {
@@ -682,7 +682,7 @@ fn run_stages(
             })?;
 
         let walker = std::thread::Builder::new()
-            .name("audiobank-walk".into())
+            .name("audiocloud-walk".into())
             .spawn_scoped(scope, move || {
                 let ctx = walk::WalkContext {
                     root_id,

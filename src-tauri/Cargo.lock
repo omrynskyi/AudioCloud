@@ -422,7 +422,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "audiobank"
+name = "audiocloud"
 version = "0.1.0"
 dependencies = [
  "annembed",

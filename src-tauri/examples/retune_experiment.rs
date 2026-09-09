@@ -3,8 +3,8 @@
 //! real data directory (never the live one -- this opens it read-write):
 //!
 //! ```text
-//! cp -r "$(...)/com.audiobank.app" /tmp/audiobank-copy
-//! cargo run --release --example retune_experiment -- /tmp/audiobank-copy
+//! cp -r "$(...)/com.audiocloud.app" /tmp/audiocloud-copy
+//! cargo run --release --example retune_experiment -- /tmp/audiocloud-copy
 //! ```
 //!
 //! This produced the numbers in `UmapParams::min_dist`, `UmapParams::sharpness`, and
@@ -16,7 +16,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use audiobank_lib::{
+use audiocloud_lib::{
     db::{queries, Database, EmbeddingLoc},
     pipeline::CancellationToken,
     projection::{
