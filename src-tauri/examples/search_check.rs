@@ -9,14 +9,28 @@ fn main() {
     let conn = db.read().unwrap();
 
     for typed in [
-        "kicks", "kick", "808", "snares", "underground", "kic",
-        "@prodby.xero", "crown.wav", "Snare - Crown", "808 NOT snare",
-        "kick NOT", "\"kick\"", "---", "@prodby.xero Snare - Crown.wav",
+        "kicks",
+        "kick",
+        "808",
+        "snares",
+        "underground",
+        "kic",
+        "@prodby.xero",
+        "crown.wav",
+        "Snare - Crown",
+        "808 NOT snare",
+        "kick NOT",
+        "\"kick\"",
+        "---",
+        "@prodby.xero Snare - Crown.wav",
     ] {
         let built = search::fts_query(typed);
         let n = queries::search_samples(&conn, typed, 10_000)
             .map(|v| v.len().to_string())
             .unwrap_or_else(|e| format!("ERROR: {e}"));
-        println!("{typed:34} -> {n:>10}   [{}]", built.unwrap_or_else(|| "(no constraint)".into()));
+        println!(
+            "{typed:34} -> {n:>10}   [{}]",
+            built.unwrap_or_else(|| "(no constraint)".into())
+        );
     }
 }

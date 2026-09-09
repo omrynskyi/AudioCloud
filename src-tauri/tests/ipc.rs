@@ -352,11 +352,11 @@ fn an_absurd_filter_is_refused_with_a_reason() {
     );
 }
 
-/// FTS5 accepts an expression language, and a user typing into a search box will eventually
-/// type something that is not one. That must be an error the box renders as "no results",
-/// never a panic.
+/// An unclosed quote is a normal intermediate state while a user types a phrase. The query
+/// builder closes it before handing it to FTS5, so it must remain safe and searchable rather
+/// than being rejected as malformed input.
 #[test]
-fn a_malformed_search_query_is_an_error_and_not_a_panic() {
+fn an_unterminated_phrase_is_safe_to_search() {
     let (_dir, db, _ids) = projected_library(4);
     let conn = db.read().unwrap();
 
@@ -367,5 +367,5 @@ fn a_malformed_search_query_is_an_error_and_not_a_panic() {
             ..Default::default()
         },
     )
-    .is_err());
+    .is_ok());
 }

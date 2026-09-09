@@ -528,7 +528,10 @@ mod tests {
         // The prefix is the whole point of the last token: `kic` has to find the kicks while
         // the user is still typing, not only once they reach the `k`.
         assert_eq!(fts_query("kic").as_deref(), Some("\"kic\"*"));
-        assert_eq!(fts_query("kick snare").as_deref(), Some("\"kick\" \"snare\"*"));
+        assert_eq!(
+            fts_query("kick snare").as_deref(),
+            Some("\"kick\" \"snare\"*")
+        );
     }
 
     #[test]
@@ -539,7 +542,10 @@ mod tests {
             fts_query("@prodby.xero").as_deref(),
             Some("\"prodby\" \"xero\"*")
         );
-        assert_eq!(fts_query("crown.wav").as_deref(), Some("\"crown\" \"wav\"*"));
+        assert_eq!(
+            fts_query("crown.wav").as_deref(),
+            Some("\"crown\" \"wav\"*")
+        );
         assert_eq!(
             fts_query("Snare - Crown").as_deref(),
             Some("\"Snare\" \"Crown\"*")
@@ -565,24 +571,27 @@ mod tests {
         // and each is a syntax error if handed to fts5 as-is.
         assert_eq!(fts_query("kick NOT").as_deref(), Some("\"kick\"*"));
         assert_eq!(fts_query("NOT kick").as_deref(), Some("\"kick\"*"));
-        assert_eq!(fts_query("kick AND OR snare").as_deref(), Some("\"kick\" AND \"snare\"*"));
+        assert_eq!(
+            fts_query("kick AND OR snare").as_deref(),
+            Some("\"kick\" AND \"snare\"*")
+        );
         assert_eq!(fts_query("NOT").as_deref(), None);
     }
 
     #[test]
     fn quotes_are_a_phrase_and_the_way_out_of_the_automatic_prefix() {
         assert_eq!(fts_query("\"kick\"").as_deref(), Some("\"kick\""));
-        assert_eq!(
-            fts_query("\"deep kick\"").as_deref(),
-            Some("\"deep kick\"")
-        );
+        assert_eq!(fts_query("\"deep kick\"").as_deref(), Some("\"deep kick\""));
         // An unclosed quote is what every phrase search looks like halfway through typing it.
         assert_eq!(fts_query("\"deep kick").as_deref(), Some("\"deep kick\""));
     }
 
     #[test]
     fn an_explicit_star_is_honored_wherever_it_falls() {
-        assert_eq!(fts_query("kic* snare").as_deref(), Some("\"kic\"* \"snare\"*"));
+        assert_eq!(
+            fts_query("kic* snare").as_deref(),
+            Some("\"kic\"* \"snare\"*")
+        );
     }
 
     #[test]

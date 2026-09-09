@@ -1450,14 +1450,20 @@ mod tests {
         writer.flush().unwrap();
 
         let conn = db.read().unwrap();
-        assert_eq!(queries::search_samples(&conn, "kicks", 10).unwrap(), [ids[0]]);
+        assert_eq!(
+            queries::search_samples(&conn, "kicks", 10).unwrap(),
+            [ids[0]]
+        );
         assert_eq!(
             queries::search_samples(&conn, "snares", 10).unwrap(),
             [ids[1]]
         );
         let mut both = queries::search_samples(&conn, "underground", 10).unwrap();
         both.sort_unstable();
-        assert_eq!(both, ids, "a kit name should reach everything filed under it");
+        assert_eq!(
+            both, ids,
+            "a kit name should reach everything filed under it"
+        );
     }
 
     /// The corruption V7 exists to end.
@@ -1485,7 +1491,9 @@ mod tests {
         {
             let conn = db.read().unwrap();
             assert!(
-                queries::search_samples(&conn, "kick", 10).unwrap().is_empty(),
+                queries::search_samples(&conn, "kick", 10)
+                    .unwrap()
+                    .is_empty(),
                 "a removed root's samples must not still be searchable"
             );
         }
@@ -1498,7 +1506,9 @@ mod tests {
 
         let conn = db.read().unwrap();
         assert!(
-            queries::search_samples(&conn, "kick", 10).unwrap().is_empty(),
+            queries::search_samples(&conn, "kick", 10)
+                .unwrap()
+                .is_empty(),
             "searching for the removed library's word must not return the new library's file"
         );
         assert_eq!(

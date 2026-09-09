@@ -18,11 +18,9 @@ use std::{
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 
-use crate::{
-    pipeline::{
-        decode::{BufferPool, PooledBuffer},
-        mel::{MEL_BINS, MEL_FRAMES},
-    },
+use crate::pipeline::{
+    decode::{BufferPool, PooledBuffer},
+    mel::{MEL_BINS, MEL_FRAMES},
 };
 
 /// Values in one log-mel spectrogram: 1001 frames x 64 bands, 256 KB of f32.
@@ -86,7 +84,6 @@ pub trait Embed: Send + Sync {
 /// What inference can fail at, from the pipeline's side of the trait.
 #[derive(Debug, thiserror::Error)]
 pub enum EmbedError {
-
     #[error("the model returned {actual} values for a batch of {count} x {dim}")]
     ShortBatch {
         count: usize,

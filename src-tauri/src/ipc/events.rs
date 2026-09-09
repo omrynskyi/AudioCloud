@@ -223,5 +223,4 @@ mod tests {
         assert_eq!(json["error"]["kind"], "cancelled");
         assert!(json["outcome"].is_null());
     }
-
 }

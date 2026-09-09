@@ -39,7 +39,6 @@ interface LibraryState {
   /** The most recent scan's terminal event, kept until the next scan starts. */
   lastScanOutcome: ScanOutcome | null;
 
-
   // Arrow-typed rather than method shorthand — see `store/scene.ts`'s note on
   // `@typescript-eslint/unbound-method`; the same selector pattern is used throughout the
   // panels that read this store.
@@ -50,7 +49,6 @@ interface LibraryState {
 
   startScan: (rootId: number) => void;
   cancelScan: () => Promise<void>;
-
 }
 
 export const useLibraryStore = create<LibraryState>()((set, get) => ({
@@ -115,7 +113,6 @@ export const useLibraryStore = create<LibraryState>()((set, get) => ({
     const scan = get().activeScan;
     if (scan?.scanId != null) await ipcCancelScan(scan.scanId);
   },
-
 }));
 
 /** Whether the most recent scan ended with an error the frontend should surface. */

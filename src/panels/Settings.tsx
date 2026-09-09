@@ -33,7 +33,9 @@ export function Settings() {
       panelClassName="glass rise-in max-h-[86vh] w-[500px]"
     >
       <div className="settings-content">
-        <p className="settings-intro">Tune the map and audition playback to your workspace.</p>
+        <p className="settings-intro">
+          Tune the map and audition playback to your workspace.
+        </p>
         <ProjectionSection />
         <AudioSection />
         <DataSection />
@@ -144,7 +146,11 @@ function AudioSection() {
             value={settings.audioDevice ?? ''}
             onChange={(value) => void pickDevice(value)}
             options={[
-              { value: '', label: 'System default', detail: 'Use the current macOS output' },
+              {
+                value: '',
+                label: 'System default',
+                detail: 'Use the current macOS output',
+              },
               ...devices.map((d) => ({
                 value: d.name,
                 label: d.name,
@@ -156,7 +162,9 @@ function AudioSection() {
             <div className="mb-2 flex items-baseline justify-between gap-3">
               <div>
                 <p className="text-xs font-medium text-neutral-300">Master gain</p>
-                <p className="mt-1 text-[11px] text-neutral-500">Applied to audition playback</p>
+                <p className="mt-1 text-[11px] text-neutral-500">
+                  Applied to audition playback
+                </p>
               </div>
               <output className="settings-value" htmlFor="master-gain">
                 {settings.gain.toFixed(2)}×
@@ -171,7 +179,11 @@ function AudioSection() {
               value={settings.gain}
               onChange={(e) => void pickGain(Number(e.target.value))}
               className="settings-range"
-              style={{ '--range-progress': `${(settings.gain / 2) * 100}%` } as React.CSSProperties}
+              style={
+                {
+                  '--range-progress': `${(settings.gain / 2) * 100}%`,
+                } as React.CSSProperties
+              }
               aria-label="Master gain"
             />
             <div className="settings-range-labels" aria-hidden="true">
@@ -210,17 +222,19 @@ function DataSection() {
   }
 
   return (
-    <Section
-      title="Library data"
-      detail="Manage the files AudioCloud keeps on this Mac."
-    >
+    <Section title="Library data" detail="Manage the files AudioCloud keeps on this Mac.">
       <div className="settings-card space-y-3">
         <div className="flex items-center justify-between gap-4">
           <div>
             <p className="text-xs font-medium text-neutral-300">Data folder</p>
-            <p className="mt-1 text-[11px] text-neutral-500">Open the local library and index.</p>
+            <p className="mt-1 text-[11px] text-neutral-500">
+              Open the local library and index.
+            </p>
           </div>
-          <PanelButton onClick={() => void revealDataDir()} className="settings-button-secondary">
+          <PanelButton
+            onClick={() => void revealDataDir()}
+            className="settings-button-secondary"
+          >
             Reveal folder
           </PanelButton>
         </div>
@@ -240,8 +254,8 @@ function DataSection() {
                 !
               </div>
               <p className="leading-relaxed text-red-300">
-              This permanently deletes your library and embeddings. Type AUDIOCLOUD to
-              confirm.
+                This permanently deletes your library and embeddings. Type AUDIOCLOUD to
+                confirm.
               </p>
             </div>
             <input
@@ -285,7 +299,10 @@ function SelectField({
 }) {
   const [open, setOpen] = useState(false);
   const [highlighted, setHighlighted] = useState(() =>
-    Math.max(0, options.findIndex((option) => option.value === value)),
+    Math.max(
+      0,
+      options.findIndex((option) => option.value === value),
+    ),
   );
   const rootRef = useRef<HTMLDivElement>(null);
   const buttonRef = useRef<HTMLButtonElement>(null);
@@ -293,7 +310,10 @@ function SelectField({
     options.find((option) => option.value === value) ??
     options[0] ??
     ({ value: '', label: 'No devices available' } satisfies SelectOption);
-  const selectedIndex = Math.max(0, options.findIndex((option) => option.value === value));
+  const selectedIndex = Math.max(
+    0,
+    options.findIndex((option) => option.value === value),
+  );
 
   useEffect(() => {
     function closeOnOutside(event: MouseEvent) {
@@ -348,10 +368,19 @@ function SelectField({
           onKeyDown={onKeyDown}
         >
           <span className="min-w-0 truncate text-left">
-            <span className="block truncate text-xs text-neutral-200">{selected.label}</span>
-            {selected.detail && <span className="mt-0.5 block truncate text-[10px] text-neutral-500">{selected.detail}</span>}
+            <span className="block truncate text-xs text-neutral-200">
+              {selected.label}
+            </span>
+            {selected.detail && (
+              <span className="mt-0.5 block truncate text-[10px] text-neutral-500">
+                {selected.detail}
+              </span>
+            )}
           </span>
-          <CaretDown size={14} className={`shrink-0 text-neutral-500 transition-transform ${open ? 'rotate-180' : ''}`} />
+          <CaretDown
+            size={14}
+            className={`shrink-0 text-neutral-500 transition-transform ${open ? 'rotate-180' : ''}`}
+          />
         </button>
         {open && (
           <div className="settings-select-menu rise-in" role="listbox" aria-label={label}>
@@ -367,9 +396,15 @@ function SelectField({
               >
                 <span className="min-w-0">
                   <span className="block truncate">{option.label}</span>
-                  {option.detail && <span className="mt-0.5 block truncate text-[10px] text-neutral-500">{option.detail}</span>}
+                  {option.detail && (
+                    <span className="mt-0.5 block truncate text-[10px] text-neutral-500">
+                      {option.detail}
+                    </span>
+                  )}
                 </span>
-                {option.value === value && <Check size={15} weight="bold" className="shrink-0 text-accent" />}
+                {option.value === value && (
+                  <Check size={15} weight="bold" className="text-accent shrink-0" />
+                )}
               </button>
             ))}
           </div>
