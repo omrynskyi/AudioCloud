@@ -4,9 +4,7 @@ AudioCloud is a macOS app for browsing large audio-sample libraries as an intera
 Import a folder, search and filter your samples, click a point to audition it, and explore nearby
 sounds.
 
-<!-- Add a product screenshot here when one is ready:
-![AudioCloud screenshot](docs/screenshot.png)
--->
+![AudioCloud screenshot](docs/audiocloud-screenshot.png)
 
 ## How it works
 
