@@ -75,7 +75,7 @@ pub async fn start_sample_drag<R: Runtime>(
             let result = drag::start_drag(
                 &drag_window,
                 drag::DragItem::Files(vec![path]),
-                drag::Image::Raw(include_bytes!("../../icons/128x128.png").to_vec()),
+                drag::Image::Raw(include_bytes!("../../icons/audio-file-drag.png").to_vec()),
                 |_result, _cursor_position| {},
                 drag::Options::default(),
             );

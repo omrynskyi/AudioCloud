@@ -209,6 +209,20 @@ fn a_json_command_round_trips_camel_case_in_both_directions() {
     assert_eq!(detail["embedded"], json!(false));
 }
 
+/// A file drag is authorized by sample id, never by a renderer-supplied path. The seeded
+/// sample deliberately points at a file that is not on disk, so this exercises command
+/// registration, camelCase argument decoding, database path resolution, and the missing-file
+/// error without trying to open a native drag session in the mock window.
+#[test]
+fn a_sample_drag_resolves_its_path_on_the_native_side() {
+    let (_dir, webview) = app();
+    let ids = seed(&webview, 1);
+
+    let err = invoke(&webview, "start_sample_drag", json!({ "sampleId": ids[0] })).unwrap_err();
+    assert_eq!(err["kind"], json!("notFound"));
+    assert_eq!(err["detail"], json!("/library/drums/000.wav"));
+}
+
 /// **The error contract.** A failing command must reject with the tagged union, not with a
 /// string — this is what `switch (error.kind)` on the frontend is standing on.
 #[test]

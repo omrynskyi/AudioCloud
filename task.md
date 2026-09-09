@@ -738,11 +738,10 @@ click handling as a stand-in for the inspector that does not exist yet.
       "no roots added," "scan failed," and "0 results"
 - [x] Keyboard: space to audition, arrows to step neighbors, `/` to focus search, escape to
       clear selection
-- [ ] Drag a sample out of the app into a DAW (macOS file promise) — **deferred.** The one
-      crate that can start a native OS drag from Rust (`drag`) is unverified against this
-      Tauri version, and doing it properly means owning the drag session server-side so the
-      file's path never crosses to the WebView, the same way `reveal_in_finder` already does.
-      Worth its own pass rather than folding into this one.
+- [x] Drag a sample out of the app into a DAW from the map, search, scrub history,
+      collections, the inspector, or similar-sound results. The native drag session is owned
+      server-side and resolves the file from a sample id, so its path never crosses from an
+      untrusted WebView argument. Hold Command to switch a map drag into pan mode.
 
 **Exit criteria:** a new user can go from first launch to auditioning a sample from their
 own library without reading documentation; every `AppError` variant has a rendered state

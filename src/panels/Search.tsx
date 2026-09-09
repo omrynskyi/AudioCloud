@@ -143,7 +143,7 @@ function Results({ ids, error }: { ids: Uint32Array | null; error: AppError | nu
             type="button"
             onClick={() => select(row.id)}
             {...auditionProps(row.id)}
-            className={`rounded-control flex w-full items-baseline justify-between gap-2 px-2 py-1 text-left text-xs transition-colors ${
+            className={`rounded-control flex w-full cursor-grab items-baseline justify-between gap-2 px-2 py-1 text-left text-xs transition-colors active:cursor-grabbing ${
               selected === row.id
                 ? 'bg-accent-muted text-accent'
                 : 'text-neutral-300 hover:bg-neutral-800 hover:text-neutral-100'

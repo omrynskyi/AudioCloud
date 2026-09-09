@@ -3,6 +3,7 @@
  * (`task.md` Phase 9).
  */
 
+import { DotsSixVertical } from '@phosphor-icons/react';
 import { save as saveDialog } from '@tauri-apps/plugin-dialog';
 import { useEffect, useState } from 'react';
 
@@ -145,19 +146,42 @@ export function Collections() {
                   {detail.members.map((member, i) => (
                     <li
                       key={member.sampleId}
-                      {...auditionProps(member.sampleId)}
-                      draggable
-                      onDragStart={(e) => e.dataTransfer.setData('text/plain', String(i))}
                       onDragOver={(e) => e.preventDefault()}
                       onDrop={(e) => {
                         e.preventDefault();
-                        const from = Number(e.dataTransfer.getData('text/plain'));
+                        const raw = e.dataTransfer.getData(
+                          'application/x-audiocloud-collection-index',
+                        );
+                        if (raw === '') return;
+                        const from = Number(raw);
+                        if (!Number.isInteger(from)) return;
                         void move(from, i);
                       }}
-                      className="cursor-grab truncate rounded px-1 py-0.5 text-neutral-400 hover:bg-neutral-900"
-                      title={member.relPath}
+                      className="flex min-w-0 items-center rounded text-neutral-400 hover:bg-neutral-900"
                     >
-                      {i + 1}. {member.filename}
+                      <span
+                        draggable
+                        onDragStart={(e) => {
+                          e.stopPropagation();
+                          e.dataTransfer.effectAllowed = 'move';
+                          e.dataTransfer.setData(
+                            'application/x-audiocloud-collection-index',
+                            String(i),
+                          );
+                        }}
+                        className="flex h-6 w-6 shrink-0 cursor-grab items-center justify-center text-neutral-600 active:cursor-grabbing"
+                        title="Drag to reorder"
+                        aria-label={`Reorder ${member.filename}`}
+                      >
+                        <DotsSixVertical size={13} />
+                      </span>
+                      <span
+                        {...auditionProps(member.sampleId)}
+                        className="min-w-0 flex-1 cursor-grab truncate px-1 py-0.5 active:cursor-grabbing"
+                        title={member.relPath}
+                      >
+                        {i + 1}. {member.filename}
+                      </span>
                     </li>
                   ))}
                 </ol>

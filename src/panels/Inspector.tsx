@@ -107,7 +107,10 @@ export function Inspector() {
   return (
     <div className="space-y-3 text-xs">
       {/* The heading is a filename like any other, so it auditions like any other. */}
-      <header {...auditionProps(detail.id)}>
+      <header
+        {...auditionProps(detail.id)}
+        className="cursor-grab active:cursor-grabbing"
+      >
         <h2
           className="truncate text-sm font-medium text-neutral-100"
           title={detail.filename}
@@ -177,7 +180,7 @@ export function Inspector() {
                   type="button"
                   onClick={() => select(n.sampleId)}
                   {...auditionProps(n.sampleId)}
-                  className="w-full truncate rounded px-1 py-0.5 text-left text-neutral-400 hover:bg-neutral-900"
+                  className="w-full cursor-grab truncate rounded px-1 py-0.5 text-left text-neutral-400 hover:bg-neutral-900 active:cursor-grabbing"
                   title={n.relPath}
                 >
                   {n.filename}

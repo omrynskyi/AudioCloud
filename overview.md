@@ -787,6 +787,7 @@ The boundary is a copy. Three transports exist so each payload takes the cheapes
 | `get_feature_column`    | `feature`                          | **raw bytes** (`f32[]`)        | `ipc::Response` |
 | `query_samples`         | `QueryFilter`                      | **raw bytes** (`u32[]` of ids) | `ipc::Response` |
 | `get_sample_detail`     | `sampleId`                         | `SampleDetail`                 | JSON            |
+| `start_sample_drag`     | `sampleId`                         | `()`                           | JSON            |
 | `get_similar`           | `sampleId`, `k`                    | `Neighbor[]`                   | JSON            |
 | `get_waveform_peaks`    | `sampleId`                         | —                              | custom protocol |
 | `play_sample`           | `sampleId`, `gain`                 | `()`                           | JSON            |

@@ -163,7 +163,7 @@ export function ScrubHistory() {
                 type="button"
                 onClick={() => select(row.id)}
                 {...auditionProps(row.id)}
-                className={`rounded-control flex w-full items-baseline gap-2 px-2 py-1.5 text-left text-xs transition-colors ${
+                className={`rounded-control flex w-full cursor-grab items-baseline gap-2 px-2 py-1.5 text-left text-xs transition-colors active:cursor-grabbing ${
                   selected === row.id
                     ? 'bg-accent-muted text-accent'
                     : 'text-neutral-300 hover:bg-neutral-800 hover:text-neutral-100'

@@ -34,7 +34,7 @@ import {
 } from 'three';
 
 import { PREVIEW_GAIN } from '../audition';
-import { getSimilar, playSample, stopPlayback } from '../ipc';
+import { getSimilar, playSample, startSampleDrag, stopPlayback } from '../ipc';
 import type { PointColors } from '../ipc/binary';
 import { useSceneStore } from '../store/scene';
 import { CloudBuffers, DEFAULT_POINT_COLOR, type CloudBufferOptions } from './buffers';
@@ -229,6 +229,14 @@ export function PointCloud({
   const maskScratch = useRef<Uint8Array | null>(null);
   const highlightScratch = useRef<Uint8Array | null>(null);
   const pointerDownAt = useRef<{ x: number; y: number } | null>(null);
+  const fileDrag = useRef<{
+    pointerId: number;
+    sampleId: number;
+    x: number;
+    y: number;
+    started: boolean;
+  } | null>(null);
+  const handledDotGesture = useRef(false);
 
   // ── Per-frame uniforms ────────────────────────────────────────────────────────
   //
@@ -451,6 +459,7 @@ export function PointCloud({
 
   useEffect(() => {
     const canvas = gl.domElement;
+    let commandDown = false;
 
     const toCanvas = (event: PointerEvent | MouseEvent) => {
       const rect = canvas.getBoundingClientRect();
@@ -458,16 +467,61 @@ export function PointCloud({
     };
 
     const onPointerDown = (event: PointerEvent) => {
-      pointerDownAt.current = toCanvas(event);
+      const at = toCanvas(event);
+      pointerDownAt.current = at;
+      fileDrag.current = null;
+
+      // Command is the explicit mode switch for canvas movement. Let OrbitControls receive
+      // that press even when it begins on a point, and show the closed-hand cursor while it
+      // owns the gesture. Touch keeps its existing one-finger pan behavior too.
+      if (event.button !== 0 || event.pointerType !== 'mouse') return;
+      if (event.metaKey) {
+        canvas.style.cursor = 'grabbing';
+        return;
+      }
+
+      const index = pickAt(at.x, at.y);
+      const sampleId = index === NO_PICK ? null : (buffers.sampleAt(index) ?? null);
+      if (sampleId !== null) {
+        fileDrag.current = {
+          pointerId: event.pointerId,
+          sampleId,
+          x: event.clientX,
+          y: event.clientY,
+          started: false,
+        };
+      }
+      // OrbitControls listens on this canvas too. Holding this event back is what prevents
+      // the map from sliding underneath a file drag. It also makes pan a deliberate Command
+      // gesture instead of something that happens when an empty patch is dragged by accident.
+      event.preventDefault();
+      event.stopImmediatePropagation();
     };
 
     const onPointerMove = (event: PointerEvent) => {
+      const drag = fileDrag.current;
+      if (drag && drag.pointerId === event.pointerId) {
+        if (
+          !drag.started &&
+          Math.hypot(event.clientX - drag.x, event.clientY - drag.y) > CLICK_SLOP_PX
+        ) {
+          drag.started = true;
+          handledDotGesture.current = true;
+          pointerDownAt.current = null;
+          event.preventDefault();
+          event.stopImmediatePropagation();
+          void startSampleDrag(drag.sampleId).catch(() => {});
+        }
+        return;
+      }
+
       // Never during a drag, and at most `HOVER_PICK_HZ` otherwise -- see `HoverGate` for why
       // that is a safety valve rather than a budget, and why the old 20 Hz was the single
       // largest term in hover-to-sound.
       if (!hoverGate.shouldPick()) return;
       const { x, y } = toCanvas(event);
       const index = pickAt(x, y);
+      if (!commandDown) canvas.style.cursor = index === NO_PICK ? '' : 'grab';
       // Map movement is the one audition source that belongs in scrub history. Other surfaces
       // call `hover()` directly, so opening a search result or inspector never changes it.
       useSceneStore
@@ -479,9 +533,62 @@ export function PointCloud({
     // moving from one sample to another, not an intent to stop listening, and
     // `HOVER_STOP_GRACE_MS` is exactly long enough to let the row that is about to be entered
     // retrigger instead.
-    const onPointerLeave = () => useSceneStore.getState().hover(null);
+    const onPointerLeave = () => {
+      useSceneStore.getState().hover(null);
+      if (!commandDown) canvas.style.cursor = '';
+    };
+
+    const onPointerUp = (event: PointerEvent) => {
+      if (event.pointerType === 'mouse') {
+        canvas.style.cursor = event.metaKey || commandDown ? 'move' : '';
+      }
+      const drag = fileDrag.current;
+      if (!drag || drag.pointerId !== event.pointerId) return;
+      fileDrag.current = null;
+      pointerDownAt.current = null;
+      handledDotGesture.current = true;
+
+      // The same press still has normal click semantics until it crosses the drag threshold.
+      if (!drag.started) {
+        useSceneStore.getState().select(drag.sampleId);
+        playSample(drag.sampleId, PREVIEW_GAIN).catch(() => {});
+      }
+
+      // Browsers dispatch `click` immediately after `pointerup`. Consume that duplicate in
+      // `onClick`, then clear defensively in case a native drag suppresses it altogether.
+      setTimeout(() => {
+        handledDotGesture.current = false;
+      }, 0);
+    };
+
+    const onPointerCancel = (event: PointerEvent) => {
+      if (fileDrag.current?.pointerId === event.pointerId) fileDrag.current = null;
+      if (event.pointerType === 'mouse') canvas.style.cursor = commandDown ? 'move' : '';
+    };
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Meta' || commandDown) return;
+      commandDown = true;
+      canvas.style.cursor = 'move';
+    };
+
+    const onKeyUp = (event: KeyboardEvent) => {
+      if (event.key !== 'Meta') return;
+      commandDown = false;
+      canvas.style.cursor =
+        useSceneStore.getState().hoveredSampleId === null ? '' : 'grab';
+    };
+
+    const onWindowBlur = () => {
+      commandDown = false;
+      canvas.style.cursor = '';
+    };
 
     const onClick = (event: MouseEvent) => {
+      if (handledDotGesture.current) {
+        handledDotGesture.current = false;
+        return;
+      }
       // A click that ended an orbit is not a click on a point. Without the slop test,
       // every drag that happens to end over the cloud changes the selection.
       const down = pointerDownAt.current;
@@ -503,15 +610,26 @@ export function PointCloud({
       }
     };
 
-    canvas.addEventListener('pointerdown', onPointerDown);
+    canvas.addEventListener('pointerdown', onPointerDown, true);
     canvas.addEventListener('pointermove', onPointerMove);
     canvas.addEventListener('pointerleave', onPointerLeave);
     canvas.addEventListener('click', onClick);
+    window.addEventListener('pointerup', onPointerUp, true);
+    window.addEventListener('pointercancel', onPointerCancel, true);
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('keyup', onKeyUp);
+    window.addEventListener('blur', onWindowBlur);
     return () => {
-      canvas.removeEventListener('pointerdown', onPointerDown);
+      canvas.removeEventListener('pointerdown', onPointerDown, true);
       canvas.removeEventListener('pointermove', onPointerMove);
       canvas.removeEventListener('pointerleave', onPointerLeave);
       canvas.removeEventListener('click', onClick);
+      window.removeEventListener('pointerup', onPointerUp, true);
+      window.removeEventListener('pointercancel', onPointerCancel, true);
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('keyup', onKeyUp);
+      window.removeEventListener('blur', onWindowBlur);
+      canvas.style.cursor = '';
     };
   }, [gl, buffers, hoverGate, pickAt]);
 
@@ -710,10 +828,10 @@ export function PointCloud({
         // It is also the whole reason the orbiting 3D view was dropped: a map you can spin
         // around is slower to scan and click through than one that just sits still.
         enableRotate={false}
-        // Left-click drag (and single-finger touch) pans instead of rotating — rotation is
-        // permanently off per the note above, so the button `OrbitControls` defaults to
-        // rotate would otherwise do nothing.
-        mouseButtons={{ LEFT: MOUSE.PAN, MIDDLE: MOUSE.DOLLY, RIGHT: MOUSE.PAN }}
+        // OrbitControls swaps ROTATE to PAN when Command is held. Mapping left to ROTATE is
+        // therefore intentional: plain left-drag is owned by sample export above, while
+        // Command + left-drag reaches the PAN branch. Rotation itself remains disabled.
+        mouseButtons={{ LEFT: MOUSE.ROTATE, MIDDLE: MOUSE.DOLLY, RIGHT: MOUSE.PAN }}
         touches={{ ONE: TOUCH.PAN, TWO: TOUCH.DOLLY_PAN }}
         // `invalidate()` on interaction only: drei calls it from the controls' `change`
         // event, which is the only thing that moves the camera. An idle canvas costs zero
