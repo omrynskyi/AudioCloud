@@ -60,23 +60,13 @@ export function toAppError(value: unknown): AppError {
  * A short, human sentence for an error, for a toast or an inline message.
  *
  * **Not a substitute for switching on `kind`.** Every variant in the union exists because it
- * has a *different recovery* — `modelMissing` wants a download button, `scanInProgress`
- * wants a link to the running scan, `decode` wants the path — and rendering all of them as
+ * has a *different recovery* — `scanInProgress` wants a link to the running scan,
+ * `decode` wants the path — and rendering all of them as
  * one paragraph of text is exactly the thing cross-cutting rule 8 was written against. This
  * is the fallback for places where there is genuinely nothing to offer.
  */
 export function describe(error: AppError): string {
   switch (error.kind) {
-    case 'modelMissing':
-      return 'The audio model is not installed yet.';
-    case 'modelDownload':
-      return error.detail.resumable
-        ? `The download stopped: ${error.detail.message}. It can be resumed.`
-        : `The download failed: ${error.detail.message}`;
-    case 'checksumMismatch':
-      return 'The downloaded model did not match its published checksum.';
-    case 'modelUnpinned':
-      return `This build has no published checksum for model ${error.detail.version}, so nothing can be downloaded.`;
     case 'database':
       return `The library database reported: ${error.detail}`;
     case 'decode':

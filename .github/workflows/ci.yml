@@ -128,7 +128,7 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
         run: |
-          BIN="src-tauri/target/$TARGET/release/audiobank"
+          BIN="src-tauri/target/$TARGET/release/audiocloud"
           ARCH="${TARGET%%-*}"
           lipo -info "$BIN"
           lipo -info "$BIN" | grep -q "$ARCH"
