@@ -26,6 +26,13 @@ import { subscribeWithSelector } from 'zustand/middleware';
 import type { Feature } from '../bindings/Feature';
 import type { QueryFilter } from '../bindings/QueryFilter';
 
+/**
+ * The scrub history deliberately stays small: it is a recall aid for the current map session,
+ * not a permanent log. The range control can reveal any prefix of these most recent samples.
+ */
+export const MAX_SCRUB_HISTORY = 100;
+export const MIN_SCRUB_HISTORY_RANGE = 10;
+
 export interface SceneState {
   /** The sample the inspector is showing, or none. */
   selectedSampleId: number | null;
@@ -53,6 +60,15 @@ export interface SceneState {
   filter: Partial<QueryFilter> | null;
   /** A global multiplier on point size, for the size slider. */
   pointSizeMultiplier: number;
+  /**
+   * Most-recent-first sample ids heard while moving across the map.
+   *
+   * This is intentionally separate from `hoveredSampleId`: list rows and the inspector use
+   * hover to audition too, but they are navigation surfaces, not a map scrub.
+   */
+  scrubHistory: number[];
+  /** How many of the retained scrubbed samples the history panel shows. */
+  scrubHistoryRange: number;
 
   // Typed as arrow-function properties rather than method shorthand (`select(id): void`)
   // deliberately: a method-typed member is exactly what `@typescript-eslint/unbound-method`
@@ -60,9 +76,13 @@ export interface SceneState {
   // later — a completely ordinary selector pattern, and these never use `this` anyway.
   select: (sampleId: number | null) => void;
   hover: (sampleId: number | null) => void;
+  /** Updates map hover and remembers a newly encountered sample in the scrub history. */
+  scrub: (sampleId: number | null) => void;
   setColorBy: (feature: Feature | null) => void;
   setFilter: (filter: Partial<QueryFilter> | null) => void;
   setPointSizeMultiplier: (multiplier: number) => void;
+  setScrubHistoryRange: (range: number) => void;
+  clearScrubHistory: () => void;
 
   /** Replaces the multi-selection outright — a fresh drag-select or click with no modifier. */
   setSelectedIds: (ids: Iterable<number>) => void;
@@ -82,6 +102,8 @@ export const useSceneStore = create<SceneState>()(
     colorBy: null,
     filter: null,
     pointSizeMultiplier: 1,
+    scrubHistory: [],
+    scrubHistoryRange: MAX_SCRUB_HISTORY,
 
     select: (sampleId) => set({ selectedSampleId: sampleId }),
     hover: (sampleId) =>
@@ -92,9 +114,34 @@ export const useSceneStore = create<SceneState>()(
       set((state) =>
         state.hoveredSampleId === sampleId ? state : { hoveredSampleId: sampleId },
       ),
+    scrub: (sampleId) =>
+      set((state) => {
+        // The picker continues running while a pointer rests on one point. Collapsing that
+        // repeat here keeps both the audition subscription and this list to one entry per
+        // actual transition, rather than turning a pause into twenty history rows per second.
+        if (state.hoveredSampleId === sampleId) return state;
+        if (sampleId === null) return { hoveredSampleId: null };
+
+        // Preserve the route through the cloud: returning to a sample after crossing another
+        // is useful context in a listening trail. The transition guard above is what prevents
+        // a stationary pointer from filling that trail with repeated entries.
+        const scrubHistory = [sampleId, ...state.scrubHistory].slice(
+          0,
+          MAX_SCRUB_HISTORY,
+        );
+        return { hoveredSampleId: sampleId, scrubHistory };
+      }),
     setColorBy: (colorBy) => set({ colorBy }),
     setFilter: (filter) => set({ filter }),
     setPointSizeMultiplier: (pointSizeMultiplier) => set({ pointSizeMultiplier }),
+    setScrubHistoryRange: (range) =>
+      set({
+        scrubHistoryRange: Math.min(
+          MAX_SCRUB_HISTORY,
+          Math.max(MIN_SCRUB_HISTORY_RANGE, Math.round(range)),
+        ),
+      }),
+    clearScrubHistory: () => set({ scrubHistory: [] }),
 
     setSelectedIds: (ids) => set({ selectedIds: new Set(ids) }),
     toggleSelected: (sampleId) =>

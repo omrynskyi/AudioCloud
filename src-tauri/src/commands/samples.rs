@@ -1,9 +1,9 @@
 //! Per-sample commands: detail, neighbors, tags, and the two audio ones (`overview.md` §6.1).
 //! Collection commands are `commands::collections`.
 
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 
-use tauri::State;
+use tauri::{Runtime, State, Window};
 
 use crate::{
     audio::AudioPlayer,
@@ -43,6 +43,50 @@ pub async fn get_sample_detail(
         tags,
         updated_at: row.updated_at,
     })
+}
+
+/// Starts an operating-system file drag for one sample.
+///
+/// HTML drag data is enough for reordering rows inside the WebView, but Finder and DAWs need
+/// a native file-list pasteboard. The frontend still supplies only a sample id: the absolute
+/// path is resolved and checked here, preserving the same boundary as [`reveal_in_finder`].
+/// `drag::start_drag` must be called on AppKit's main thread, while a Tauri async command is
+/// not guaranteed to run there, hence the small one-shot channel around `run_on_main_thread`.
+#[tauri::command]
+pub async fn start_sample_drag<R: Runtime>(
+    window: Window<R>,
+    db: State<'_, Database>,
+    sample_id: i64,
+) -> Result<(), AppError> {
+    let conn = db.read()?;
+    let row = queries::sample_row(&conn, sample_id)?
+        .ok_or_else(|| AppError::not_found("sample", sample_id))?;
+    drop(conn);
+
+    let path = row.absolute_path();
+    if !path.is_file() {
+        return Err(AppError::NotFound(path.display().to_string()));
+    }
+
+    let drag_window = window.clone();
+    let (started_tx, started_rx) = mpsc::sync_channel(1);
+    window
+        .run_on_main_thread(move || {
+            let result = drag::start_drag(
+                &drag_window,
+                drag::DragItem::Files(vec![path]),
+                drag::Image::Raw(include_bytes!("../../icons/128x128.png").to_vec()),
+                |_result, _cursor_position| {},
+                drag::Options::default(),
+            );
+            let _ = started_tx.send(result);
+        })
+        .map_err(|e| AppError::internal("dispatching a sample drag", e))?;
+
+    started_rx
+        .recv()
+        .map_err(|e| AppError::internal("waiting for a sample drag to start", e))?
+        .map_err(|e| AppError::internal("starting a sample drag", e))
 }
 
 /// The `k` nearest samples to `sample_id` by cosine similarity.

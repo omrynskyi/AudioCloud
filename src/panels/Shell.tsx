@@ -7,7 +7,13 @@
  * chrome around it.
  */
 
-import { FolderOpen, Gear, Stack, Tag } from '@phosphor-icons/react';
+import {
+  ClockCounterClockwise,
+  FolderOpen,
+  Gear,
+  Stack,
+  Tag,
+} from '@phosphor-icons/react';
 import { useEffect, useState } from 'react';
 
 import {
@@ -35,6 +41,7 @@ import { Inspector } from './Inspector';
 import { Library } from './Library';
 import { Search } from './Search';
 import { Settings } from './Settings';
+import { ScrubHistory } from './ScrubHistory';
 import { PanelButton } from './StateViews';
 import { Tags } from './Tags';
 import { useShortcuts } from './useShortcuts';
@@ -182,6 +189,14 @@ export function Shell() {
         <Search ids={matchedIds} error={current?.error ?? null} />
         <div className="flex items-start gap-1">
           <ColorBy />
+          <Popover
+            label="Scrub history"
+            icon={<ClockCounterClockwise />}
+            align="right"
+            width="w-80"
+          >
+            <ScrubHistory />
+          </Popover>
           <Popover
             label="Library folders"
             icon={<FolderOpen />}

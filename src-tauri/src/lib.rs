@@ -55,6 +55,7 @@ pub fn command_handler<R: tauri::Runtime>(
         commands::cloud::get_feature_column,
         commands::cloud::query_samples,
         commands::samples::get_sample_detail,
+        commands::samples::start_sample_drag,
         commands::samples::get_similar,
         commands::samples::set_tag,
         commands::samples::unset_tag,

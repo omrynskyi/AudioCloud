@@ -20,9 +20,9 @@
  * **Top-level, not under `scene/` or `panels/`.** It is used by both and belongs to neither.
  */
 
-import { useEffect } from 'react';
+import { useEffect, type DragEvent } from 'react';
 
-import { playSample, stopPlayback } from './ipc';
+import { playSample, startSampleDrag, stopPlayback } from './ipc';
 import { useSceneStore } from './store/scene';
 
 /** A flat default until a settings panel exposes a gain control. */
@@ -90,8 +90,10 @@ export function useAudition(): void {
 }
 
 /**
- * Pointer handlers that make any element naming `sampleId` an audition target. Spread onto a
- * list row: `<button {...auditionProps(row.id)}>`.
+ * Pointer and drag handlers that make any element naming `sampleId` a complete sample target.
+ * Spread onto a list row: `<button {...auditionProps(row.id)}>`. In addition to auditioning,
+ * every such surface now starts the same native file drag, so a search result, neighbor,
+ * history entry, or inspector heading can all be dropped into Finder or a DAW.
  *
  * The leave handler clears the hover only if this element is still the one the store thinks is
  * hovered. Pointer events on siblings are supposed to arrive leave-then-enter, but nested
@@ -101,14 +103,23 @@ export function useAudition(): void {
  * worst kind of bug to be handed.
  */
 export function auditionProps(sampleId: number): {
+  draggable: true;
   onPointerEnter: () => void;
   onPointerLeave: () => void;
+  onDragStart: (event: DragEvent<HTMLElement>) => void;
 } {
   return {
+    draggable: true,
     onPointerEnter: () => useSceneStore.getState().hover(sampleId),
     onPointerLeave: () => {
       const state = useSceneStore.getState();
       if (state.hoveredSampleId === sampleId) state.hover(null);
+    },
+    onDragStart: (event) => {
+      // Cancel WebView drag-and-drop. It can carry text for internal reordering, but an
+      // external application needs a native file-list pasteboard from the Rust command.
+      event.preventDefault();
+      void startSampleDrag(sampleId).catch(() => {});
     },
   };
 }

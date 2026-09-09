@@ -468,9 +468,11 @@ export function PointCloud({
       if (!hoverGate.shouldPick()) return;
       const { x, y } = toCanvas(event);
       const index = pickAt(x, y);
+      // Map movement is the one audition source that belongs in scrub history. Other surfaces
+      // call `hover()` directly, so opening a search result or inspector never changes it.
       useSceneStore
         .getState()
-        .hover(index === NO_PICK ? null : (buffers.sampleAt(index) ?? null));
+        .scrub(index === NO_PICK ? null : (buffers.sampleAt(index) ?? null));
     };
 
     // No special stop here. Leaving the canvas for a search result in the rail is a hover

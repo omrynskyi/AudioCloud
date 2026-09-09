@@ -191,6 +191,11 @@ export function getSampleDetail(sampleId: number): Promise<SampleDetail> {
   return invoke('get_sample_detail', { sampleId });
 }
 
+/** Starts a native file drag so Finder, a DAW, or any other app receives the real sample. */
+export function startSampleDrag(sampleId: number): Promise<void> {
+  return invoke('start_sample_drag', { sampleId });
+}
+
 /** The `k` nearest samples by cosine similarity over the stored vectors. */
 export function getSimilar(sampleId: number, k: number): Promise<Neighbor[]> {
   return invoke('get_similar', { sampleId, k });
