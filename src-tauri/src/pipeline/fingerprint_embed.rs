@@ -67,6 +67,7 @@ impl Embed for FingerprintEmbedder {
 ///
 /// L2-normalized, per [`Embed::embed_batch`]'s contract -- everything downstream (cosine
 /// similarity in `get_similar`, the projectors) assumes a unit vector.
+#[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
 fn fingerprint(mels: &[f32]) -> [f32; FINGERPRINT_DIM] {
     let mut grid = [0.0f32; FINGERPRINT_DIM];
     for (col, frame) in mels.chunks_exact(MEL_BINS).take(FP_COLS).enumerate() {

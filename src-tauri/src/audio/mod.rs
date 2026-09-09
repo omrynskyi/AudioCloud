@@ -541,7 +541,13 @@ fn log_latency(engine: &Arc<Engine>, generation: u64, sample_id: i64) {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    unknown_lints,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::chunks_exact_to_as_chunks
+)]
 mod tests {
     use super::*;
 

@@ -314,6 +314,7 @@ impl EmbeddingMatrix {
     }
 
     /// Widens one row into `out`, reusing its allocation.
+    #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
     pub fn row_into(&self, loc: EmbeddingLoc, out: &mut Vec<f32>) -> Result<(), DbError> {
         let end = loc.offset.saturating_add(loc.bytes());
         let bytes = match &self.map {
@@ -350,6 +351,7 @@ impl EmbeddingMatrix {
 /// `chunks_exact` rather than a pointer cast: the f16 values are copied out either way
 /// because the caller wants f32, so a zero-copy `&[f16]` view would buy nothing and cost
 /// an alignment assumption.
+#[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
 fn widen(bytes: &[u8]) -> Vec<f32> {
     bytes
         .chunks_exact(BYTES_PER_VALUE as usize)

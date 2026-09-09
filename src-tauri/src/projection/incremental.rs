@@ -228,6 +228,7 @@ fn place_all(
 /// which lets the same arithmetic issue eight lanes wide. It is still deterministic --
 /// fixed lanes, fixed order, same answer on every run -- which a `-ffast-math` equivalent
 /// would not be.
+#[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
 fn dot(a: &[f32], b: &[f32]) -> f32 {
     const LANES: usize = 8;
     let mut acc = [0.0f32; LANES];
