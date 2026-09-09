@@ -7,6 +7,12 @@ fingerprint, projected to
 - [`overview.md`](overview.md) — the architecture.
 - [`task.md`](task.md) — the implementation roadmap, phase by phase.
 
+## License and inspiration
+
+AudioCloud is licensed under the Apache License, Version 2.0; see [`LICENSE`](LICENSE).
+
+The project is inspired by Google Creative Lab’s [AI Experiments Drum Machine](https://github.com/googlecreativelab/aiexperiments-drum-machine), especially its idea of organizing audio samples into an explorable space of similar sounds. That project is credited here for inspiration and is not part of this codebase.
+
 **Status: Phase 7 implemented, Phase 3's gate not yet passed.** The window now draws the
 map, and behind it the ingest pipeline is real and complete: point it at a folder of
 audio and it walks, hashes, deduplicates, decodes, analyzes, computes CLAP's log-mel
