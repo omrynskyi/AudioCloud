@@ -5,49 +5,100 @@
  */
 
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 import { IpcError, type AppError } from '../ipc';
 import { useLibraryStore } from '../store/library';
+import { useProjectionStore } from '../store/projection';
 import { EmptyState, ErrorState, LoadingState, PanelButton } from './StateViews';
 
-type Step = 'welcome' | 'addRoot' | 'scan';
+type Step = 'welcome' | 'addRoots' | 'scan' | 'buildMap';
 
 export function FirstRun({ onComplete }: { onComplete: () => void }) {
   const [step, setStep] = useState<Step>('welcome');
-  const [rootId, setRootId] = useState<number | null>(null);
+  const [rootIds, setRootIds] = useState<number[]>([]);
+  const [scanIndex, setScanIndex] = useState(0);
   const [error, setError] = useState<AppError | null>(null);
+  const startedScanIndex = useRef<number | null>(null);
+  const mapStartedRef = useRef(false);
 
   const roots = useLibraryStore((s) => s.roots);
   const addRoot = useLibraryStore((s) => s.addRoot);
   const activeScan = useLibraryStore((s) => s.activeScan);
   const lastScanOutcome = useLibraryStore((s) => s.lastScanOutcome);
   const startScan = useLibraryStore((s) => s.startScan);
+  const activeRefit = useProjectionStore((s) => s.activeRefit);
+  const lastRefitOutcome = useProjectionStore((s) => s.lastRefitOutcome);
+  const startRefit = useProjectionStore((s) => s.startRefit);
 
   useEffect(() => {
-    if (step === 'scan' && rootId !== null && !activeScan && !lastScanOutcome) {
+    if (step !== 'scan' || activeScan || scanIndex >= rootIds.length) return;
+    const rootId = rootIds[scanIndex];
+    if (rootId === undefined) return;
+    if (startedScanIndex.current !== scanIndex) {
+      startedScanIndex.current = scanIndex;
       startScan(rootId);
+      return;
     }
-  }, [step, rootId, activeScan, lastScanOutcome, startScan]);
+    const outcome = lastScanOutcome;
+    if (outcome?.rootId === rootId) {
+      if (outcome.status === 'failed') {
+        setError(outcome.error ?? { kind: 'internal', detail: 'The scan failed.' });
+        setStep('addRoots');
+      } else {
+        setScanIndex((index) => index + 1);
+      }
+      return;
+    }
+
+  }, [
+    step,
+    rootIds,
+    scanIndex,
+    activeScan,
+    lastScanOutcome,
+    startScan,
+  ]);
 
   useEffect(() => {
-    if (step === 'scan' && lastScanOutcome) onComplete();
-  }, [step, lastScanOutcome, onComplete]);
+    if (step !== 'scan' || activeScan || scanIndex < rootIds.length || mapStartedRef.current) return;
+    mapStartedRef.current = true;
+    setStep('buildMap');
+    startRefit({ forceFull: true });
+  }, [step, activeScan, scanIndex, rootIds.length, startRefit]);
+
+  useEffect(() => {
+    if (step === 'buildMap' && !activeRefit && lastRefitOutcome) onComplete();
+  }, [step, activeRefit, lastRefitOutcome, onComplete]);
 
   async function pickFolder() {
     setError(null);
-    const picked = await openDialog({ directory: true, multiple: false });
-    if (typeof picked !== 'string') return;
+    const picked = await openDialog({ directory: true, multiple: true });
+    const paths = Array.isArray(picked) ? picked : typeof picked === 'string' ? [picked] : [];
+    if (paths.length === 0) return;
+
     try {
-      await addRoot(picked);
-      const added = useLibraryStore.getState().roots.find((r) => r.path === picked);
-      setRootId(added?.id ?? roots[0]?.id ?? null);
-      setStep('scan');
+      const addedIds: number[] = [];
+      for (const path of paths) {
+        await addRoot(path);
+        const added = useLibraryStore.getState().roots.find((root) => root.path === path);
+        if (added) addedIds.push(added.id);
+      }
+      setRootIds((ids) => [...ids, ...addedIds.filter((id) => !ids.includes(id))]);
     } catch (raw) {
       setError(
         raw instanceof IpcError ? raw.error : { kind: 'internal', detail: String(raw) },
       );
     }
+  }
+
+  function beginImport() {
+    if (rootIds.length === 0) return;
+    setError(null);
+    setScanIndex(0);
+    startedScanIndex.current = null;
+    mapStartedRef.current = false;
+    setStep('scan');
   }
 
   if (step === 'welcome') {
@@ -58,21 +109,65 @@ export function FirstRun({ onComplete }: { onComplete: () => void }) {
           Point it at a folder of samples and it builds a map you can fly through —
           similar sounds land near each other.
         </p>
-        <PanelButton onClick={() => setStep('addRoot')}>Get started</PanelButton>
+        <PanelButton onClick={() => setStep('addRoots')}>Get started</PanelButton>
       </Centered>
     );
   }
 
-  if (step === 'addRoot') {
+  if (step === 'addRoots') {
     return (
       <Centered>
-        <h1 className="text-lg font-medium text-neutral-100">Add a folder</h1>
+        <h1 className="text-lg font-medium text-neutral-100">Add sample folders</h1>
         <p className="max-w-sm text-sm text-neutral-400">
-          Choose the folder that holds your samples. Subfolders are included
-          automatically.
+          Add one or more folders. Subfolders are included automatically, and AudioCloud
+          will scan everything and build your map when you’re ready.
         </p>
-        <PanelButton onClick={() => void pickFolder()}>Choose a folder…</PanelButton>
+        {rootIds.length > 0 && (
+          <ul className="first-run-roots" aria-label="Folders to scan">
+            {rootIds.map((id) => {
+              const root = roots.find((item) => item.id === id);
+              return root ? (
+                <li key={id} className="first-run-root">
+                  <span className="truncate" title={root.path}>
+                    {root.label ?? root.path.split('/').pop()}
+                  </span>
+                  <span className="font-mono text-[10px] text-neutral-500">ready</span>
+                </li>
+              ) : null;
+            })}
+          </ul>
+        )}
+        <div className="flex gap-2">
+          <PanelButton onClick={() => void pickFolder()}>
+            {rootIds.length > 0 ? 'Add more folders…' : 'Choose folders…'}
+          </PanelButton>
+          {rootIds.length > 0 && (
+            <PanelButton onClick={beginImport} className="settings-button-primary">
+              Scan and build map
+            </PanelButton>
+          )}
+        </div>
         {error && <ErrorState error={error} />}
+      </Centered>
+    );
+  }
+
+  if (step === 'buildMap') {
+    if (lastRefitOutcome?.error) return <ErrorState error={lastRefitOutcome.error} />;
+    return (
+      <Centered>
+        <h1 className="text-lg font-medium text-neutral-100">Building your map…</h1>
+        <p className="max-w-sm text-sm text-neutral-400">
+          Placing similar sounds together. This may take a moment for a large library.
+        </p>
+        {activeRefit ? (
+          <p className="font-mono text-xs text-neutral-500">
+            {activeRefit.progress?.phase ?? 'Preparing'}
+            {activeRefit.progress ? ` · ${activeRefit.progress.samples.toLocaleString()} samples` : ''}
+          </p>
+        ) : (
+          <LoadingState label="Starting the map build…" />
+        )}
       </Centered>
     );
   }
@@ -82,7 +177,9 @@ export function FirstRun({ onComplete }: { onComplete: () => void }) {
   const progress = activeScan.progress;
   return (
     <Centered>
-      <h1 className="text-lg font-medium text-neutral-100">Scanning your library…</h1>
+      <h1 className="text-lg font-medium text-neutral-100">
+        Scanning folder {Math.min(scanIndex + 1, rootIds.length)} of {rootIds.length}…
+      </h1>
       {progress ? (
         <div className="w-64 text-center">
           <p className="font-mono text-xs text-neutral-500">

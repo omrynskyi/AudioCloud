@@ -3,11 +3,12 @@
  * reset-database (`task.md` Phase 9).
  */
 
-import { CaretDown, Check } from '@phosphor-icons/react';
+import { CaretDown, Check, WarningCircle } from '@phosphor-icons/react';
 import { useEffect, useRef, useState, type KeyboardEvent } from 'react';
 
 import {
   getSettings,
+  type AppError,
   listAudioDevices,
   resetDatabase,
   revealDataDir,
@@ -107,9 +108,35 @@ function ProjectionSection() {
         )}
       </div>
       {!activeRefit && lastRefitOutcome?.error && (
-        <ErrorState error={lastRefitOutcome.error} />
+        <ProjectionError error={lastRefitOutcome.error} />
       )}
     </Section>
+  );
+}
+
+/**
+ * A projection failure is part of the map setup flow, not a modal-sized failure screen.
+ * Keep the actionable empty-library case readable and reserve the generic error treatment
+ * for failures that do not have a better recovery message.
+ */
+function ProjectionError({ error }: { error: AppError }) {
+  if (error.kind !== 'tooFewSamples') return <ErrorState error={error} />;
+
+  const missing = Math.max(0, error.detail.need - error.detail.have);
+  const sampleWord = missing === 1 ? 'sample' : 'samples';
+
+  return (
+    <div className="settings-inline-error" role="alert">
+      <WarningCircle size={18} weight="fill" aria-hidden="true" />
+      <div className="min-w-0">
+        <p className="text-xs font-medium text-neutral-200">Not enough samples to build a map</p>
+        <p className="mt-1 text-[11px] leading-relaxed text-neutral-500">
+          {error.detail.have === 0
+            ? `Scan a folder first, then add at least ${error.detail.need} embedded samples.`
+            : `Add ${missing} more embedded ${sampleWord}, then refresh the map.`}
+        </p>
+      </div>
+    </div>
   );
 }
 
