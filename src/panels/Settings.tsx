@@ -1,9 +1,10 @@
 /**
- * Settings modal: projection params + re-fit, audio device + gain, model status/re-download,
- * data directory, and reset-database (`task.md` Phase 9).
+ * Settings modal: projection params + re-fit, audio device + gain, data directory, and
+ * reset-database (`task.md` Phase 9).
  */
 
-import { useEffect, useState } from 'react';
+import { CaretDown, Check } from '@phosphor-icons/react';
+import { useEffect, useRef, useState, type KeyboardEvent } from 'react';
 
 import {
   getSettings,
@@ -15,11 +16,9 @@ import {
   type AppSettings,
   type AudioDeviceInfo,
 } from '../ipc';
-import type { DownloadProgressEvent } from '../bindings/DownloadProgressEvent';
-import { useLibraryStore } from '../store/library';
 import { useProjectionStore } from '../store/projection';
 import { useShellStore } from '../store/shell';
-import { ErrorState, LoadingState, PanelButton } from './StateViews';
+import { ErrorState, LoadingState, Modal, PanelButton } from './StateViews';
 
 export function Settings() {
   const open = useShellStore((s) => s.settingsOpen);
@@ -27,41 +26,39 @@ export function Settings() {
   if (!open) return null;
 
   return (
-    <div
-      className="fixed inset-0 z-20 flex items-center justify-center bg-black/60"
-      onClick={close}
+    <Modal
+      title="Settings"
+      onClose={close}
+      closeLabel="Close settings"
+      panelClassName="glass rise-in max-h-[86vh] w-[500px]"
     >
-      <div
-        onClick={(e) => e.stopPropagation()}
-        className="max-h-[80vh] w-[420px] overflow-y-auto rounded-lg border border-neutral-800 bg-neutral-950 p-4 text-xs shadow-xl"
-      >
-        <header className="mb-3 flex items-center justify-between">
-          <h1 className="text-sm font-medium text-neutral-100">Settings</h1>
-          <button
-            type="button"
-            onClick={close}
-            aria-label="Close settings"
-            className="text-neutral-500 hover:text-neutral-200"
-          >
-            ×
-          </button>
-        </header>
-
-        <div className="space-y-5">
-          <ProjectionSection />
-          <AudioSection />
-          <ModelSection />
-          <DataSection />
-        </div>
+      <div className="settings-content">
+        <p className="settings-intro">Tune the map and audition playback to your workspace.</p>
+        <ProjectionSection />
+        <AudioSection />
+        <DataSection />
       </div>
-    </div>
+    </Modal>
   );
 }
 
-function Section({ title, children }: { title: string; children: React.ReactNode }) {
+function Section({
+  title,
+  detail,
+  children,
+}: {
+  title: string;
+  detail: string;
+  children: React.ReactNode;
+}) {
   return (
-    <section className="space-y-2 border-t border-neutral-900 pt-3 first:border-t-0 first:pt-0">
-      <h2 className="text-[11px] tracking-wide text-neutral-500 uppercase">{title}</h2>
+    <section className="settings-section">
+      <div className="settings-section-heading">
+        <div>
+          <h2 className="text-[13px] font-medium text-neutral-200">{title}</h2>
+          <p className="mt-0.5 text-[11px] text-neutral-500">{detail}</p>
+        </div>
+      </div>
       {children}
     </section>
   );
@@ -72,36 +69,41 @@ function ProjectionSection() {
   const lastRefitOutcome = useProjectionStore((s) => s.lastRefitOutcome);
   const startRefit = useProjectionStore((s) => s.startRefit);
   const cancelRefit = useProjectionStore((s) => s.cancelRefit);
-  // Re-fits whichever layout the header switcher is showing — "the map you build is the map
-  // you're looking at," rather than a second, independent dims control here to keep in sync.
-  const viewMode = useShellStore((s) => s.viewMode);
-  const dims = viewMode === '2d' ? 2 : 3;
 
   return (
-    <Section title={`Map (${viewMode.toUpperCase()})`}>
-      <div className="flex gap-2">
-        <PanelButton
-          disabled={!!activeRefit}
-          onClick={() => startRefit({ dims, forceFull: false })}
-        >
-          Re-fit
-        </PanelButton>
-        <PanelButton
-          disabled={!!activeRefit}
-          onClick={() => startRefit({ dims, forceFull: true })}
-        >
-          Full re-fit
-        </PanelButton>
+    <Section
+      title="Map projection"
+      detail="Refresh the spatial arrangement of your library."
+    >
+      <div className="settings-card">
+        <div className="flex items-center justify-between gap-4">
+          <div>
+            <p className="text-xs font-medium text-neutral-300">Update the map</p>
+            <p className="mt-1 text-[11px] leading-relaxed text-neutral-500">
+              Refresh the full t-SNE layout using your current library embeddings.
+            </p>
+          </div>
+          <PanelButton
+            disabled={!!activeRefit}
+            onClick={() => startRefit({ forceFull: true })}
+            className="settings-button-primary shrink-0"
+          >
+            Refresh map
+          </PanelButton>
+        </div>
         {activeRefit && (
-          <PanelButton onClick={() => void cancelRefit()}>Cancel</PanelButton>
+          <div className="settings-progress" role="status">
+            <span className="settings-progress-dot" aria-hidden="true" />
+            <span>
+              {activeRefit.progress?.phase ?? 'Preparing'} ·{' '}
+              {activeRefit.progress?.samples.toLocaleString() ?? '0'} samples
+            </span>
+            <PanelButton onClick={() => void cancelRefit()} className="ml-auto">
+              Cancel
+            </PanelButton>
+          </div>
         )}
       </div>
-      {activeRefit?.progress && (
-        <p className="font-mono text-[11px] text-neutral-500">
-          {activeRefit.progress.phase} · {activeRefit.progress.samples.toLocaleString()}{' '}
-          samples
-        </p>
-      )}
       {!activeRefit && lastRefitOutcome?.error && (
         <ErrorState error={lastRefitOutcome.error} />
       )}
@@ -129,114 +131,59 @@ function AudioSection() {
   }
 
   return (
-    <Section title="Audio">
+    <Section
+      title="Audio output"
+      detail="Choose where previews play and set their listening level."
+    >
       {!devices || !settings ? (
         <LoadingState label="Loading devices…" />
       ) : (
-        <>
-          <select
+        <div className="settings-card space-y-5">
+          <SelectField
+            label="Output device"
             value={settings.audioDevice ?? ''}
-            onChange={(e) => void pickDevice(e.target.value)}
-            className="w-full rounded border border-neutral-800 bg-neutral-950 px-2 py-1 text-xs text-neutral-200 focus:border-neutral-600 focus:outline-none"
-          >
-            <option value="">System default</option>
-            {devices.map((d) => (
-              <option key={d.name} value={d.name}>
-                {d.name}
-                {d.isDefault ? ' (default)' : ''}
-              </option>
-            ))}
-          </select>
-          <label className="flex items-center gap-2 text-neutral-400">
-            Gain
+            onChange={(value) => void pickDevice(value)}
+            options={[
+              { value: '', label: 'System default', detail: 'Use the current macOS output' },
+              ...devices.map((d) => ({
+                value: d.name,
+                label: d.name,
+                detail: d.isDefault ? 'System default' : undefined,
+              })),
+            ]}
+          />
+          <div>
+            <div className="mb-2 flex items-baseline justify-between gap-3">
+              <div>
+                <p className="text-xs font-medium text-neutral-300">Master gain</p>
+                <p className="mt-1 text-[11px] text-neutral-500">Applied to audition playback</p>
+              </div>
+              <output className="settings-value" htmlFor="master-gain">
+                {settings.gain.toFixed(2)}×
+              </output>
+            </div>
             <input
+              id="master-gain"
               type="range"
               min={0}
               max={2}
               step={0.05}
               value={settings.gain}
               onChange={(e) => void pickGain(Number(e.target.value))}
-              className="flex-1"
+              className="settings-range"
+              style={{ '--range-progress': `${(settings.gain / 2) * 100}%` } as React.CSSProperties}
+              aria-label="Master gain"
             />
-            <span className="w-8 text-right font-mono text-[11px]">
-              {settings.gain.toFixed(2)}
-            </span>
-          </label>
-        </>
-      )}
-    </Section>
-  );
-}
-
-function ModelSection() {
-  const modelStatus = useLibraryStore((s) => s.modelStatus);
-  const refreshModelStatus = useLibraryStore((s) => s.refreshModelStatus);
-  const activeDownload = useLibraryStore((s) => s.activeDownload);
-  const lastDownloadOutcome = useLibraryStore((s) => s.lastDownloadOutcome);
-  const startDownload = useLibraryStore((s) => s.startDownload);
-  const cancelDownload = useLibraryStore((s) => s.cancelDownload);
-
-  useEffect(() => {
-    void refreshModelStatus();
-  }, [refreshModelStatus]);
-
-  return (
-    <Section title="Model">
-      {!modelStatus ? (
-        <LoadingState label="Checking…" />
-      ) : (
-        <>
-          <div className="flex items-center justify-between">
-            <p className="text-neutral-400">
-              {modelStatus.state === 'installed'
-                ? `Installed (${modelStatus.version})`
-                : modelStatus.state === 'unpinned'
-                  ? 'No published checksum for this build'
-                  : 'Not installed'}
-            </p>
-            {modelStatus.state === 'downloadable' &&
-              (activeDownload ? (
-                <PanelButton onClick={() => void cancelDownload()}>Cancel</PanelButton>
-              ) : (
-                <PanelButton onClick={() => startDownload()}>Download</PanelButton>
-              ))}
+            <div className="settings-range-labels" aria-hidden="true">
+              <span>0.00×</span>
+              <span>1.00×</span>
+              <span>2.00×</span>
+            </div>
           </div>
-
-          {activeDownload && <DownloadProgress event={activeDownload.progress} />}
-
-          {!activeDownload && lastDownloadOutcome?.error && (
-            <ErrorState error={lastDownloadOutcome.error} />
-          )}
-        </>
+        </div>
       )}
     </Section>
   );
-}
-
-function DownloadProgress({ event }: { event: DownloadProgressEvent | null }) {
-  if (!event) return <p className="font-mono text-[11px] text-neutral-500">Starting…</p>;
-
-  const mb = (event.downloaded / 1e6).toFixed(1);
-  if (event.total) {
-    const pct = Math.min(100, Math.round((event.downloaded / event.total) * 100));
-    return (
-      <div className="space-y-1">
-        <div className="h-1.5 overflow-hidden rounded-full bg-neutral-800">
-          <div
-            className="h-full rounded-full bg-neutral-400 transition-[width]"
-            style={{ width: `${pct}%` }}
-          />
-        </div>
-        <p className="font-mono text-[11px] text-neutral-500">
-          {mb} / {(event.total / 1e6).toFixed(1)} MB ({pct}%)
-        </p>
-      </div>
-    );
-  }
-
-  // No `Content-Length` from the server — a live byte count rather than a bar stuck at zero,
-  // per `DownloadProgressEvent`'s own doc comment on why `total` is optional.
-  return <p className="font-mono text-[11px] text-neutral-500">{mb} MB downloaded…</p>;
 }
 
 function DataSection() {
@@ -253,38 +200,64 @@ function DataSection() {
 
   if (resetting) {
     return (
-      <Section title="Data">
+      <Section
+        title="Library data"
+        detail="Manage the files AudioBank keeps on this Mac."
+      >
         <LoadingState label="Resetting… AudioBank will restart." />
       </Section>
     );
   }
 
   return (
-    <Section title="Data">
-      <PanelButton onClick={() => void revealDataDir()}>Reveal data folder</PanelButton>
-
-      <div className="pt-2">
-        {!confirming ? (
-          <PanelButton variant="danger" onClick={() => setConfirming(true)}>
-            Reset database…
+    <Section
+      title="Library data"
+      detail="Manage the files AudioBank keeps on this Mac."
+    >
+      <div className="settings-card space-y-3">
+        <div className="flex items-center justify-between gap-4">
+          <div>
+            <p className="text-xs font-medium text-neutral-300">Data folder</p>
+            <p className="mt-1 text-[11px] text-neutral-500">Open the local library and index.</p>
+          </div>
+          <PanelButton onClick={() => void revealDataDir()} className="settings-button-secondary">
+            Reveal folder
           </PanelButton>
+        </div>
+        {!confirming ? (
+          <button
+            type="button"
+            onClick={() => setConfirming(true)}
+            className="settings-danger-link"
+          >
+            <span>Reset database</span>
+            <span aria-hidden="true">↗</span>
+          </button>
         ) : (
-          <div className="space-y-1.5 rounded border border-red-950 p-2">
-            <p className="text-red-400">
+          <div className="settings-confirmation">
+            <div className="flex items-start gap-2">
+              <div className="settings-danger-mark" aria-hidden="true">
+                !
+              </div>
+              <p className="leading-relaxed text-red-300">
               This permanently deletes your library and embeddings. Type AUDIOBANK to
               confirm.
-            </p>
+              </p>
+            </div>
             <input
               type="text"
               value={confirmText}
               onChange={(e) => setConfirmText(e.target.value)}
-              className="w-full rounded border border-neutral-800 bg-neutral-950 px-2 py-1 text-xs text-neutral-200 focus:border-neutral-600 focus:outline-none"
+              placeholder="Type AUDIOBANK"
+              aria-label="Type AUDIOBANK to confirm database reset"
+              className="settings-text-input"
             />
             <div className="flex gap-2">
               <PanelButton
                 variant="danger"
                 disabled={confirmText !== 'AUDIOBANK'}
                 onClick={() => void doReset()}
+                className="settings-danger-button"
               >
                 Delete everything
               </PanelButton>
@@ -294,5 +267,114 @@ function DataSection() {
         )}
       </div>
     </Section>
+  );
+}
+
+type SelectOption = { value: string; label: string; detail?: string | undefined };
+
+function SelectField({
+  label,
+  value,
+  options,
+  onChange,
+}: {
+  label: string;
+  value: string;
+  options: SelectOption[];
+  onChange: (value: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [highlighted, setHighlighted] = useState(() =>
+    Math.max(0, options.findIndex((option) => option.value === value)),
+  );
+  const rootRef = useRef<HTMLDivElement>(null);
+  const buttonRef = useRef<HTMLButtonElement>(null);
+  const selected =
+    options.find((option) => option.value === value) ??
+    options[0] ??
+    ({ value: '', label: 'No devices available' } satisfies SelectOption);
+  const selectedIndex = Math.max(0, options.findIndex((option) => option.value === value));
+
+  useEffect(() => {
+    function closeOnOutside(event: MouseEvent) {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+    }
+    document.addEventListener('mousedown', closeOnOutside);
+    return () => document.removeEventListener('mousedown', closeOnOutside);
+  }, []);
+
+  function choose(option: SelectOption) {
+    onChange(option.value);
+    setHighlighted(Math.max(0, options.indexOf(option)));
+    setOpen(false);
+    buttonRef.current?.focus();
+  }
+
+  function onKeyDown(event: KeyboardEvent<HTMLButtonElement>) {
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault();
+      setOpen(true);
+      setHighlighted((current) =>
+        event.key === 'ArrowDown'
+          ? Math.min((open ? current : selectedIndex) + 1, options.length - 1)
+          : Math.max((open ? current : selectedIndex) - 1, 0),
+      );
+    } else if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      if (open && options[highlighted]) choose(options[highlighted]);
+      else {
+        setHighlighted(selectedIndex);
+        setOpen(true);
+      }
+    } else if (event.key === 'Escape') {
+      setOpen(false);
+    }
+  }
+
+  return (
+    <div ref={rootRef} className="settings-field">
+      <label className="settings-field-label" htmlFor="audio-device">
+        {label}
+      </label>
+      <div className="settings-select-wrap">
+        <button
+          ref={buttonRef}
+          id="audio-device"
+          type="button"
+          className="settings-select-trigger"
+          aria-haspopup="listbox"
+          aria-expanded={open}
+          onClick={() => setOpen((current) => !current)}
+          onKeyDown={onKeyDown}
+        >
+          <span className="min-w-0 truncate text-left">
+            <span className="block truncate text-xs text-neutral-200">{selected.label}</span>
+            {selected.detail && <span className="mt-0.5 block truncate text-[10px] text-neutral-500">{selected.detail}</span>}
+          </span>
+          <CaretDown size={14} className={`shrink-0 text-neutral-500 transition-transform ${open ? 'rotate-180' : ''}`} />
+        </button>
+        {open && (
+          <div className="settings-select-menu rise-in" role="listbox" aria-label={label}>
+            {options.map((option, index) => (
+              <button
+                key={option.value || 'system-default'}
+                type="button"
+                role="option"
+                aria-selected={option.value === value}
+                className={`settings-select-option ${index === highlighted ? 'is-highlighted' : ''}`}
+                onMouseEnter={() => setHighlighted(index)}
+                onClick={() => choose(option)}
+              >
+                <span className="min-w-0">
+                  <span className="block truncate">{option.label}</span>
+                  {option.detail && <span className="mt-0.5 block truncate text-[10px] text-neutral-500">{option.detail}</span>}
+                </span>
+                {option.value === value && <Check size={15} weight="bold" className="shrink-0 text-accent" />}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
   );
 }

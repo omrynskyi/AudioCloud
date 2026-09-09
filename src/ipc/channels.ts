@@ -13,13 +13,12 @@
  *   promise resolved as soon as the job was admitted.
  */
 
-import type { DownloadEvent } from '../bindings/DownloadEvent';
 import type { RefitEvent } from '../bindings/RefitEvent';
 import type { ScanEvent } from '../bindings/ScanEvent';
 import type { AppError } from './errors';
 
 /** Any of the three streams. */
-type StreamEvent = ScanEvent | RefitEvent | DownloadEvent;
+type StreamEvent = ScanEvent | RefitEvent;
 
 /** Narrows an event to the terminal one. */
 export function isFinished<E extends StreamEvent>(

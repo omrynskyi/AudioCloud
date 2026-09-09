@@ -39,9 +39,11 @@ export interface FrameOptions {
 
 const DEFAULTS = {
   padding: 1.35,
-  // Slightly above and off-axis. A dead-on view of a three-dimensional cloud reads as a
-  // two-dimensional scatter plot until the user drags it, and first impressions of this
-  // screen are the whole argument for building it in 3D.
+  // Slightly above and off-axis. The app itself always overrides this with a dead-on top-down
+  // direction (`PointCloud.tsx`'s `TOP_DOWN_DIRECTION`) — the interactive view is a flat map,
+  // not an orbit, so a tilted first impression has no one left to sell it to. This default
+  // survives only for the orbit-sweep performance harness (`profile/main.tsx`), which still
+  // wants a 3D camera path to measure render throughput under camera movement.
   direction: [0.62, 0.42, 1] as const,
 } as const;
 
@@ -112,21 +114,16 @@ export function frameBounds(
  * near plane, every point in the cloud is behind it and the whole cloud clips at once, which
  * is exactly the "zoom in and everything disappears" bug this function exists to fix.
  *
- * Kept outside `fadeRange` despite computing the same `distance`/`radius` pair: fade near/far
- * are alpha thresholds a point crosses gradually, clip near/far are a hard GPU boundary nothing
- * should ever reach, so the clip pair is deliberately padded wider than the fade pair — a point
- * still fading toward `uFarAlpha` must never be clipped before it finishes fading.
+ * The fade shader is permanently disabled now (`PointCloud.tsx`'s `FADE_DISABLED_NEAR`/`FAR`
+ * — a flat map has no far side to recede), but the clip planes still have to track the live
+ * camera distance: zoom is still a dolly, even with rotation locked out.
  *
- * Call every frame the camera might have moved, exactly like `fadeRange`. `updateProjectionMatrix`
- * is only called when the planes actually changed, since it is not free and this runs inside
- * `useFrame`.
+ * Call every frame the camera might have moved. `updateProjectionMatrix` is only called when
+ * the planes actually changed, since it is not free and this runs inside `useFrame`.
  */
 export function updateClipPlanes(camera: PerspectiveCamera, bounds: CloudBounds): void {
   const distance = camera.position.distanceTo(bounds.center);
   const radius = Math.max(bounds.radius, 1e-3);
-  // 1.2/1.5 rather than `fadeRange`'s 1.0/1.15: comfortably outside the fade range in both
-  // directions, so nothing is ever GPU-clipped before the fade shader has already dimmed it
-  // toward invisible on its own terms.
   const near = Math.max(distance - radius * 1.2, distance / 1000);
   const far = distance + radius * 1.5;
   if (camera.near !== near || camera.far !== far) {
@@ -134,29 +131,4 @@ export function updateClipPlanes(camera: PerspectiveCamera, bounds: CloudBounds)
     camera.far = far;
     camera.updateProjectionMatrix();
   }
-}
-
-/**
- * View-space depths to fade between, for the current camera.
- *
- * Cheap enough to redo every frame — a distance and two adds — and it has to be, because
- * the whole point of the fade is that the far side of the cloud recedes *as you orbit*. A
- * fade fixed at load would be wrong the moment the camera moved.
- *
- * Writes into `out` rather than returning a pair. Returning a fresh two-element array here
- * would allocate once per frame forever, which is a small enough thing that it would never
- * be found again and exactly the kind of thing cross-cutting rule 1 is about.
- */
-export function fadeRange(
-  camera: PerspectiveCamera,
-  bounds: CloudBounds,
-  out: { near: number; far: number },
-): { near: number; far: number } {
-  const distance = camera.position.distanceTo(bounds.center);
-  const radius = Math.max(bounds.radius, 1e-3);
-  // The fade starts at the near face of the cloud rather than at the camera, so points at
-  // the front are at full strength and the gradient is spent across the body.
-  out.near = Math.max(distance - radius, 1e-3);
-  out.far = distance + radius * 1.15;
-  return out;
 }

@@ -6,7 +6,7 @@
  * that changes when the cursor moves, no dependency on the selection. It returns one
  * `<primitive>` and a set of controls, and it re-renders only when the payload itself is
  * replaced. Everything that happens while the user is working — hovering, selecting,
- * filtering, recolouring, orbiting — happens through the effects and subscriptions below,
+ * filtering, recolouring, panning — happens through the effects and subscriptions below,
  * which write into typed arrays and uniforms and then ask for one frame.
  *
  * The three inputs have three different shapes on purpose:
@@ -23,19 +23,30 @@ import { OrbitControls } from '@react-three/drei';
 import { useFrame, useThree } from '@react-three/fiber';
 import { useCallback, useEffect, useMemo, useRef, type ComponentRef } from 'react';
 import {
+  MOUSE,
   Points,
+  TOUCH,
   Vector2,
+  Vector3,
   type PerspectiveCamera,
   type Scene,
   type WebGLRenderer,
 } from 'three';
 
-import { playSample, stopPlayback } from '../ipc';
+import { PREVIEW_GAIN } from '../audition';
+import { getSimilar, playSample, stopPlayback } from '../ipc';
+import type { PointColors } from '../ipc/binary';
 import { useSceneStore } from '../store/scene';
 import { CloudBuffers, DEFAULT_POINT_COLOR, type CloudBufferOptions } from './buffers';
 import { readCaps, type GlCaps } from './caps';
-import { EMBER, colorsFromColumn, featureDomain, featureRamp } from './colors';
-import { fadeRange, frameBounds, updateClipPlanes } from './framing';
+import {
+  EMBER,
+  colorsFromColumn,
+  colorsFromFit,
+  featureDomain,
+  featureRamp,
+} from './colors';
+import { frameBounds, updateClipPlanes } from './framing';
 import { maskFrom } from './mask';
 import {
   createCloudMaterials,
@@ -44,6 +55,8 @@ import {
   type SharedUniforms,
 } from './materials';
 import { HoverGate, NO_PICK, Picker } from './picking';
+import { prefetchQueue } from './prefetchQueue';
+import { allSamplesByDistance, visibleSamples } from './visibility';
 
 /** What the harness in `scene/profile.ts` and the app shell get to hold. */
 export interface CloudHandle {
@@ -79,17 +92,6 @@ export interface PointCloudProps {
   /** An `ABPC` payload. Held for the lifetime of the cloud — see `CloudBuffers.source`. */
   source: ArrayBuffer;
   /**
-   * `'3d'` (default) is the orbiting starfield. `'2d'` locks the camera to look straight down
-   * the world Z axis at a layout whose z is uniformly `0.0` (a real 2D UMAP/PCA fit, not the
-   * 3D layout with a coordinate dropped — see `store/shell.ts`'s `ViewMode`).
-   *
-   * Because every point then shares one view-space depth, perspective projection of that
-   * plane introduces zero relative distortion: screen position becomes a linear function of
-   * world x/y, and the existing depth-driven size/fade shader code needs no branch for it —
-   * only the camera direction, `OrbitControls`' rotation, and the fade uniforms below change.
-   */
-  mode?: '2d' | '3d';
-  /**
    * The active colour-by column, in the cloud's order, or `null` for the flat default.
    *
    * Fetched by the shell through `getFeatureColumn`, not here: the scene does not do IPC.
@@ -97,6 +99,12 @@ export interface PointCloudProps {
   featureValues?: Float32Array | null;
   /** Matching sample ids from `query_samples`, ascending, or `null` for no filter. */
   matchedIds?: Uint32Array | null;
+  /**
+   * The active layout's fit colors, in the cloud's order, or `null`/absent before they've
+   * loaded. Only ever the *default* — `colorBy` above always overrides it, same as it
+   * overrides the flat `DEFAULT_POINT_COLOR` fallback this replaces when present.
+   */
+  fitColors?: PointColors | null;
   options?: CloudBufferOptions;
   /** Called once the scene is live, with the imperative handle. */
   onReady?: (handle: CloudHandle) => void;
@@ -106,35 +114,71 @@ export interface PointCloudProps {
 const CLICK_SLOP_PX = 4;
 
 /**
- * Debounce before a hover starts audition (`task.md` Phase 8).
- *
- * The engine itself never clicks on a retrigger -- every `play_sample` fades through a fresh
- * envelope -- so this is not here to avoid a glitch. It is here so a cursor sweeping across a
- * dense cluster does not machine-gun the decoder with one request per point it crosses.
+ * Ceiling on hover picks per second. See `HoverGate` for why this is a safety valve against a
+ * pointer device reporting faster than the display can matter, and not a cost budget -- the
+ * ~20 Hz it replaces was spending 0-50 ms of pure dead time in front of every audition.
  */
-const HOVER_AUDITION_DEBOUNCE_MS = 120;
+const HOVER_PICK_HZ = 120;
 
-/** A flat default until Phase 9's settings panel exposes a gain control. */
-const PREVIEW_GAIN = 0.85;
+/** Per-wheel-tick zoom factor; see the wheel effect below. */
+const ZOOM_SPEED = 0.0015;
 
 /**
- * Fade planes for 2D mode, comfortably beyond any real framing distance so
- * `smoothstep(uFadeNear, uFadeFar, depth)` evaluates to `0` for every point. A flat map has
- * no "far side" to recede — every point sits at the same view-space depth by construction —
- * so this holds the whole cloud at full brightness/size rather than uniformly dimming it by
- * whatever `fadeRange` would have computed for the 3D case's framing distance.
+ * Debounce before a hover fetches and highlights similar samples.
+ *
+ * Audition plays immediately on every hover (see below); this one stays debounced because it
+ * guards a different cost -- `get_similar`'s tens-of-milliseconds linear scan, not the
+ * decoder -- and a cursor sweeping across a dense cluster must not fire one scan per point it
+ * crosses.
+ */
+const HOVER_SIMILARITY_DEBOUNCE_MS = 120;
+
+/** How many nearest neighbors light up when a sample is hovered. */
+const SIMILAR_HIGHLIGHT_K = 15;
+
+/**
+ * How many of those neighbors get their PCM warmed in the background while the cursor sits on
+ * the current one. Small and sequential (see the prefetch loop below) on purpose: a point-cloud
+ * browsing session tends to drift to a *nearby* point next, so warming a few is most of the
+ * benefit, and warming all fifteen would queue that much decode work behind the single decoder
+ * lock `audio/mod.rs` deliberately keeps -- exactly what would make the next *real* hover slower
+ * instead of faster.
+ */
+const PREFETCH_NEIGHBOR_COUNT = 4;
+
+/**
+ * Debounce before a settled camera warms whatever is now on screen.
+ *
+ * Longer than the hover debounces: panning and zooming fire many `change` events in quick
+ * succession while the gesture is still happening, and there is no point recomputing (and
+ * re-queuing) the visible set until the camera has actually stopped moving.
+ */
+const VIEWPORT_PREFETCH_SETTLE_MS = 250;
+
+/** How many on-screen samples get warmed after the camera settles. Capped well below what a
+ *  fully zoomed-out view can put in frame -- see `visibility.ts`'s doc comment. */
+const PREFETCH_VIEWPORT_MAX = 60;
+
+/**
+ * Fade planes comfortably beyond any real framing distance, so
+ * `smoothstep(uFadeNear, uFadeFar, depth)` evaluates to `0` for every point. The map is a flat
+ * layout viewed straight-on (see `frameAll` below) with no "far side" to recede — every point
+ * sits at the same view-space depth by construction — so this holds the whole cloud at full
+ * brightness/size rather than dimming it by whatever a 3D framing distance would have implied.
  */
 const FADE_DISABLED_NEAR = 1e6;
 const FADE_DISABLED_FAR = 1e6 + 1;
 
-/** Looks straight down the world Z axis, for `frameBounds` in 2D mode. */
+/** Looks straight down the world Z axis, so screen position is a linear function of world
+ *  x/y with zero perspective distortion — the whole reason the map is trustworthy to browse
+ *  by eye. */
 const TOP_DOWN_DIRECTION = [0, 0, 1] as const;
 
 export function PointCloud({
   source,
-  mode = '3d',
   featureValues = null,
   matchedIds = null,
+  fitColors = null,
   options,
   onReady,
 }: PointCloudProps) {
@@ -154,7 +198,7 @@ export function PointCloud({
   );
   const materials = useMemo(() => createCloudMaterials(caps), [caps]);
   const picker = useMemo(() => new Picker(), []);
-  const hoverGate = useMemo(() => new HoverGate(20), []);
+  const hoverGate = useMemo(() => new HoverGate(HOVER_PICK_HZ), []);
 
   const points = useMemo(() => {
     const object = new Points(buffers.geometry, materials.points);
@@ -168,7 +212,7 @@ export function PointCloud({
   }, [buffers, materials]);
 
   const drawingBuffer = useRef(new Vector2());
-  const fade = useRef({ near: 0, far: 1 });
+  const dollyOffset = useRef(new Vector3());
   // The per-frame uniform writes below go through a ref rather than straight at the
   // memoized `materials`. A `ShaderMaterial`'s uniforms are mutable external state and
   // writing them every frame is the entire design, but a value produced by `useMemo` is a
@@ -183,14 +227,16 @@ export function PointCloud({
   const controlsRef = useRef<ComponentRef<typeof OrbitControls>>(null);
   const colorScratch = useRef<Float32Array | null>(null);
   const maskScratch = useRef<Uint8Array | null>(null);
+  const highlightScratch = useRef<Uint8Array | null>(null);
   const pointerDownAt = useRef<{ x: number; y: number } | null>(null);
 
   // ── Per-frame uniforms ────────────────────────────────────────────────────────
   //
-  // Twelve bytes of uniform writes per frame, and nothing else. Both terms genuinely
-  // depend on the camera: point size is pixels-per-world-unit, which changes with the
-  // window and the pixel ratio, and the depth fade is relative to where the camera is now,
-  // which is the whole reason the far side of the cloud recedes as you orbit.
+  // Eight bytes of uniform writes per frame, and nothing else. Point size is pixels-per-
+  // world-unit, which changes with the window and the pixel ratio; the fade planes are fixed
+  // (see `FADE_DISABLED_NEAR`/`FAR`) but still written every frame alongside it rather than
+  // once, so this stays a single easy-to-audit block instead of splitting uniform ownership
+  // between here and a setup effect.
   useFrame(() => {
     const uniforms = shared.current;
     if (!uniforms) return;
@@ -201,27 +247,18 @@ export function PointCloud({
     updateClipPlanes(camera, buffers.bounds);
     gl.getDrawingBufferSize(drawingBuffer.current);
     uniforms.uSizeScale.value = pixelsPerWorldUnit(camera.fov, drawingBuffer.current.y);
-    if (mode === '2d') {
-      uniforms.uFadeNear.value = FADE_DISABLED_NEAR;
-      uniforms.uFadeFar.value = FADE_DISABLED_FAR;
-    } else {
-      const { near, far } = fadeRange(camera, buffers.bounds, fade.current);
-      uniforms.uFadeNear.value = near;
-      uniforms.uFadeFar.value = far;
-    }
+    uniforms.uFadeNear.value = FADE_DISABLED_NEAR;
+    uniforms.uFadeFar.value = FADE_DISABLED_FAR;
   });
 
   // ── Framing ───────────────────────────────────────────────────────────────────
 
   const frameAll = useCallback(() => {
-    frameBounds(
-      camera,
-      controlsRef.current,
-      buffers.bounds,
-      mode === '2d' ? { direction: TOP_DOWN_DIRECTION } : undefined,
-    );
+    frameBounds(camera, controlsRef.current, buffers.bounds, {
+      direction: TOP_DOWN_DIRECTION,
+    });
     invalidate();
-  }, [camera, buffers, invalidate, mode]);
+  }, [camera, buffers, invalidate]);
 
   useEffect(() => {
     frameAll();
@@ -230,25 +267,41 @@ export function PointCloud({
   // ── Colour ────────────────────────────────────────────────────────────────────
 
   useEffect(() => {
-    if (!featureValues || featureValues.length !== buffers.count) {
-      buffers.setUniformColor(DEFAULT_POINT_COLOR);
-      invalidate();
-      return;
-    }
-    // Reused across colour-by changes. At 50,000 points the output is 600 KB, and a user
-    // clicking through six features should not leave 3.6 MB behind for the collector to
-    // find in the middle of an orbit.
+    // Reused across colour-by *and* fit-colour changes alike -- both write `count * 3`
+    // floats, and a user clicking through six features (or a map that just finished a
+    // re-fit) should not leave 3.6 MB behind for the collector to find mid-orbit.
     if (colorScratch.current?.length !== buffers.count * 3) {
       colorScratch.current = new Float32Array(buffers.count * 3);
     }
-    const mapping = colorsFromColumn(featureValues, {
-      ramp: colorBy ? featureRamp(colorBy) : EMBER,
-      domain: colorBy ? featureDomain(colorBy) : null,
-      out: colorScratch.current,
-    });
-    buffers.setColors(mapping.colors);
+
+    if (featureValues && featureValues.length === buffers.count) {
+      const mapping = colorsFromColumn(featureValues, {
+        ramp: colorBy ? featureRamp(colorBy) : EMBER,
+        domain: colorBy ? featureDomain(colorBy) : null,
+        out: colorScratch.current,
+      });
+      buffers.setColors(mapping.colors);
+      invalidate();
+      return;
+    }
+
+    // No explicit colour-by: a fit colour, when the active layout has one, is the default --
+    // falling back to the flat `DEFAULT_POINT_COLOR` only per-point, for whichever samples
+    // the active run never colored (see `colorsFromFit`'s doc).
+    if (fitColors && fitColors.count === buffers.count) {
+      buffers.setColors(
+        colorsFromFit(fitColors, {
+          fallback: DEFAULT_POINT_COLOR,
+          out: colorScratch.current,
+        }),
+      );
+      invalidate();
+      return;
+    }
+
+    buffers.setUniformColor(DEFAULT_POINT_COLOR);
     invalidate();
-  }, [featureValues, colorBy, buffers, invalidate]);
+  }, [featureValues, fitColors, colorBy, buffers, invalidate]);
 
   // ── Filter ────────────────────────────────────────────────────────────────────
 
@@ -316,9 +369,18 @@ export function PointCloud({
 
   // ── Audio preview ─────────────────────────────────────────────────────────────
   //
-  // Hover auditions after a debounce; a click plays immediately. Both just call the command --
-  // retriggering is always safe, so there is no local "is something already playing" state to
-  // keep in sync with the engine's.
+  // Not here. Picking below reports what the cursor is over by writing `hoveredSampleId`, and
+  // `audition.ts` -- mounted once by the shell -- is what turns that into sound, for the map
+  // and the rail's sample lists alike. `onPointerMove`'s `HOVER_PICK_HZ` gate is what bounds
+  // how many auditions a sweep across the map can fire per second.
+
+  // ── Similar-sound highlight ───────────────────────────────────────────────────
+  //
+  // Dims every point except the hovered sample and its nearest neighbors by embedding
+  // similarity, so "what does this sound like" is a glance rather than a click into the
+  // inspector. Debounced, unlike audition above -- a cursor sweeping across a dense cluster
+  // must not fire one `get_similar` scan per point it crosses -- and the fetch is discarded
+  // if the hover has already moved on by the time it resolves.
 
   useEffect(() => {
     let pending: ReturnType<typeof setTimeout> | null = null;
@@ -334,14 +396,43 @@ export function PointCloud({
       (sampleId) => {
         clearPending();
         if (sampleId === null) {
-          // Leaving the cloud entirely stops audition; moving from one point to another does
-          // not need to -- the new hover's debounced `playSample` retriggers cleanly on its own.
-          stopPlayback().catch(() => {});
+          buffers.setHighlight(null);
+          invalidate();
           return;
         }
         pending = setTimeout(() => {
-          playSample(sampleId, PREVIEW_GAIN).catch(() => {});
-        }, HOVER_AUDITION_DEBOUNCE_MS);
+          getSimilar(sampleId, SIMILAR_HIGHLIGHT_K)
+            .then((neighbors) => {
+              // Stale if the cursor has moved to a different sample, or off the cloud, since
+              // this fetch started -- applying it now would highlight the wrong neighborhood.
+              if (useSceneStore.getState().hoveredSampleId !== sampleId) return;
+              if (highlightScratch.current?.length !== buffers.count) {
+                highlightScratch.current = new Uint8Array(buffers.count);
+              }
+              const highlight = highlightScratch.current;
+              highlight.fill(0);
+              const focusIndex = buffers.indexOfSample(sampleId);
+              if (focusIndex !== -1) highlight[focusIndex] = 1;
+              for (const neighbor of neighbors) {
+                const index = buffers.indexOfSample(neighbor.sampleId);
+                if (index !== -1) highlight[index] = 1;
+              }
+              buffers.setHighlight(highlight);
+              invalidate();
+
+              // Warm the nearest few neighbors' decode cache while the cursor is here -- the
+              // most likely next stop as the cursor keeps drifting through this cluster.
+              // `prefetchQueue` supersedes this with whatever the *next* hover or viewport
+              // settle asks for, so there is nothing to abort here even if the cursor has
+              // already moved on by the time this resolves.
+              prefetchQueue.replacePriority(
+                neighbors
+                  .slice(0, PREFETCH_NEIGHBOR_COUNT)
+                  .map((neighbor) => neighbor.sampleId),
+              );
+            })
+            .catch(() => {});
+        }, HOVER_SIMILARITY_DEBOUNCE_MS);
       },
     );
 
@@ -349,7 +440,7 @@ export function PointCloud({
       clearPending();
       unsubscribe();
     };
-  }, []);
+  }, [buffers, invalidate]);
 
   // ── Picking ───────────────────────────────────────────────────────────────────
 
@@ -371,9 +462,9 @@ export function PointCloud({
     };
 
     const onPointerMove = (event: PointerEvent) => {
-      // The gate is the whole of the §5.3 policy: never during a drag, and at most 20 Hz
-      // otherwise. `readRenderTargetPixels` stalls the pipeline, and stalling it once per
-      // pointer event during an orbit is how a 60 fps scene becomes a 20 fps one.
+      // Never during a drag, and at most `HOVER_PICK_HZ` otherwise -- see `HoverGate` for why
+      // that is a safety valve rather than a budget, and why the old 20 Hz was the single
+      // largest term in hover-to-sound.
       if (!hoverGate.shouldPick()) return;
       const { x, y } = toCanvas(event);
       const index = pickAt(x, y);
@@ -382,6 +473,10 @@ export function PointCloud({
         .hover(index === NO_PICK ? null : (buffers.sampleAt(index) ?? null));
     };
 
+    // No special stop here. Leaving the canvas for a search result in the rail is a hover
+    // moving from one sample to another, not an intent to stop listening, and
+    // `HOVER_STOP_GRACE_MS` is exactly long enough to let the row that is about to be entered
+    // retrigger instead.
     const onPointerLeave = () => useSceneStore.getState().hover(null);
 
     const onClick = (event: MouseEvent) => {
@@ -417,6 +512,100 @@ export function PointCloud({
       canvas.removeEventListener('click', onClick);
     };
   }, [gl, buffers, hoverGate, pickAt]);
+
+  // ── Wheel: scroll to zoom ────────────────────────────────────────────────────
+  //
+  // `OrbitControls`' own wheel handling dollies too, but ties its speed to `zoomSpeed`'s
+  // fixed multiplicative step; this handler keeps the tuned `ZOOM_SPEED` curve and the
+  // explicit min/max clamp instead. `enableZoom={false}` below hands dolly entirely to this
+  // handler, so there is exactly one place moving the camera on wheel input instead of two
+  // listeners on the same element racing each other. Panning is a left-click drag, handled
+  // natively by `OrbitControls` via the `mouseButtons`/`touches` remap on the JSX below.
+  useEffect(() => {
+    const canvas = gl.domElement;
+
+    const onWheel = (event: WheelEvent) => {
+      const controls = controlsRef.current;
+      if (!controls) return;
+      event.preventDefault();
+
+      // `deltaMode` is almost always 0 (pixels) for trackpads and modern mice; the other two
+      // only show up on the rare wheel that reports lines or pages, and a rough px-per-unit
+      // guess is plenty since nobody is measuring precision here, only direction and feel.
+      const scale =
+        event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? canvas.clientHeight : 1;
+      const deltaY = event.deltaY * scale;
+
+      const offset = dollyOffset.current.copy(camera.position).sub(controls.target);
+      const distance = offset.length();
+      const min = controls.minDistance ?? 0;
+      const max = controls.maxDistance ?? Infinity;
+      const next = Math.min(max, Math.max(min, distance * Math.exp(deltaY * ZOOM_SPEED)));
+      offset.setLength(next);
+      camera.position.copy(controls.target).add(offset);
+
+      controls.update();
+      invalidate();
+    };
+
+    // `{ passive: false }` because `preventDefault` on a passive listener is a silent no-op —
+    // without it the page (and the browser's own pinch-zoom) scrolls right along with the map.
+    canvas.addEventListener('wheel', onWheel, { passive: false });
+    return () => canvas.removeEventListener('wheel', onWheel);
+  }, [gl, camera, invalidate]);
+
+  // ── Viewport prefetch ─────────────────────────────────────────────────────────
+  //
+  // Warms the decode cache for whatever the camera settles on, so a hover landing on a point
+  // the user just panned or zoomed to is a cache hit instead of the cold decode that used to be
+  // "the first hover in a freshly-panned-to area is always slow." Runs once for the initial
+  // framed view (the frame-all effect above has already positioned the camera by the time this
+  // one runs, so there is a real view to warm from the very first frame) and again every time
+  // panning or zooming settles.
+
+  useEffect(() => {
+    const controls = controlsRef.current;
+    if (!controls) return;
+
+    let pending: ReturnType<typeof setTimeout> | null = null;
+    const warm = () => {
+      prefetchQueue.replacePriority(
+        visibleSamples(camera, buffers.cloud, PREFETCH_VIEWPORT_MAX),
+      );
+    };
+    const onChange = () => {
+      if (pending !== null) clearTimeout(pending);
+      pending = setTimeout(warm, VIEWPORT_PREFETCH_SETTLE_MS);
+    };
+
+    warm();
+    controls.addEventListener('change', onChange);
+    return () => {
+      if (pending !== null) clearTimeout(pending);
+      controls.removeEventListener('change', onChange);
+    };
+  }, [camera, buffers]);
+
+  // ── Background prefetch sweep ────────────────────────────────────────────────
+  //
+  // Warms the *rest* of the library -- everything the viewport and neighbor prefetches above
+  // are not already covering right now -- during whatever idle time exists between them.
+  // Nearest-to-center first (`allSamplesByDistance`), so a library too large to finish warming
+  // still spends its idle time on the samples closest to where the user started rather than an
+  // arbitrary id-order prefix.
+  //
+  // Set once per loaded library, deliberately not re-triggered by hover or viewport settling --
+  // `PrefetchQueue.setBackground` is exactly what keeps this from being wiped out and restarted
+  // every time the user so much as moves the cursor. The Rust-side cache's byte budget
+  // (`audio/mod.rs`'s `PCM_CACHE_BYTE_BUDGET`) is what actually bounds how much of this ever
+  // stays resident -- a library too big to fit just self-limits to the most recently touched
+  // ~1 GB rather than growing without bound.
+
+  useEffect(() => {
+    prefetchQueue.setBackground(
+      allSamplesByDistance(buffers.cloud, buffers.bounds.center),
+    );
+  }, [buffers]);
 
   // ── Context loss ──────────────────────────────────────────────────────────────
 
@@ -509,13 +698,21 @@ export function PointCloud({
         makeDefault
         enableDamping
         dampingFactor={0.08}
-        rotateSpeed={0.6}
-        zoomSpeed={0.8}
+        // Wheel input is handled entirely by the effect above (scroll to zoom); leaving
+        // `enableZoom` on would give the same wheel event to two independent camera movers.
+        enableZoom={false}
         panSpeed={0.7}
-        // 2D mode is pan/zoom only. Rotating a flat map out of its top-down lock would
-        // reintroduce exactly the depth ambiguity this mode exists to remove — screen-space
+        // Pan/zoom only, permanently. Rotating the map out of its top-down lock would
+        // reintroduce exactly the depth ambiguity a flat map exists to remove — screen-space
         // distance stops meaning anything the moment the camera tilts off the plane's normal.
-        enableRotate={mode !== '2d'}
+        // It is also the whole reason the orbiting 3D view was dropped: a map you can spin
+        // around is slower to scan and click through than one that just sits still.
+        enableRotate={false}
+        // Left-click drag (and single-finger touch) pans instead of rotating — rotation is
+        // permanently off per the note above, so the button `OrbitControls` defaults to
+        // rotate would otherwise do nothing.
+        mouseButtons={{ LEFT: MOUSE.PAN, MIDDLE: MOUSE.DOLLY, RIGHT: MOUSE.PAN }}
+        touches={{ ONE: TOUCH.PAN, TWO: TOUCH.DOLLY_PAN }}
         // `invalidate()` on interaction only: drei calls it from the controls' `change`
         // event, which is the only thing that moves the camera. An idle canvas costs zero
         // frames, which for a tool that sits open next to a DAW all day is the difference

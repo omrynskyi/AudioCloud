@@ -68,16 +68,64 @@ export function ErrorState({
   return <Frame icon="!" title={fallback ?? describe(error)} action={action} />;
 }
 
+/** Overlay + centered panel + title/close-button header shared by every modal panel. */
+export function Modal({
+  title,
+  onClose,
+  closeLabel,
+  zIndexClassName = 'z-20',
+  panelClassName = 'max-h-[80vh] w-[420px]',
+  children,
+}: {
+  title: string;
+  onClose: () => void;
+  closeLabel: string;
+  /** Stacking two modals above each other (e.g. tuning over settings) needs the top one higher. */
+  zIndexClassName?: string;
+  /** Tailwind sizing classes for the panel itself; each modal's content dictates its own. */
+  panelClassName?: string;
+  children: ReactNode;
+}) {
+  return (
+    <div
+      className={`fixed inset-0 ${zIndexClassName} flex items-center justify-center bg-black/60`}
+      onClick={onClose}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        role="dialog"
+        aria-modal="true"
+        className={`${panelClassName} overflow-y-auto rounded-lg border border-neutral-800 p-4 text-xs shadow-xl`}
+      >
+        <header className="mb-3 flex items-center justify-between">
+          <h1 className="text-sm font-medium text-neutral-100">{title}</h1>
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label={closeLabel}
+            className="text-neutral-500 hover:text-neutral-200"
+          >
+            ×
+          </button>
+        </header>
+        {children}
+      </div>
+    </div>
+  );
+}
+
 export function PanelButton({
   children,
   onClick,
   disabled,
   variant = 'default',
+  className = '',
 }: {
   children: ReactNode;
   onClick?: () => void;
   disabled?: boolean;
   variant?: 'default' | 'danger';
+  className?: string;
 }) {
   return (
     <button
@@ -88,7 +136,7 @@ export function PanelButton({
         variant === 'danger'
           ? 'border-red-900 text-red-400 hover:bg-red-950'
           : 'border-neutral-700 text-neutral-300 hover:bg-neutral-800'
-      }`}
+      } ${className}`}
     >
       {children}
     </button>

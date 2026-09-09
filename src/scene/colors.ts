@@ -24,6 +24,7 @@
  */
 
 import type { Feature } from '../bindings/Feature';
+import type { PointColors } from '../ipc/binary';
 
 /** A colour ramp: linear RGB stops at even intervals. */
 export interface Ramp {
@@ -33,16 +34,25 @@ export interface Ramp {
   readonly cyclic: boolean;
 }
 
-/** What a point with no value for the active feature is painted. */
-export const MISSING_COLOR: readonly [number, number, number] = [0.16, 0.17, 0.2];
+/**
+ * What a point with no value for the active feature is painted.
+ *
+ * Raised with the background (`scene/SceneCanvas.tsx`): blending is additive, so a colour
+ * this close to the clear colour used to make a missing cell nearly invisible against the
+ * new grey. Still the quietest thing the ramp can paint, but a point rather than a hole.
+ */
+export const MISSING_COLOR: readonly [number, number, number] = [0.3, 0.32, 0.38];
 
 /** Cool to hot. The default for anything that reads as an amount. */
 export const EMBER: Ramp = {
   name: 'ember',
   cyclic: false,
   stops: [
-    [0.11, 0.16, 0.36],
-    [0.25, 0.3, 0.63],
+    // The dark ends of both this ramp and ICE are lifted off where they started: additive
+    // blending over the grey background adds these values to the clear colour, so a stop
+    // near the background's own luminance had no contrast left to spend.
+    [0.18, 0.24, 0.48],
+    [0.29, 0.35, 0.68],
     [0.55, 0.33, 0.62],
     [0.85, 0.36, 0.42],
     [0.98, 0.6, 0.27],
@@ -55,8 +65,8 @@ export const ICE: Ramp = {
   name: 'ice',
   cyclic: false,
   stops: [
-    [0.05, 0.09, 0.2],
-    [0.09, 0.28, 0.47],
+    [0.13, 0.21, 0.39],
+    [0.16, 0.36, 0.56],
     [0.16, 0.5, 0.63],
     [0.36, 0.72, 0.71],
     [0.72, 0.9, 0.83],
@@ -198,6 +208,42 @@ export function colorsFromColumn(
   }
 
   return { colors: out, domain, missing };
+}
+
+/**
+ * Turns a decoded `ABPX` payload into the `count * 3` floats `aColor` wants.
+ *
+ * Unlike {@link colorsFromColumn}, there is no ramp and no domain to derive: the fit already
+ * produced RGB directly (`tsne::fit_color`'s doc), so this is a straight interleave, plus the
+ * same NaN-is-a-value handling for a point the active run never colored. `fallback` defaults
+ * to {@link MISSING_COLOR} but is meant to be overridden — a fit color stands in for the
+ * *ordinary* default point color, and a caller using it that way wants an uncolored point to
+ * blend in, not to read as an error the way a missing feature value does.
+ */
+export function colorsFromFit(
+  colors: PointColors,
+  options: { fallback?: readonly [number, number, number]; out?: Float32Array } = {},
+): Float32Array {
+  const { count, r, g, b } = colors;
+  const fallback = options.fallback ?? MISSING_COLOR;
+  const out = options.out ?? new Float32Array(count * 3);
+  if (out.length !== count * 3) {
+    throw new RangeError(`out has ${out.length} floats for ${count} points`);
+  }
+
+  for (let i = 0; i < count; i++) {
+    const rv = r[i] as number;
+    if (Number.isNaN(rv)) {
+      out[i * 3] = fallback[0];
+      out[i * 3 + 1] = fallback[1];
+      out[i * 3 + 2] = fallback[2];
+      continue;
+    }
+    out[i * 3] = rv;
+    out[i * 3 + 1] = g[i] as number;
+    out[i * 3 + 2] = b[i] as number;
+  }
+  return out;
 }
 
 /**

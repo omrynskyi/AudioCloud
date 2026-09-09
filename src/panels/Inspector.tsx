@@ -8,7 +8,7 @@
  * second fetch of the same thing.
  */
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 
 import {
   IpcError,
@@ -25,8 +25,11 @@ import {
   type Peaks,
   type SampleDetail,
 } from '../ipc';
+import { auditionProps } from '../audition';
 import { useSceneStore } from '../store/scene';
 import { EmptyState, ErrorState, LoadingState } from './StateViews';
+import { formatMs } from './format';
+import { Waveform } from './Waveform';
 
 const NEIGHBOR_COUNT = 12;
 
@@ -103,7 +106,8 @@ export function Inspector() {
 
   return (
     <div className="space-y-3 text-xs">
-      <header>
+      {/* The heading is a filename like any other, so it auditions like any other. */}
+      <header {...auditionProps(detail.id)}>
         <h2
           className="truncate text-sm font-medium text-neutral-100"
           title={detail.filename}
@@ -118,7 +122,9 @@ export function Inspector() {
         </p>
       </header>
 
-      <Waveform peaks={peaks} />
+      <div className="rounded-control overflow-hidden border border-neutral-800 bg-neutral-950 px-2">
+        <Waveform peaks={peaks} durationMs={detail.durationMs} className="h-16 w-full" />
+      </div>
 
       <Transport sampleId={detail.id} />
 
@@ -170,6 +176,7 @@ export function Inspector() {
                 <button
                   type="button"
                   onClick={() => select(n.sampleId)}
+                  {...auditionProps(n.sampleId)}
                   className="w-full truncate rounded px-1 py-0.5 text-left text-neutral-400 hover:bg-neutral-900"
                   title={n.relPath}
                 >
@@ -293,51 +300,6 @@ function TagEditor({
       </form>
     </div>
   );
-}
-
-function Waveform({ peaks }: { peaks: Peaks | null }) {
-  const ref = useRef<HTMLCanvasElement>(null);
-
-  useEffect(() => {
-    const canvas = ref.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-    const { width, height } = canvas;
-    ctx.clearRect(0, 0, width, height);
-    if (!peaks || peaks.buckets === 0) return;
-
-    ctx.fillStyle = '#525a68';
-    const mid = height / 2;
-    const w = width / peaks.buckets;
-    for (let i = 0; i < peaks.buckets; i++) {
-      const min = peaks.minMax[i * 2] ?? 0;
-      const max = peaks.minMax[i * 2 + 1] ?? 0;
-      const y1 = mid - max * mid;
-      const y2 = mid - min * mid;
-      ctx.fillRect(i * w, y1, Math.max(1, w - 0.5), Math.max(1, y2 - y1));
-    }
-  }, [peaks]);
-
-  return (
-    <div className="h-16 w-full overflow-hidden rounded border border-neutral-800 bg-neutral-950">
-      {peaks ? (
-        <canvas ref={ref} width={480} height={64} className="h-full w-full" />
-      ) : (
-        <div className="flex h-full items-center justify-center text-[11px] text-neutral-600">
-          No waveform
-        </div>
-      )}
-    </div>
-  );
-}
-
-function formatMs(ms: number | null): string {
-  if (ms === null) return '—';
-  const totalSeconds = Math.round(ms / 1000);
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-  return `${minutes}:${seconds.toString().padStart(2, '0')}`;
 }
 
 function toError(raw: unknown): AppError {

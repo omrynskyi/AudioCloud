@@ -3,4 +3,4 @@
 /**
  * Which projector a re-fit should use.
  */
-export type Algorithm = "umap" | "pca";
+export type Algorithm = "tsne" | "umap" | "pca";

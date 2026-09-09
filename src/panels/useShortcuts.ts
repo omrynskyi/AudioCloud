@@ -49,7 +49,7 @@ export function useShortcuts() {
         }
         case '/': {
           e.preventDefault();
-          document.querySelector<HTMLInputElement>('[data-search-input]')?.focus();
+          document.getElementById('search-input')?.focus();
           break;
         }
         case 'Escape': {

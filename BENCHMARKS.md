@@ -466,7 +466,8 @@ a real one.
 
 | Measurement                                       | Target        | Actual        |
 | -------------------------------------------------- | ------------- | ------------- |
-| `play_pcm` → first audible sample                  | < 50 ms       | **~16–17 ms** |
+| `play_pcm` → first audible sample                  | < 50 ms       | **~2–4 ms**   |
+| Preview decode + resample, per sample (555 wavs)   | —             | **3.0 / 10.6 ms p50/p95** |
 | Audio-thread allocations                           | exactly 0     | **enforced**  |
 | Rapid retrigger storm (20× in 300 ms)               | no panic      | **no panic**  |
 | `stop()` mid-clip                                   | no panic      | **no panic**  |
@@ -475,17 +476,45 @@ Measured against the real default output device via `cargo test --test audio_har
 --ignored`, which is not run in CI — headless runners have no audio device, and this is the
 one Phase 8 measurement that genuinely needs one. `tests/audio_hardware.rs` opens
 [`Engine`], plays a synthetic sine burst and a real decoded WAV alike, and prints
-`play_pcm -> first audible sample: 16.98ms` (and, on a second run, 16.12ms) on the machine
-this was developed on.
+`play_pcm -> first audible sample: 2.26ms` (2.66 / 3.53 / 8.03 ms on repeat runs) on the
+machine this was developed on. The spread is the callback period: a play lands somewhere
+inside a 5.3 ms buffer and waits out the remainder, and the 8 ms outlier is the first play
+after a device open, before the callback has settled into cadence.
+
+**This was 16–17 ms, then 10.8 ms, and the difference was a bug, not a budget.** `render`
+answered a generation change with `consumer.clear()` — discarding *everything* queued, on the
+correct reasoning that the previous clip's frames are nobody's audio anymore. But the new
+generation's producer had usually already pushed by the time the callback next ran, so the
+clear was throwing away the opening frames of the clip the user was waiting for, which then
+had to be re-pushed on the next `PUSH_BACKOFF` tick. `Transport::generation_start` replaces
+the blanket clear with a count of exactly how many queued samples are stale, so the callback
+drops those and plays the rest on the same callback. Priming the ring inline in `play_pcm`
+rather than on the spawned push task removes the remaining scheduling hop; together they are
+the 10.8 → 2.3 ms.
+
+### On the decode number
+
+`cargo run --release --example preview_latency -- <copy of the data dir>` over the 555-sample
+development library: p50 3.05 ms, p90 10.4 ms, p95 10.57 ms, max 32.07 ms, ~611× realtime.
+The split that matters is source rate — 4.33 ms p50 for the 44.1 kHz files that need a sinc
+resample to 48 kHz against 0.58 ms for the 39 already at 48 kHz — which is why the resampler
+is cached per rate rather than rebuilt per clip.
+
+That p95 is also the reason `AudioPlayer` carries **two** decode lanes. One shared
+`Mutex<Decoder>` meant a hover arriving just after the background prefetch sweep took the lock
+waited out that prefetch's entire decode before its own began; a second decoder makes warming
+the cache structurally incapable of delaying a sound someone is waiting for, for the price of
+one more pooled window (~1.9 MB).
 
 **What the number is, precisely.** Elapsed time from `Engine::play_pcm` being called to the
 real-time callback's first non-silent sample, read off `Transport::first_audible_nanos`. This
 is the half of the hover-to-audible budget the audio engine owns: queueing, the attack ramp,
 and the ring hand-off. It excludes the IPC round trip from a pointer event to the
-`play_sample` command arriving, and it excludes the frontend's 120 ms hover debounce
-(`scene/PointCloud.tsx`), because neither is observable from a Rust test — `overview.md` §7's
-"hover → audio, < 50 ms" is stated as the whole chain, and 17 ms leaves comfortable room for
-the rest of it. There is no in-process way to measure the full chain the way Phase 7's
+`play_sample` command arriving, and it excludes the frontend's hover pick gate
+(`scene/PointCloud.tsx`'s `HoverGate`, 20 Hz when this was first written and 120 Hz now — at
+20 Hz that gate alone contributed more than everything measured here), because neither is
+observable from a Rust test — `overview.md` §7's "hover → audio, < 50 ms" is stated as the
+whole chain, and a few milliseconds leaves ample room for the rest of it. There is no in-process way to measure the full chain the way Phase 7's
 `scripts/webview_eval.swift` measures a real WKWebView frame; that would need an instrumented
 build with a real pointer event, which is a Phase 10 Instruments-pass question, not a unit
 test.

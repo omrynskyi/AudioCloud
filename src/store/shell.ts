@@ -1,45 +1,37 @@
 /**
- * Shell chrome — which overlay is open, whether the inspector is collapsed — plus the
- * debounced filter draft `panels/Search.tsx` and `panels/Filters.tsx` both write into.
+ * Shell chrome - which overlay is open - plus the debounced filter draft `panels/Search.tsx`
+ * and `panels/Tags.tsx` write into.
  *
  * The draft is split from `store/scene.ts`'s `filter` on purpose: `scene.ts`'s `filter` is
- * "what the map is currently filtered by," read by `App.tsx`'s fetch effect on every change,
- * and pushing a fresh `QueryFilter` on every keystroke of a search box would refetch on every
- * keystroke. This store holds the fields as the user is still typing/adjusting them and
- * debounces before calling `useSceneStore.getState().setFilter`.
+ * "what the map is currently filtered by," read by `Shell.tsx`'s fetch effect on every
+ * change, and pushing a fresh `QueryFilter` on every keystroke of a search box would refetch
+ * on every keystroke. This store holds the fields as the user is still typing/adjusting them
+ * and debounces before calling `useSceneStore.getState().setFilter`.
+ *
+ * **The draft is two fields now, not five.** It used to mirror most of `QueryFilter` -
+ * numeric feature ranges, file extensions, library roots - to back a panel of min/max boxes
+ * that has since been removed. The backend still accepts all of it (`NO_FILTER` fills in the
+ * rest on the way out); the *interface* only offers the two constraints anyone reaches for
+ * while browsing by ear, which is a name and a tag. Carrying draft state for controls that no
+ * longer exist is how a store quietly becomes fiction.
  */
 
 import { create } from 'zustand';
 
-import { NO_FILTER, type FeatureRange, type QueryFilter } from '../ipc';
+import { NO_FILTER, type QueryFilter } from '../ipc';
 import { useSceneStore } from './scene';
 
 const DEBOUNCE_MS = 250;
 
 export interface FilterDraft {
   text: string;
-  rootIds: number[];
   tags: string[];
-  exts: string[];
-  features: FeatureRange[];
 }
 
-const EMPTY_DRAFT: FilterDraft = {
-  text: '',
-  rootIds: [],
-  tags: [],
-  exts: [],
-  features: [],
-};
+const EMPTY_DRAFT: FilterDraft = { text: '', tags: [] };
 
 function isEmptyDraft(draft: FilterDraft): boolean {
-  return (
-    draft.text.trim() === '' &&
-    draft.rootIds.length === 0 &&
-    draft.tags.length === 0 &&
-    draft.exts.length === 0 &&
-    draft.features.length === 0
-  );
+  return draft.text.trim() === '' && draft.tags.length === 0;
 }
 
 function toQueryFilter(draft: FilterDraft): Partial<QueryFilter> {
@@ -47,36 +39,20 @@ function toQueryFilter(draft: FilterDraft): Partial<QueryFilter> {
   return {
     ...NO_FILTER,
     ...(text === '' ? {} : { text }),
-    rootIds: draft.rootIds,
     tags: draft.tags,
-    exts: draft.exts,
-    features: draft.features,
   };
 }
 
 let debounceHandle: ReturnType<typeof setTimeout> | null = null;
 
-export type ViewMode = '2d' | '3d';
-
 interface ShellState {
   settingsOpen: boolean;
-  inspectorCollapsed: boolean;
   filterDraft: FilterDraft;
-  /**
-   * Which independently-active layout the map shows — the header switcher's setting.
-   *
-   * Global UI chrome, not per-point scene data, which is why it lives here rather than in
-   * `store/scene.ts`: that store is reserved for map coloring/filter/selection intent (see
-   * its own docstring), and this is closer kin to `settingsOpen`/`inspectorCollapsed`.
-   */
-  viewMode: ViewMode;
 
   // Arrow-typed rather than method shorthand — see `store/scene.ts`'s note on
   // `@typescript-eslint/unbound-method`.
   openSettings: () => void;
   closeSettings: () => void;
-  toggleInspector: () => void;
-  setViewMode: (mode: ViewMode) => void;
 
   setDraft: (patch: Partial<FilterDraft>) => void;
   clearDraft: () => void;
@@ -84,15 +60,10 @@ interface ShellState {
 
 export const useShellStore = create<ShellState>()((set, get) => ({
   settingsOpen: false,
-  inspectorCollapsed: false,
   filterDraft: EMPTY_DRAFT,
-  viewMode: '3d',
 
   openSettings: () => set({ settingsOpen: true }),
   closeSettings: () => set({ settingsOpen: false }),
-  toggleInspector: () =>
-    set((state) => ({ inspectorCollapsed: !state.inspectorCollapsed })),
-  setViewMode: (viewMode) => set({ viewMode }),
 
   setDraft: (patch) => {
     const draft = { ...get().filterDraft, ...patch };

@@ -14,9 +14,9 @@
  *   still 50,000 points — but the fill is a few hundred pixels rather than four million,
  *   and 50,000 points through a trivial vertex shader is not what costs anything here.
  * - **On demand only.** `readRenderTargetPixels` is a synchronous `readPixels`, which
- *   drains the GPU pipeline. Once per click, at most twenty times a second on hover, and
- *   never while a drag is in progress. The async `PIXEL_PACK_BUFFER` path that removes the
- *   stall is a Phase 10 idea, and profiling should be what triggers it.
+ *   drains the GPU pipeline. Once per click, at most once per `HoverGate` interval on hover,
+ *   and never while a drag is in progress. The async `PIXEL_PACK_BUFFER` path that removes
+ *   the stall is a Phase 10 idea, and profiling should be what triggers it.
  *
  * ### What the window size buys, and what it costs
  *
@@ -245,16 +245,32 @@ export function decodePickPixel(pixels: Uint8Array, offset: number): number {
 /**
  * The hover gate: at most one pick per interval, and none at all while dragging.
  *
- * Separate from `Picker` because it is a policy, not a mechanism, and because the policy is
- * the part with a number in it that `overview.md` §5.3 fixes at "~20 Hz". Clicks do not go
- * through this — a click is a deliberate act and must never be dropped.
+ * Separate from `Picker` because it is a policy, not a mechanism. Clicks do not go through
+ * this — a click is a deliberate act and must never be dropped.
+ *
+ * ### Why the rate is a safety valve and not a budget
+ *
+ * This was ~20 Hz, and 20 Hz is the wrong number for a hover-to-audition interface. It is not
+ * that a pick is expensive; it is that the gate puts **0–50 ms of dead time in front of every
+ * hover**, before the pick, the IPC hop, the decode and the audio engine have spent anything
+ * at all — more than the entire rest of the chain put together, and the largest single term in
+ * hover-to-sound. Worse, quantizing to 20 samples a second means a cursor sweeping a cluster
+ * silently skips most of the points it crosses, which reads as an interface that is ignoring
+ * you rather than one that is merely slow.
+ *
+ * The stall the old number was defending against is real but is charged to a different
+ * account: picking is already suppressed outright during an orbit (`setDragging`), and the
+ * scene renders on demand, so a pick between drags stalls a pipeline that has nothing else
+ * queued. What is left to defend against is a pointer device reporting far faster than the
+ * display can matter — hence 120 Hz, high enough to be invisible at any real refresh rate and
+ * still a bound.
  */
 export class HoverGate {
   private lastPickAt = 0;
   private dragging = false;
   readonly intervalMs: number;
 
-  constructor(hz = 20) {
+  constructor(hz = 120) {
     this.intervalMs = 1000 / hz;
   }
 

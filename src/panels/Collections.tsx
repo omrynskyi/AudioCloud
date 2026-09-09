@@ -16,6 +16,7 @@ import {
   type Collection,
   type CollectionDetail,
 } from '../ipc';
+import { auditionProps } from '../audition';
 import { useSceneStore } from '../store/scene';
 import { EmptyState, LoadingState, PanelButton } from './StateViews';
 
@@ -144,6 +145,7 @@ export function Collections() {
                   {detail.members.map((member, i) => (
                     <li
                       key={member.sampleId}
+                      {...auditionProps(member.sampleId)}
                       draggable
                       onDragStart={(e) => e.dataTransfer.setData('text/plain', String(i))}
                       onDragOver={(e) => e.preventDefault()}

@@ -37,6 +37,7 @@ export const HEADER_BYTES = 16;
 const MAGIC = {
   pointCloud: 'ABPC',
   featureColumn: 'ABFC',
+  pointColors: 'ABPX',
   queryResult: 'ABQS',
   peaks: 'ABPK',
 } as const;
@@ -181,6 +182,54 @@ export function decodeFeatureColumn(
 
   assertAligned(HEADER_BYTES, 'the value column');
   return new Float32Array(buffer, HEADER_BYTES, count);
+}
+
+/** The active layout's fit colors: one triple per point, in the point cloud's order. */
+export interface PointColors {
+  count: number;
+  r: Float32Array;
+  g: Float32Array;
+  b: Float32Array;
+}
+
+/**
+ * Decodes an `ABPX` payload.
+ *
+ * Same shape as {@link decodeFeatureColumn} — no ids, order against the point cloud is the
+ * join, `NaN` wherever a point has none (every point, for a run whose algorithm never
+ * produces one). Pass the cloud's `count` for the same reason `decodeFeatureColumn` takes
+ * one: a mismatch means a re-fit landed between the two fetches.
+ */
+export function decodePointColors(
+  buffer: ArrayBuffer,
+  expectedCount?: number,
+): PointColors {
+  const { count } = readHeader(buffer, MAGIC.pointColors);
+  assertLength(buffer, HEADER_BYTES + count * 12, 'point colors');
+  if (expectedCount !== undefined && count !== expectedCount) {
+    throw new WireFormatError(
+      `point colors has ${count} values for a point cloud of ${expectedCount}; ` +
+        'the projection changed between the two fetches',
+    );
+  }
+
+  const r = HEADER_BYTES;
+  const g = r + count * 4;
+  const b = g + count * 4;
+  for (const [offset, name] of [
+    [r, 'the r column'],
+    [g, 'the g column'],
+    [b, 'the b column'],
+  ] as const) {
+    assertAligned(offset, name);
+  }
+
+  return {
+    count,
+    r: new Float32Array(buffer, r, count),
+    g: new Float32Array(buffer, g, count),
+    b: new Float32Array(buffer, b, count),
+  };
 }
 
 /**

@@ -66,10 +66,14 @@ const DEFAULTS = {
   // `1/260` put an ordinary point at roughly a pixel across at `framing.ts`'s default framed
   // distance — independent of library size, since both this radius and the viewing distance
   // scale with the cloud's own bounding radius — which read as "tiny" well before it read as
-  // dense. `1/190` is a real fill-rate cost at 50,000 overlapping sprites (`overview.md` §7's
-  // 60 fps target), so this is a size increase, not a decision to stop caring about that
-  // budget — re-check `npm run profile` after moving this again.
-  radiusFraction: 1 / 190,
+  // dense. `1/190` was still a dot you had to look for; `1/140` is about half again as wide,
+  // which is what makes an individual sample a thing you can aim at rather than a grain of
+  // the cloud's texture.
+  //
+  // This is a real fill-rate cost at 50,000 overlapping sprites (`overview.md` §7's 60 fps
+  // target) and the cost is quadratic in this number, not linear — re-check `npm run
+  // profile` after moving it again.
+  radiusFraction: 1 / 140,
   filteredScale: 0.42,
   filteredSaturation: 0.12,
   filteredBrightness: 0.3,
@@ -109,6 +113,16 @@ export class CloudBuffers {
   private baseColors: Float32Array;
   /** 1 where the point matches the active filter. `null` means no filter at all. */
   private mask: Uint8Array | null = null;
+  /**
+   * 1 where a hover wants the point emphasized — the hovered sample and its nearest
+   * neighbors by embedding similarity. `null` means no hover-highlight is active.
+   *
+   * A second, independent mask rather than a re-use of `mask`: the two answer different
+   * questions ("does this match the search?" vs. "is this similar to what's under the
+   * cursor?") and a hover during an active search should dim anything that fails either one,
+   * not silently override the filter.
+   */
+  private highlight: Uint8Array | null = null;
 
   private constructor(
     source: ArrayBuffer,
@@ -120,6 +134,11 @@ export class CloudBuffers {
     this.count = cloud.count;
     this.options = { ...DEFAULTS, ...options };
 
+    // The core fits the projection in 2D directly now (`projection::umap`'s `TARGET_DIM`) --
+    // `z` arrives as exactly `0.0` on every point, and there is nothing left for the client
+    // to flatten. A measured comparison against fitting in 3D and projecting down here found
+    // the client-side flatten step this replaced was a net loss on real neighbor fidelity,
+    // not just an unnecessary one -- see `TARGET_DIM`'s doc.
     this.positions = new Float32Array(this.count * 3);
     this.bounds = interleave(cloud, this.positions);
     this.pointRadius = Math.max(this.bounds.radius, 1e-6) * this.options.radiusFraction;
@@ -251,11 +270,30 @@ export class CloudBuffers {
     this.applySizes();
   }
 
+  /**
+   * Emphasizes a subset of points against everything else — the hovered sample and its
+   * nearest neighbors — or clears the highlight with `null`.
+   *
+   * Same shrink-and-desaturate treatment as `setMask`, applied over a second, independent
+   * mask: see `highlight`'s field comment for why hover-highlighting doesn't just reuse the
+   * filter mask.
+   */
+  setHighlight(highlight: Uint8Array | null): void {
+    if (highlight && highlight.length !== this.count) {
+      throw new RangeError(
+        `highlight has ${highlight.length} entries for ${this.count} points`,
+      );
+    }
+    this.highlight = highlight;
+    this.applyColors();
+    this.applySizes();
+  }
+
   private applyColors(): void {
     const { filteredSaturation, filteredBrightness } = this.options;
-    const { mask, baseColors, colors, count } = this;
+    const { mask, highlight, baseColors, colors, count } = this;
 
-    if (!mask) {
+    if (!mask && !highlight) {
       colors.set(baseColors);
     } else {
       for (let i = 0; i < count; i++) {
@@ -263,7 +301,7 @@ export class CloudBuffers {
         const r = baseColors[o] as number;
         const g = baseColors[o + 1] as number;
         const b = baseColors[o + 2] as number;
-        if (mask[i] === 1) {
+        if ((!mask || mask[i] === 1) && (!highlight || highlight[i] === 1)) {
           colors[o] = r;
           colors[o + 1] = g;
           colors[o + 2] = b;
@@ -281,12 +319,15 @@ export class CloudBuffers {
 
   private applySizes(): void {
     const { filteredScale } = this.options;
-    const { mask, sizes, pointRadius, count } = this;
-    if (!mask) {
+    const { mask, highlight, sizes, pointRadius, count } = this;
+    if (!mask && !highlight) {
       sizes.fill(pointRadius);
     } else {
       const dimmed = pointRadius * filteredScale;
-      for (let i = 0; i < count; i++) sizes[i] = mask[i] === 1 ? pointRadius : dimmed;
+      for (let i = 0; i < count; i++) {
+        const emphasized = (!mask || mask[i] === 1) && (!highlight || highlight[i] === 1);
+        sizes[i] = emphasized ? pointRadius : dimmed;
+      }
     }
     const attribute = this.geometry.getAttribute('aSize');
     if (attribute) attribute.needsUpdate = true;

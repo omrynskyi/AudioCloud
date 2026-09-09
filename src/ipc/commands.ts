@@ -20,11 +20,9 @@ import type { AppSettings } from '../bindings/AppSettings';
 import type { AudioDeviceInfo } from '../bindings/AudioDeviceInfo';
 import type { Collection } from '../bindings/Collection';
 import type { CollectionDetail } from '../bindings/CollectionDetail';
-import type { DownloadEvent } from '../bindings/DownloadEvent';
 import type { Feature } from '../bindings/Feature';
 import type { FeatureRange } from '../bindings/FeatureRange';
 import type { LibraryRoot } from '../bindings/LibraryRoot';
-import type { ModelStatus } from '../bindings/ModelStatus';
 import type { Neighbor } from '../bindings/Neighbor';
 import type { QueryFilter } from '../bindings/QueryFilter';
 import type { RefitEvent } from '../bindings/RefitEvent';
@@ -36,7 +34,9 @@ import {
   decodeFeatureColumn,
   decodeIdList,
   decodePointCloud,
+  decodePointColors,
   type PointCloud,
+  type PointColors,
 } from './binary';
 import { IpcError, toAppError } from './errors';
 
@@ -45,13 +45,12 @@ export type {
   AudioDeviceInfo,
   Collection,
   CollectionDetail,
-  DownloadEvent,
   Feature,
   FeatureRange,
   LibraryRoot,
-  ModelStatus,
   Neighbor,
   PointCloud,
+  PointColors,
   QueryFilter,
   RefitEvent,
   RefitParams,
@@ -122,22 +121,30 @@ export function cancelScan(scanId: number): Promise<void> {
 // ── The binary transports ───────────────────────────────────────────────────────
 
 /**
- * Fetches the whole active layout in one call, for one `dims` (2 or 3).
- *
- * A 2D map and a 3D map are independently-active layouts (`idx_projection_active` is scoped
- * per `dims`), so the mode switcher's current view decides which one comes back — there is
- * no single "the" active layout any more.
+ * Fetches the whole active layout in one call.
  *
  * Returns the decoded views **and** the buffer they are views onto. Hold the buffer: the
  * arrays borrow it, and a `webglcontextlost` rebuild is meant to reuse it rather than
  * refetch (`task.md` Phase 7).
  */
-export async function getPointCloud(dims: 2 | 3 = 3): Promise<{
+export async function getPointCloud(): Promise<{
   cloud: PointCloud;
   buffer: ArrayBuffer;
 }> {
-  const buffer = await invoke<ArrayBuffer>('get_point_cloud', { dims });
+  const buffer = await invoke<ArrayBuffer>('get_point_cloud');
   return { cloud: decodePointCloud(buffer), buffer };
+}
+
+/**
+ * Fetches the active layout's fit colors, in the point cloud's order.
+ *
+ * Pass the cloud's `count` to have that contract checked, same as {@link getFeatureColumn}.
+ * Every channel is `NaN` for a run whose algorithm never produced one (PCA, UMAP, or a
+ * t-SNE run from before this existed) — a real, common state, not an error.
+ */
+export async function getPointColors(expectedCount?: number): Promise<PointColors> {
+  const buffer = await invoke<ArrayBuffer>('get_point_colors');
+  return decodePointColors(buffer, expectedCount);
 }
 
 /**
@@ -235,6 +242,16 @@ export function stopPlayback(): Promise<void> {
   return invoke('stop_playback');
 }
 
+/**
+ * Warms the decode cache for a sample the user has not asked to hear yet, so that hovering it
+ * next lands on a cache hit instead of paying a cold decode. Meant for neighbors of whatever is
+ * currently hovered, not for anything the user has not shown interest in near yet -- a no-op on
+ * the Rust side until a device has actually been opened by a real `playSample` call.
+ */
+export function prefetchSample(sampleId: number): Promise<void> {
+  return invoke('prefetch_sample', { sampleId });
+}
+
 // ── Projection ──────────────────────────────────────────────────────────────────
 
 /**
@@ -255,37 +272,16 @@ export function startRefit(
   const channel = new Channel<RefitEvent>();
   channel.onmessage = onEvent;
   return invoke('start_refit', {
-    params: { algorithm: 'umap', dims: 3, forceFull: false, ...params },
+    // No `algorithm` here: omitting it lets the backend's own default apply
+    // (`RefitParams::default()`, currently t-SNE) rather than this call site pinning one
+    // that would silently outlive whichever algorithm the backend considers current.
+    params: { forceFull: false, ...params },
     onProgress: channel,
   });
 }
 
 export function cancelRefit(jobId: number): Promise<void> {
   return invoke('cancel_refit', { jobId });
-}
-
-// ── Model ───────────────────────────────────────────────────────────────────────
-
-/** Cheap enough to poll: no network, no filesystem beyond three stats, no session init. */
-export function getModelStatus(): Promise<ModelStatus> {
-  return invoke('get_model_status');
-}
-
-/**
- * Downloads and verifies the model, streaming progress.
- *
- * Resolves as soon as the download is admitted. The outcome — including a checksum
- * mismatch, which is its own `AppError` variant — arrives as the terminal event.
- */
-export function downloadModel(onEvent: (event: DownloadEvent) => void): Promise<void> {
-  const channel = new Channel<DownloadEvent>();
-  channel.onmessage = onEvent;
-  return invoke('download_model', { onProgress: channel });
-}
-
-/** Stops the download, keeping the partial so the next call resumes rather than restarts. */
-export function cancelDownload(): Promise<void> {
-  return invoke('cancel_download');
 }
 
 // ── Collections ─────────────────────────────────────────────────────────────────

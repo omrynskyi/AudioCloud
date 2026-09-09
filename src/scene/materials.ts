@@ -94,8 +94,14 @@ const DEFAULTS = {
   // comment said and being too conservative about it. Lower, so a point at its natural
   // framed size lands outside the ramp instead of at the dim end of it.
   minPointSize: 0.6,
-  farAlpha: 0.22,
-  farSizeScale: 0.55,
+  // The far side of the cloud is drawn against a grey background now rather than a
+  // near-black one (`scene/SceneCanvas.tsx`), and additive blending means a faded point is
+  // only ever *background plus a little*. At 0.22 over grey the back half of the cloud
+  // stopped reading as haze and started reading as nothing, so both the alpha a fully-faded
+  // point keeps and the size it shrinks to are raised — depth still reads, but as recession
+  // rather than as absence.
+  farAlpha: 0.34,
+  farSizeScale: 0.66,
   emphasisScale: 1.9,
 } as const;
 
@@ -124,9 +130,11 @@ export function createCloudMaterials(
     uEmphasisScale: { value: settings.emphasisScale },
     // Fraction of the sprite's radius that reads as solid before `points.frag.glsl`'s
     // falloff begins. 0.35 spent most of a small sprite's few pixels on soft edge and almost
-    // none on solid colour, which reads as a smudge rather than a point; 0.5 gives it an
-    // actual visible core at the sizes this cloud renders at in practice.
-    uCoreRadius: { value: 0.5 },
+    // none on solid colour, which reads as a smudge rather than a point; 0.5 gave it a
+    // visible core, and 0.62 is that same argument carried the rest of the way — against the
+    // lighter background a wide soft falloff is what makes a dot look like a blur, so most
+    // of the sprite is now core and only its outer third is edge.
+    uCoreRadius: { value: 0.62 },
     uRingInner: { value: 0.62 },
     uRingOuter: { value: 0.92 },
     uHoverColor: { value: new Color(0.98, 0.98, 1.0) },

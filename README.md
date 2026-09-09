@@ -1,6 +1,7 @@
 # AudioBank
 
-A spatial browser for large sample libraries. Samples are embedded with CLAP, projected to
+A spatial browser for large sample libraries. Samples are embedded with a handcrafted spectral
+fingerprint, projected to
 3D, and rendered as a point cloud you can orbit and audition.
 
 - [`overview.md`](overview.md) — the architecture.

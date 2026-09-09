@@ -6,14 +6,30 @@ import type { Algorithm } from "./Algorithm";
  */
 export type RefitParams = { algorithm: Algorithm, 
 /**
- * Which independently-active layout this re-fit builds: 2 or 3. The mode switcher's
- * current view, in practice -- "the map you build is the map you're looking at."
- */
-dims: number, 
-/**
- * UMAP's neighbourhood size. Ignored by PCA. `None` takes the vendored default.
+ * UMAP's neighbourhood size. Ignored by PCA. `None` takes the tuned default (15).
  */
 nNeighbors?: number, 
+/**
+ * How tightly points may pack (`annembed`'s `scale_rho`, by way of `min_dist`). Ignored
+ * by PCA. `None` takes the tuned default (0.01) -- see `UmapParams::min_dist`'s doc for
+ * where that number came from.
+ */
+minDist?: number, 
+/**
+ * Exponent of the embedded-space kernel (`annembed`'s `b`). Ignored by PCA. `None` takes
+ * the tuned default (0.2). Lower is tighter here, not higher -- see `UmapParams::sharpness`'s
+ * doc before nudging this away from the measured-best value.
+ */
+sharpness?: number, 
+/**
+ * Exponent of the edge weight in the original 512-dim kNN graph (`annembed`'s `beta`).
+ * Ignored by PCA. `None` takes the tuned default (1.0, `annembed`'s own).
+ */
+inputSharpness?: number, 
+/**
+ * Gradient batches. Ignored by PCA. `None` takes the tuned default (20).
+ */
+nEpochs?: number, 
 /**
  * Run a full re-fit even when the planner would have placed the new points
  * incrementally.
@@ -23,5 +39,10 @@ nNeighbors?: number,
  * accumulates drift, and the user is the one who can see that the map has gone
  * crooked. `overview.md` §3.8 says a re-fit is announced rather than silent, and this
  * is the announcement's button.
+ *
+ * **Also the only way a UMAP parameter change actually takes effect.** Incremental
+ * placement never calls the projector at all -- it barycenters new points into the
+ * existing layout -- and an unchanged library plans as `UpToDate` and refits nothing.
+ * A tuning UI that wants its sliders to do something has to set this.
  */
 forceFull: boolean, };

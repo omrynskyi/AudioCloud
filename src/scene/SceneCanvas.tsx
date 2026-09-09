@@ -24,8 +24,13 @@ import type { ReactNode } from 'react';
 
 import { PointCloud, type PointCloudProps } from './PointCloud';
 
-/** Matches `--color-canvas` in `src/styles/index.css`. */
-const CLEAR_COLOR = 0x08090b;
+/**
+ * Matches `--color-canvas` in `src/styles/index.css` — a grey rather than the near-black
+ * this started at. Blending is additive (`scene/materials.ts`), so the background is a
+ * floor the cloud only ever adds to: lifting it costs the darkest end of a ramp some
+ * contrast, which is why it is lifted to a grey and not to a light theme.
+ */
+const CLEAR_COLOR = 0x191c21;
 
 export interface SceneCanvasProps extends PointCloudProps {
   /** Overlays drawn inside the canvas element but outside the WebGL scene. */
