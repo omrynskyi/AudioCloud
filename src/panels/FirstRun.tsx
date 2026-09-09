@@ -20,12 +20,10 @@ export function FirstRun({ onComplete }: { onComplete: () => void }) {
   const [scanIndex, setScanIndex] = useState(0);
   const [error, setError] = useState<AppError | null>(null);
   const startedScanIndex = useRef<number | null>(null);
-  const mapStartedRef = useRef(false);
 
   const roots = useLibraryStore((s) => s.roots);
   const addRoot = useLibraryStore((s) => s.addRoot);
   const activeScan = useLibraryStore((s) => s.activeScan);
-  const lastScanOutcome = useLibraryStore((s) => s.lastScanOutcome);
   const startScan = useLibraryStore((s) => s.startScan);
   const activeRefit = useProjectionStore((s) => s.activeRefit);
   const lastRefitOutcome = useProjectionStore((s) => s.lastRefitOutcome);
@@ -38,34 +36,34 @@ export function FirstRun({ onComplete }: { onComplete: () => void }) {
     if (startedScanIndex.current !== scanIndex) {
       startedScanIndex.current = scanIndex;
       startScan(rootId);
-      return;
     }
-    const outcome = lastScanOutcome;
-    if (outcome?.rootId === rootId) {
+  }, [step, rootIds, scanIndex, activeScan, startScan]);
+
+  useEffect(() => {
+    // Scan completion is an external store event. Advance the wizard from that subscription
+    // rather than synchronously setting component state in a render-driven effect; the latter
+    // creates a cascading render and is exactly what React's set-state-in-effect rule rejects.
+    return useLibraryStore.subscribe((state, previous) => {
+      const outcome = state.lastScanOutcome;
+      if (outcome === previous.lastScanOutcome || step !== 'scan') return;
+      const rootId = rootIds[scanIndex];
+      if (!outcome || rootId === undefined || outcome.rootId !== rootId) return;
+
       if (outcome.status === 'failed') {
         setError(outcome.error ?? { kind: 'internal', detail: 'The scan failed.' });
         setStep('addRoots');
-      } else {
-        setScanIndex((index) => index + 1);
+        return;
       }
-      return;
-    }
 
-  }, [
-    step,
-    rootIds,
-    scanIndex,
-    activeScan,
-    lastScanOutcome,
-    startScan,
-  ]);
+      if (scanIndex + 1 < rootIds.length) {
+        setScanIndex((index) => index + 1);
+        return;
+      }
 
-  useEffect(() => {
-    if (step !== 'scan' || activeScan || scanIndex < rootIds.length || mapStartedRef.current) return;
-    mapStartedRef.current = true;
-    setStep('buildMap');
-    startRefit({ forceFull: true });
-  }, [step, activeScan, scanIndex, rootIds.length, startRefit]);
+      setStep('buildMap');
+      startRefit({ forceFull: true });
+    });
+  }, [step, rootIds, scanIndex, startRefit]);
 
   useEffect(() => {
     if (step === 'buildMap' && !activeRefit && lastRefitOutcome) onComplete();
@@ -74,7 +72,11 @@ export function FirstRun({ onComplete }: { onComplete: () => void }) {
   async function pickFolder() {
     setError(null);
     const picked = await openDialog({ directory: true, multiple: true });
-    const paths = Array.isArray(picked) ? picked : typeof picked === 'string' ? [picked] : [];
+    const paths = Array.isArray(picked)
+      ? picked
+      : typeof picked === 'string'
+        ? [picked]
+        : [];
     if (paths.length === 0) return;
 
     try {
@@ -97,7 +99,6 @@ export function FirstRun({ onComplete }: { onComplete: () => void }) {
     setError(null);
     setScanIndex(0);
     startedScanIndex.current = null;
-    mapStartedRef.current = false;
     setStep('scan');
   }
 
@@ -163,7 +164,9 @@ export function FirstRun({ onComplete }: { onComplete: () => void }) {
         {activeRefit ? (
           <p className="font-mono text-xs text-neutral-500">
             {activeRefit.progress?.phase ?? 'Preparing'}
-            {activeRefit.progress ? ` · ${activeRefit.progress.samples.toLocaleString()} samples` : ''}
+            {activeRefit.progress
+              ? ` · ${activeRefit.progress.samples.toLocaleString()} samples`
+              : ''}
           </p>
         ) : (
           <LoadingState label="Starting the map build…" />

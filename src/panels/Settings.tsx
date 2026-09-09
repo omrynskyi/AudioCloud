@@ -129,7 +129,9 @@ function ProjectionError({ error }: { error: AppError }) {
     <div className="settings-inline-error" role="alert">
       <WarningCircle size={18} weight="fill" aria-hidden="true" />
       <div className="min-w-0">
-        <p className="text-xs font-medium text-neutral-200">Not enough samples to build a map</p>
+        <p className="text-xs font-medium text-neutral-200">
+          Not enough samples to build a map
+        </p>
         <p className="mt-1 text-[11px] leading-relaxed text-neutral-500">
           {error.detail.have === 0
             ? `Scan a folder first, then add at least ${error.detail.need} embedded samples.`
