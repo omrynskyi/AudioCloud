@@ -12,10 +12,10 @@ AudioCloud processes samples locally:
 
 1. It scans a folder, identifies audio files, and extracts basic audio features.
 2. It creates a compact vector from each sample's log-mel spectrogram using AudioCloud's built-in
-   spectral fingerprint. No CLAP model or model download is required.
+   spectral fingerprint.
 3. It compares vectors with cosine similarity. The similarity value shown in the app is the cosine
    score between two normalized vectors, ranging from `-1` to `1` and displayed as a percentage.
-4. It projects the vectors into 3D with PCA or UMAP and renders the result as a point cloud.
+4. It projects the vectors into 3D with t-SNE and renders the result as a point cloud.
 
 The vectors are deterministic: the same audio content produces the same fingerprint. Similarity is
 based on spectral shape, attack, and early decay, so it is most useful for finding samples with
