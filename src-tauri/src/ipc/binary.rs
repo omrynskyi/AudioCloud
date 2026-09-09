@@ -26,9 +26,20 @@
 //!
 //! ABPC     ids u32[count], xs f32[count], ys f32[count], zs f32[count]
 //! ABFC     values f32[count], in the point cloud's order, NaN where the column is null
+//! ABPX     rs f32[count], gs f32[count], bs f32[count], in the point cloud's order, NaN
+//!          where the point has no fit color
 //! ABQS     ids u32[count], ascending
 //! ABPK     min/max f32 pairs, 2*count floats, interleaved
 //! ```
+//!
+//! **`ABPX` is its own fetch, not three more `ABPC` columns.** It carries no ids for the
+//! same reason `ABFC` doesn't -- order against the point cloud's own `ORDER BY sample_id` is
+//! the join, and a payload fetched once per map load has no more use for 200 KB of redundant
+//! ids than one fetched on every `colorBy` change does. Appending it to `ABPC` instead would
+//! have grown every point from 16 bytes to 28 and broken the 900 KB/50,000-point budget
+//! `overview.md` §7 states `ABPC` against; keeping it a same-shaped sibling of `ABFC` costs
+//! nothing when a run has no fit colors (PCA, UMAP, or before this existed) and nothing when
+//! nobody asks for it.
 //!
 //! Everything is little-endian, which is not a portability claim -- it is the only byte
 //! order Apple Silicon and `DataView`'s default disagree about, and `DataView` is what the
@@ -48,6 +59,8 @@ pub const HEADER_BYTES: usize = 16;
 pub const MAGIC_POINT_CLOUD: &[u8; 4] = b"ABPC";
 /// `get_feature_column`.
 pub const MAGIC_FEATURE_COLUMN: &[u8; 4] = b"ABFC";
+/// `get_point_colors`.
+pub const MAGIC_POINT_COLORS: &[u8; 4] = b"ABPX";
 /// `query_samples`.
 pub const MAGIC_QUERY_RESULT: &[u8; 4] = b"ABQS";
 /// The `abpeaks://` scheme's body.
@@ -119,6 +132,21 @@ pub fn feature_column(values: &[f32]) -> Vec<u8> {
     let mut buf = frame(MAGIC_FEATURE_COLUMN, values.len(), 0, values.len() * 4);
     for v in values {
         buf.extend_from_slice(&v.to_le_bytes());
+    }
+    buf
+}
+
+/// Encodes the fit-color column: three planar `f32` channels, in the point cloud's order.
+///
+/// Same shape and the same null convention as [`feature_column`] -- three of it rather than
+/// one, since a color is three numbers that arrive or go missing together, not three
+/// independent columns a caller would ever fetch separately.
+pub fn point_colors(colors: &[[f32; 3]]) -> Vec<u8> {
+    let mut buf = frame(MAGIC_POINT_COLORS, colors.len(), 0, colors.len() * 12);
+    for channel in 0..3 {
+        for c in colors {
+            buf.extend_from_slice(&c[channel].to_le_bytes());
+        }
     }
     buf
 }
@@ -278,6 +306,40 @@ mod tests {
     }
 
     #[test]
+    fn point_colors_are_three_planar_columns_in_order() {
+        let colors = [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6], [0.7, 0.8, 0.9]];
+        let buf = point_colors(&colors);
+        let h = header(&buf).unwrap();
+        assert_eq!(h.magic, MAGIC_POINT_COLORS);
+        assert_eq!(h.count, 3);
+        assert_eq!(buf.len(), HEADER_BYTES + 3 * 12);
+
+        let channel = |c: usize| {
+            let start = HEADER_BYTES + c * 3 * 4;
+            (0..3)
+                .map(|i| {
+                    let at = start + i * 4;
+                    f32::from_le_bytes(buf[at..at + 4].try_into().unwrap())
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(channel(0), vec![0.1, 0.4, 0.7]);
+        assert_eq!(channel(1), vec![0.2, 0.5, 0.8]);
+        assert_eq!(channel(2), vec![0.3, 0.6, 0.9]);
+    }
+
+    #[test]
+    fn a_point_with_no_fit_color_arrives_as_nan() {
+        let buf = point_colors(&[[1.0, 2.0, 3.0], [f32::NAN, f32::NAN, f32::NAN]]);
+        let at = |i: usize| {
+            let start = HEADER_BYTES + i * 4;
+            f32::from_le_bytes(buf[start..start + 4].try_into().unwrap())
+        };
+        assert_eq!(at(0), 1.0);
+        assert!(at(1).is_nan());
+    }
+
+    #[test]
     fn an_id_that_does_not_fit_is_an_error_rather_than_a_truncation() {
         let err = point_cloud(&[(u32::MAX as i64 + 1, [0.0; 3])]).unwrap_err();
         assert!(matches!(err, AppError::Internal(_)));
@@ -289,6 +351,7 @@ mod tests {
         for buf in [
             point_cloud(&[]).unwrap(),
             feature_column(&[]),
+            point_colors(&[]),
             id_list(&[]).unwrap(),
             peaks(&[], 0),
         ] {

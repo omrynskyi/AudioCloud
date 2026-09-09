@@ -61,6 +61,19 @@ use crate::{
     projection::{EmbeddingSet, Point3, ProjectionError, Projector},
 };
 
+/// Target dimensionality. Two: the renderer only ever shows a flat top-down map now (the
+/// orbiting 3D view was dropped).
+///
+/// Measured three ways against this app's own library, under the tuned params
+/// (`examples/retune_experiment.rs`, 5 repeats each): a native 3D fit hits 57.3%/80.0%
+/// (hit-rate@5 / hit-rate@1, see `UmapParams::sharpness`'s doc for what that means); the same
+/// 3D fit flattened to 2D client-side (the previous architecture) drops to 45.5%/68.9%; a
+/// native 2D fit gets 47.8%/69.1% -- narrowly but consistently ahead of flattening, with no
+/// overlap in the hit@5 ranges across repeats. Fitting in 3D and then discarding an axis buys
+/// nothing here: it costs the full 3D fit and still lands at or below what fitting the plane
+/// directly gets for less compute, so this fits in 2D and stops there.
+const TARGET_DIM: usize = 2;
+
 /// Rows read from the mmap before they are handed to the index and dropped.
 ///
 /// 1024 x 512 f32 is 2 MB, which is the whole transient cost of feeding a 102 MB index.
@@ -84,23 +97,50 @@ pub struct UmapParams {
     pub n_neighbors: usize,
     /// How tightly points may pack. See the module note: a monotone stand-in for
     /// `annembed`'s `scale_rho`, not Python UMAP's `min_dist`.
+    ///
+    /// Defaults to `0.01`, well below `annembed`'s own neutral point -- deliberately at the
+    /// floor [`UmapParams::scale_rho`] clamps to. Measured against this app's own library
+    /// (one-shot percussion; `retune_experiment`, five repeats per config): dropping from the
+    /// neutral `0.1` to `0.01` took "is the sample nearest a hover truly one of its 15 most
+    /// similar" from 53% to 68%. A looser embedded scale gives the fit more room to spread
+    /// dissimilar points apart instead of packing them into the same neighborhood by default.
     pub min_dist: f32,
     /// Gradient batches. `annembed`'s default is 20; the cost of the fit is close to linear
     /// in this.
     pub n_epochs: usize,
-    /// Output dimensionality: 2 or 3. The renderer draws whichever the mode switcher is
-    /// showing; the map's `dims` column and this must agree, which is the caller's job
-    /// (`commands/projection.rs` sets it from the same value it threads through `Refit`).
-    pub target_dim: usize,
+    /// Exponent of the embedded-space kernel (`annembed`'s `b`; Python UMAP derives the same
+    /// exponent from `min_dist`/`spread`). `annembed`'s own default is `1.0`.
+    ///
+    /// **Counter-intuitive, so it is worth stating plainly: lower is tighter here, not
+    /// higher.** The instinct going in was "punish weak matches harder, so only 90%+ cosine
+    /// holds a point in place" -- which reads as *raise* the exponent. Measured against this
+    /// app's own library, that was backwards: raising it steadily *hurt* neighbor fidelity
+    /// (hit-rate fell from 53% at `1.0` to 24% at `8.0`), and lowering it steadily helped.
+    /// `0.2` combined with [`Self::min_dist`]`=0.01` took "is the sample nearest a hover truly
+    /// one of its 15 most similar" from 53% to 81%, and "are its 5 closest truly in that
+    /// top-15" from 42% to 58% -- both averaged over 5 stochastic re-fits with non-overlapping
+    /// ranges against the `1.0` baseline, not a lucky seed. A harder falloff apparently makes
+    /// `annembed`'s gradient descent commit early to a coarse near/far split and stop
+    /// discriminating within "far", which is exactly the muddled middle a hover most needs
+    /// ordered correctly. See `examples/retune_experiment.rs` to re-run this against a copy of
+    /// a real library if the corpus changes shape enough to matter.
+    pub sharpness: f64,
+    /// Exponent of the edge weight in the *original* (512-dim) kNN graph (`annembed`'s
+    /// `beta`). Where `sharpness` reshapes the output kernel, this reshapes the input one --
+    /// how much more a rank-1 neighbor counts than a rank-15 one before the fit even starts.
+    /// Left at `annembed`'s own default: the same sweep found no value that beat `1.0` by
+    /// more than run-to-run noise on this corpus.
+    pub input_sharpness: f64,
 }
 
 impl Default for UmapParams {
     fn default() -> Self {
         Self {
             n_neighbors: 15,
-            min_dist: 0.1,
+            min_dist: 0.01,
             n_epochs: 20,
-            target_dim: 3,
+            sharpness: 0.2,
+            input_sharpness: 1.0,
         }
     }
 }
@@ -188,11 +228,12 @@ impl Projector for UmapProjector {
             )));
         }
 
-        let target_dim = self.params.target_dim;
         let mut params = EmbedderParams::default();
-        params.set_dim(target_dim);
+        params.set_dim(TARGET_DIM);
         params.scale_rho = self.params.scale_rho();
         params.nb_grad_batch = self.params.n_epochs.max(1);
+        params.b = self.params.sharpness;
+        params.beta = self.params.input_sharpness;
 
         EmbeddingSet::check_cancelled(cancel)?;
         let mut embedder = Embedder::new(&kgraph, params);
@@ -209,7 +250,7 @@ impl Projector for UmapProjector {
         // that looks perfectly plausible and is wired to the wrong files.
         let embedded = embedder.get_embedded_reindexed();
         let (rows, cols) = embedded.dim();
-        if rows != n || cols != target_dim {
+        if rows != n || cols != TARGET_DIM {
             return Err(ProjectionError::Umap(format!(
                 "annembed produced a {rows} x {cols} layout for {n} vectors"
             )));
@@ -217,11 +258,7 @@ impl Projector for UmapProjector {
 
         let mut points = Vec::with_capacity(n);
         for i in 0..n {
-            // A 2D fit pads z to 0.0 rather than changing what `Projector::fit_transform`
-            // returns everywhere else -- the wire format, the buffers, and Procrustes'
-            // `Point3` shape all stay exactly as they are for the 3D path.
-            let z = if target_dim >= 3 { embedded[[i, 2]] } else { 0.0 };
-            let point = [embedded[[i, 0]], embedded[[i, 1]], z];
+            let point = [embedded[[i, 0]], embedded[[i, 1]], 0.0];
             if point.iter().any(|v| !v.is_finite()) {
                 return Err(ProjectionError::Umap(format!(
                     "row {i} of the layout is not finite: {point:?}"
@@ -238,12 +275,13 @@ impl Projector for UmapProjector {
 
     fn params_json(&self) -> String {
         format!(
-            r#"{{"n_neighbors":{},"min_dist":{},"n_epochs":{},"metric":"cosine","scale_rho":{},"target_dim":{}}}"#,
+            r#"{{"n_neighbors":{},"min_dist":{},"n_epochs":{},"metric":"cosine","scale_rho":{},"sharpness":{},"input_sharpness":{}}}"#,
             self.params.n_neighbors,
             self.params.min_dist,
             self.params.n_epochs,
             self.params.scale_rho(),
-            self.params.target_dim,
+            self.params.sharpness,
+            self.params.input_sharpness,
         )
     }
 }
@@ -398,6 +436,24 @@ mod tests {
         assert!(points.iter().all(|p| p.iter().all(|v| v.is_finite())));
     }
 
+    /// `TARGET_DIM` is 2 -- the renderer only ever shows a flat map -- so `annembed` is asked
+    /// for two columns and the third coordinate must be padded to exactly `0.0`, not left at
+    /// whatever a stray write would leave it. `scene/buffers.ts` renders these coordinates
+    /// with no client-side flatten step any more, so this is the only thing standing between
+    /// a real fit and a point lifted off the plane.
+    #[test]
+    fn the_layout_is_genuinely_flat() {
+        let vectors = clustered(120, 16, 4, 11);
+        let points = projected(&UmapProjector::default(), &vectors);
+
+        for p in &points {
+            assert_eq!(
+                p[2], 0.0,
+                "a 2D fit must not write a third coordinate: {p:?}"
+            );
+        }
+    }
+
     /// Cancellation is checked at the boundaries; a token already tripped must stop before
     /// the index is built, not after the descent.
     #[test]
@@ -482,6 +538,9 @@ mod tests {
         let json = UmapProjector::default().params_json();
         assert!(json.contains(r#""n_neighbors":15"#), "{json}");
         assert!(json.contains(r#""metric":"cosine""#), "{json}");
-        assert!(json.contains(r#""scale_rho":1"#), "{json}");
+        // The tuned defaults: min_dist=0.01 clamps scale_rho to its floor, and sharpness=0.2
+        // is the measured-best output-kernel exponent -- see `UmapParams::sharpness`'s doc.
+        assert!(json.contains(r#""scale_rho":0.25"#), "{json}");
+        assert!(json.contains(r#""sharpness":0.2"#), "{json}");
     }
 }

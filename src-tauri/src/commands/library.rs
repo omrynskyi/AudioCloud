@@ -21,8 +21,10 @@ use crate::{
         events::{ScanEvent, ScanOutcome},
         types::LibraryRoot,
     },
-    model::Model,
-    pipeline::{scan_root_with, ScanOptions, ScanProgress},
+    pipeline::{
+        fingerprint_embed::FingerprintEmbedder, mel::Padding, scan_root_with, ScanOptions,
+        ScanProgress,
+    },
 };
 
 /// Registers a folder as a library root. Idempotent: an existing path returns its row.
@@ -108,9 +110,8 @@ pub async fn set_root_enabled(
 /// exists, which is one `INSERT`, so the UI gets an id to cancel with without waiting for a
 /// walk of 50,000 files.
 ///
-/// Embeds if -- and only if -- a model is installed. A missing model downgrades the scan to
-/// decode and DSP rather than failing it: a library is worth indexing before a 200 MB
-/// download finishes, and the next scan finishes what this one starts.
+/// Always embeds with [`crate::pipeline::fingerprint_embed::FingerprintEmbedder`], a
+/// downsampled log-mel image with no external model or download.
 #[tauri::command]
 pub async fn scan_library<R: tauri::Runtime>(
     app: AppHandle<R>,
@@ -146,34 +147,25 @@ pub async fn scan_library<R: tauri::Runtime>(
         // `slot` is moved in so the admission is released however this task ends.
         let _slot = slot;
         let db = app.state::<Database>();
-        let model = app.state::<Model>();
 
-        let session = match model.status() {
-            crate::model::ModelStatus::Installed => match model.session().get() {
-                Ok(session) => Some(session),
-                Err(e) => {
-                    // A session that will not build does not fail the scan. The rows land at
-                    // `decoded` and the next scan with a working session finishes them,
-                    // which is the same path a scan with no model at all takes.
-                    tracing::warn!(error = %e, "scanning without inference: the session would not build");
-                    None
+        let mut options = ScanOptions::new(&cancel)
+            .on_start(on_start)
+            .with_embedder(Arc::new(FingerprintEmbedder::new()))
+            // `ZeroPad`, not the mel front-end's `RepeatPad` default: this embedder reads
+            // an attack-and-early-decay shape from the front of the buffer, and repeat-padding
+            // a short one-shot would tile a second copy of it into that same window
+            // (`pipeline::mod::ScanOptions::with_padding`'s doc has the fuller version of
+            // this reasoning, stated for `DspEmbedder`, which needs it for the same reason).
+            .with_padding(Padding::ZeroPad)
+            .with_progress({
+                let channel = on_progress.clone();
+                move |snapshot| {
+                    // A failed send means the WebView reloaded and the receiver is gone. The
+                    // scan keeps going: its work is durable, and the reloaded page reads the
+                    // `scan_runs` row rather than the channel.
+                    let _ = channel.send(ScanEvent::Progress(snapshot));
                 }
-            },
-            _ => None,
-        };
-
-        let mut options = ScanOptions::new(&cancel).on_start(on_start).with_progress({
-            let channel = on_progress.clone();
-            move |snapshot| {
-                // A failed send means the WebView reloaded and the receiver is gone. The
-                // scan keeps going: its work is durable, and the reloaded page reads the
-                // `scan_runs` row rather than the channel.
-                let _ = channel.send(ScanEvent::Progress(snapshot));
-            }
-        });
-        if let Some(session) = session {
-            options = options.with_session(session);
-        }
+            });
         let counters = options.progress();
 
         let outcome = scan_root_with(&db, root_id, &mut options);

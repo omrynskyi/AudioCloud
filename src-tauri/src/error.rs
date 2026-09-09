@@ -23,7 +23,6 @@ use ts_rs::TS;
 use crate::{
     audio::{engine::AudioError, PlaybackError},
     db::DbError,
-    model::{download::ModelError, ModelStatus},
     pipeline::PipelineError,
     projection::ProjectionError,
 };
@@ -42,29 +41,6 @@ use crate::{
 )]
 #[ts(export_to = "AppError.ts")]
 pub enum AppError {
-    /// No model is installed, so nothing can be embedded. Recovery: download it.
-    #[error("model not installed")]
-    ModelMissing,
-
-    /// The download did not finish. Recovery depends on `resumable`, which is why it is on
-    /// the wire rather than inferred from the message: an interrupted transfer offers
-    /// "Resume", an HTTP 404 offers "Check for a newer release", and the frontend cannot
-    /// tell those apart from a string.
-    #[error("model download failed: {message}")]
-    ModelDownload { message: String, resumable: bool },
-
-    /// The downloaded bytes are not the model. Recovery: discard and re-download; the
-    /// partial is already gone.
-    #[error("checksum mismatch: expected {expected}, got {got}")]
-    ChecksumMismatch { expected: String, got: String },
-
-    /// The build has no published digest to verify a download against
-    /// (`crate::model::UNPINNED`). Recovery: none available to the user -- this is a build
-    /// that shipped without a pinned model, and saying so is more useful than offering a
-    /// download that would refuse itself.
-    #[error("model release {version} has no published checksum in this build")]
-    ModelUnpinned { version: String },
-
     /// The data layer failed in a way the user might survive by retrying.
     #[error("database error: {0}")]
     Database(String),
@@ -258,39 +234,6 @@ impl From<PlaybackError> for AppError {
     }
 }
 
-impl From<ModelError> for AppError {
-    fn from(e: ModelError) -> Self {
-        let resumable = e.is_resumable();
-        match e {
-            ModelError::ReleaseNotPinned { version } => AppError::ModelUnpinned { version },
-            ModelError::HashMismatch { expected, actual } => AppError::ChecksumMismatch {
-                expected,
-                got: actual,
-            },
-            ModelError::Cancelled { .. } => AppError::Cancelled,
-            other => AppError::ModelDownload {
-                message: other.to_string(),
-                resumable,
-            },
-        }
-    }
-}
-
-/// What a command that needs an installed model should fail with, given the model's state.
-///
-/// Two states, two different screens: "download it" is an action, "this build shipped
-/// without a pinned release" is not, and collapsing them into one error would put a button
-/// in front of the user that cannot work.
-pub fn require_model(status: ModelStatus) -> Result<(), AppError> {
-    match status {
-        ModelStatus::Installed => Ok(()),
-        ModelStatus::Downloadable => Err(AppError::ModelMissing),
-        ModelStatus::Unpinned => Err(AppError::ModelUnpinned {
-            version: crate::model::ModelRelease::CURRENT.version.to_string(),
-        }),
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -302,9 +245,6 @@ mod tests {
     /// TypeScript for the wrong wire format, so the tag itself is asserted here.
     #[test]
     fn errors_serialize_as_a_tagged_union() {
-        let json = serde_json::to_value(AppError::ModelMissing).unwrap();
-        assert_eq!(json, serde_json::json!({ "kind": "modelMissing" }));
-
         let json = serde_json::to_value(AppError::Decode {
             path: "kicks/909.wav".into(),
             reason: "the stream is damaged".into(),
@@ -339,29 +279,6 @@ mod tests {
             }),
             AppError::Database(_)
         ));
-    }
-
-    /// Cancellation is not a download failure, and the frontend must not offer "Retry" for
-    /// something the user chose.
-    #[test]
-    fn a_cancelled_download_is_cancellation() {
-        assert!(matches!(
-            AppError::from(ModelError::Cancelled { downloaded: 17 }),
-            AppError::Cancelled
-        ));
-    }
-
-    /// Resumability is a field, not a phrase inside a message.
-    #[test]
-    fn a_download_error_says_whether_resuming_would_help() {
-        let err = AppError::from(ModelError::Http {
-            status: 404,
-            url: "https://example.invalid/model.onnx".into(),
-        });
-        match err {
-            AppError::ModelDownload { resumable, .. } => assert!(!resumable),
-            other => panic!("expected a download error, got {other:?}"),
-        }
     }
 
     #[test]

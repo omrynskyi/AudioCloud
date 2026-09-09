@@ -1,7 +1,7 @@
 //! Application assembly: the Tauri builder, plugin registration, and managed state.
 //!
 //! Nothing that can block belongs here. Long-lived resources (the SQLite writer thread,
-//! the read pool, the `ort` session, the audio engine) are constructed lazily and handed
+//! the read pool, the audio engine) are constructed lazily and handed
 //! to `.manage()`; see `overview.md` §7 on keeping cold start off the critical path.
 
 pub mod audio;
@@ -9,7 +9,6 @@ pub mod commands;
 pub mod db;
 pub mod error;
 pub mod ipc;
-pub mod model;
 pub mod pipeline;
 pub mod projection;
 pub mod protocol;
@@ -22,21 +21,20 @@ use crate::{
     audio::{peaks::PeakCache, AudioPlayer},
     commands::Jobs,
     db::Database,
-    model::Model,
     protocol::peaks,
 };
 
-/// Dimensionality of a CLAP audio-tower embedding (`overview.md` §3.4).
+/// Dimensionality of the stored per-sample vector.
 ///
-/// Fixed here rather than discovered from the ONNX graph so the data layer can be built and
-/// benchmarked before the model exists (Phase 3). Phase 3's parity gate is what proves the
-/// two agree.
-pub const EMBEDDING_DIM: usize = 512;
+/// [`pipeline::fingerprint_embed::FINGERPRINT_DIM`] -- the active embedder and the width
+/// `embeddings.bin` is opened at.
+pub const EMBEDDING_DIM: usize = pipeline::fingerprint_embed::FINGERPRINT_DIM;
 
 /// The command surface (`overview.md` §6.1).
 ///
-/// Every command the frontend can call, in one list. Three of them -- `get_point_cloud`,
-/// `get_feature_column`, `query_samples` -- answer in raw bytes; the rest are JSON. Waveform
+/// Every command the frontend can call, in one list. Four of them -- `get_point_cloud`,
+/// `get_point_colors`, `get_feature_column`, `query_samples` -- answer in raw bytes; the
+/// rest are JSON. Waveform
 /// peaks are not here at all: they travel over the `abpeaks://` scheme registered below, so
 /// bulk asset traffic never competes with commands (`overview.md` §6.4).
 ///
@@ -53,6 +51,7 @@ pub fn command_handler<R: tauri::Runtime>(
         commands::library::scan_library,
         commands::library::cancel_scan,
         commands::cloud::get_point_cloud,
+        commands::cloud::get_point_colors,
         commands::cloud::get_feature_column,
         commands::cloud::query_samples,
         commands::samples::get_sample_detail,
@@ -64,6 +63,7 @@ pub fn command_handler<R: tauri::Runtime>(
         commands::samples::reveal_in_finder,
         commands::samples::play_sample,
         commands::samples::stop_playback,
+        commands::samples::prefetch_sample,
         commands::collections::create_collection,
         commands::collections::list_collections,
         commands::collections::get_collection,
@@ -72,9 +72,6 @@ pub fn command_handler<R: tauri::Runtime>(
         commands::collections::export_collection,
         commands::projection::start_refit,
         commands::projection::cancel_refit,
-        commands::model::get_model_status,
-        commands::model::download_model,
-        commands::model::cancel_download,
         commands::settings::get_settings,
         commands::settings::list_audio_devices,
         commands::settings::set_audio_device,
@@ -117,13 +114,6 @@ pub fn run() {
             let data_dir = app.path().app_data_dir()?;
             let db = Database::open(&data_dir, EMBEDDING_DIM)?;
             app.manage(db);
-
-            // Path joins and an empty cell. The model is not read, the network is not
-            // touched, and no `ort` session is built -- `overview.md` §7 budgets cold start
-            // to interactive at under two seconds *excluding* ML session init, which is
-            // only honest if init genuinely happens somewhere else. See
-            // `model::session::LazySession`.
-            app.manage(Model::new(&data_dir));
 
             // Three empty containers. `Jobs` is three mutexes; `PeakCache` holds one decoder
             // whose buffer pool allocates lazily; `AudioPlayer` holds a `LazyEngine` that does

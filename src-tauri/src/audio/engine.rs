@@ -126,11 +126,17 @@ pub struct DeviceFormat {
 
 /// Lock-free state shared between control-side callers and the real-time callback.
 ///
-/// Every field here is read or written with `Ordering::Relaxed`. Nothing in this struct
+/// Almost every field here is read or written with `Ordering::Relaxed`. Nothing in this struct
 /// publishes other memory that a `Relaxed` load would need to see correctly ordered -- the PCM
 /// bytes themselves cross the boundary through the ring buffer, whose own synchronization is
 /// what `ringbuf` provides. These atomics are control signals (which generation, how loud, is
 /// it still wanted), not a channel for data.
+///
+/// The one exception is the [`generation`](Transport::generation) /
+/// [`generation_start`](Transport::generation_start) pair, which is release/acquire: the
+/// callback reads the boundary *because* it saw the generation move, and a boundary from the
+/// generation before the one it is acting on would make it discard the wrong number of
+/// samples.
 #[derive(Debug)]
 struct Transport {
     /// Bumped by every `play_pcm` and by every stream rebuild. The audio thread treats a
@@ -158,6 +164,23 @@ struct Transport {
     first_audible_nanos: AtomicU64,
     /// Incremented on every stream (re)build. See [`DeviceFormat::epoch`].
     format_epoch: AtomicU64,
+    /// Total samples ever handed to the ring on the current stream. Written only under the
+    /// producer lock, so "the producer" here is whichever task or `play_pcm` call holds it,
+    /// and never two at once. The audio thread does not read it; [`Transport::generation_start`]
+    /// is the half of this pair that crosses to the callback.
+    pushed_total: AtomicU64,
+    /// The value of [`Transport::pushed_total`] at which the current generation's audio begins
+    /// -- everything the ring holds below this mark belongs to a clip nobody wants anymore.
+    ///
+    /// This exists because the obvious alternative is wrong. [`render`] used to answer a
+    /// generation change with `consumer.clear()`, which discards *everything* queued, including
+    /// whatever the new generation's producer had already pushed -- and since `play_pcm` now
+    /// primes the ring on the calling thread, the new generation has almost always pushed by
+    /// the time the callback next runs. The clip's own opening frames were being thrown away
+    /// and re-pushed on the next backoff tick, which is milliseconds of silence bought for
+    /// nothing. A count says exactly how much is stale, so the callback drops exactly that and
+    /// plays the rest on the very same callback.
+    generation_start: AtomicU64,
 }
 
 impl Transport {
@@ -170,6 +193,8 @@ impl Transport {
             started_at_nanos: AtomicU64::new(0),
             first_audible_nanos: AtomicU64::new(0),
             format_epoch: AtomicU64::new(0),
+            pushed_total: AtomicU64::new(0),
+            generation_start: AtomicU64::new(0),
         }
     }
 }
@@ -195,6 +220,10 @@ enum Phase {
 struct CallbackState {
     /// The last generation this callback observed, so it can detect a change on the next call.
     generation: u64,
+    /// Total samples this callback has taken out of the ring -- popped or skipped alike --
+    /// since the stream was built. Compared against [`Transport::generation_start`] to work
+    /// out how much of what the ring currently holds belongs to a superseded clip.
+    popped_total: u64,
     phase: Phase,
     envelope: f32,
     /// Whether [`Transport::first_audible_nanos`] has already been written for `generation`.
@@ -214,6 +243,7 @@ impl CallbackState {
         };
         Self {
             generation: 0,
+            popped_total: 0,
             phase: Phase::Idle,
             envelope: 0.0,
             latency_recorded: false,
@@ -239,7 +269,7 @@ fn render(
     now_nanos: impl Fn() -> u64,
 ) {
     let channels = channels.max(1);
-    let generation = transport.generation.load(Ordering::Relaxed);
+    let generation = transport.generation.load(Ordering::Acquire);
     if generation != state.generation {
         state.generation = generation;
         state.envelope = 0.0;
@@ -250,8 +280,15 @@ fn render(
         };
         state.latency_recorded = false;
         // The exclusive-owner drop: whatever the previous generation queued belongs to a clip
-        // nobody wants anymore, and this is the only place that can safely discard it.
-        consumer.clear();
+        // nobody wants anymore, and this is the only place that can safely discard it. Exactly
+        // that much and no more -- `clear()` would also swallow the frames the new generation
+        // has already pushed, which is the common case and not the rare one (see
+        // `Transport::generation_start`). `skip` drops in place without allocating.
+        let boundary = transport.generation_start.load(Ordering::Acquire);
+        let stale = boundary.saturating_sub(state.popped_total);
+        if stale > 0 {
+            state.popped_total += consumer.skip(stale as usize) as u64;
+        }
     }
 
     // The common case -- nothing has ever played -- costs one atomic load and a `fill`.
@@ -297,6 +334,7 @@ fn render(
         }
 
         let popped = consumer.pop_slice(frame);
+        state.popped_total += popped as u64;
         if popped < frame.len() {
             // An underrun during Attack/Sustain, or the tail of Release once the ring has
             // nothing left to give the fade: silence, not stale data.
@@ -532,12 +570,27 @@ impl Engine {
     /// play was assigned.
     ///
     /// `pcm` is interleaved `f32` at exactly `self.format()`'s rate and channel count --
-    /// [`crate::audio::to_device_format`] is what produces that, off this thread. Spawns the
-    /// decode-ahead push task and returns immediately; the caller does not wait for a single
-    /// frame to reach the speaker.
-    pub fn play_pcm(self: &Arc<Self>, pcm: Arc<Vec<f32>>, gain: f32) -> u64 {
+    /// [`crate::audio::to_device_format`] is what produces that, off this thread. Returns as
+    /// soon as the ring holds as much of the clip as fits; the caller never waits for a frame
+    /// to reach the speaker.
+    ///
+    /// **The first push happens here, on the caller's thread, not on the spawned task.** A
+    /// ring the callback finds empty is a callback's worth of silence -- ~5.3 ms at
+    /// [`PREFERRED_BUFFER_FRAMES`] -- and handing the very first chunk to `tokio` to deliver
+    /// meant paying that for a scheduling hop, on a path whose whole budget is a few tens of
+    /// milliseconds. A clip short enough to fit the ring outright never needs the task at all.
+    pub async fn play_pcm(self: &Arc<Self>, pcm: Arc<Vec<f32>>, gain: f32) -> u64 {
         let gain = gain.clamp(*GAIN_RANGE.start(), *GAIN_RANGE.end());
-        let generation = self.transport.generation.fetch_add(1, Ordering::AcqRel) + 1;
+
+        // Held across the whole hand-off: the boundary this generation starts at is
+        // `pushed_total` as it stands right now, and that is only true if no other pusher can
+        // move it between reading it and publishing the generation that depends on it.
+        let mut producer = self.producer.lock().await;
+
+        let boundary = self.transport.pushed_total.load(Ordering::Relaxed);
+        self.transport
+            .generation_start
+            .store(boundary, Ordering::Release);
         self.transport
             .gain_bits
             .store(gain.to_bits(), Ordering::Relaxed);
@@ -550,12 +603,30 @@ impl Engine {
         self.transport
             .started_at_nanos
             .store(self.now_nanos(), Ordering::Relaxed);
-        // Ordered last: the moment this is visible, the audio thread may start reading a
-        // generation whose gain and timestamps must already be in place.
         self.transport.want_playing.store(true, Ordering::Relaxed);
+        // Ordered last, and `Release`: the moment this is visible the audio thread acts on the
+        // new generation, and every field above -- the boundary it will discard against most of
+        // all -- must already be in place. A callback landing before this line still sees the
+        // previous generation, which merely means the outgoing clip plays one more buffer.
+        let generation = self.transport.generation.fetch_add(1, Ordering::AcqRel) + 1;
 
-        let engine = Arc::clone(self);
-        tokio::spawn(async move { engine.push_pcm(generation, pcm).await });
+        let primed = producer.push_slice(&pcm);
+        self.transport
+            .pushed_total
+            .store(boundary + primed as u64, Ordering::Relaxed);
+        drop(producer);
+
+        if primed >= pcm.len() {
+            // The whole clip is queued; there is nothing for a push task to do, and marking it
+            // finished here is what lets `render` end it rather than treating the drained ring
+            // as an underrun forever.
+            self.transport
+                .finished_generation
+                .store(generation, Ordering::Relaxed);
+        } else {
+            let engine = Arc::clone(self);
+            tokio::spawn(async move { engine.push_pcm(generation, pcm, primed).await });
+        }
         generation
     }
 
@@ -586,27 +657,36 @@ impl Engine {
         self.epoch.elapsed().as_nanos() as u64
     }
 
-    /// Pushes `pcm` into the ring in whatever chunks it accepts, stopping early if superseded
-    /// or stopped. Marks `generation` finished once every frame has been handed over -- not
-    /// once every frame has been *played*, which is [`render`]'s job to notice by draining the
-    /// ring.
-    async fn push_pcm(self: Arc<Self>, generation: u64, pcm: Arc<Vec<f32>>) {
-        let mut producer = self.producer.lock().await;
-        let mut offset = 0;
+    /// Pushes the rest of `pcm` from `from` into the ring in whatever chunks it accepts,
+    /// stopping early if superseded or stopped. Marks `generation` finished once every frame
+    /// has been handed over -- not once every frame has been *played*, which is [`render`]'s
+    /// job to notice by draining the ring.
+    ///
+    /// The producer lock is **released around the backoff sleep**, not held across it. Holding
+    /// it was the older choice and it cost a retrigger up to a whole [`PUSH_BACKOFF`] before it
+    /// could prime the ring: [`play_pcm`](Self::play_pcm) now does that priming inline, so the
+    /// lock this task is sitting on is the one thing standing between a hover and its first
+    /// audible sample. Re-checking the generation after every re-acquire is what keeps the
+    /// hand-off safe: a task that lost the ring to a newer clip notices before it pushes.
+    async fn push_pcm(self: Arc<Self>, generation: u64, pcm: Arc<Vec<f32>>, from: usize) {
+        let mut offset = from;
         while offset < pcm.len() {
-            if self.transport.generation.load(Ordering::Relaxed) != generation
-                || !self.transport.want_playing.load(Ordering::Relaxed)
             {
-                return;
+                let mut producer = self.producer.lock().await;
+                if self.transport.generation.load(Ordering::Relaxed) != generation
+                    || !self.transport.want_playing.load(Ordering::Relaxed)
+                {
+                    return;
+                }
+                let pushed = producer.push_slice(&pcm[offset..]);
+                offset += pushed;
+                if pushed > 0 {
+                    self.transport
+                        .pushed_total
+                        .fetch_add(pushed as u64, Ordering::Relaxed);
+                }
             }
-            let pushed = producer.push_slice(&pcm[offset..]);
-            offset += pushed;
-            if pushed == 0 {
-                // Held across the await deliberately: `tokio::sync::Mutex`'s guard is `Send`
-                // for exactly this, and releasing it here would let a *third*, not-yet-spawned
-                // task race this one for no benefit -- a superseding task still has to wait
-                // for a lock either way, and this keeps the wait bounded by one sleep rather
-                // than by however the runtime happens to schedule a re-lock.
+            if offset < pcm.len() {
                 tokio::time::sleep(PUSH_BACKOFF).await;
             }
         }
@@ -631,7 +711,17 @@ impl Engine {
             self.epoch,
         ) {
             Ok((stream, producer, format)) => {
-                *self.producer.lock().await = producer;
+                // Under the producer lock, and only here: a fresh ring means a fresh
+                // `CallbackState` whose `popped_total` starts at zero, so the counters the
+                // boundary handshake compares must start there too. Doing it inside
+                // `build_stream` would race a push task that is still finishing a chunk into
+                // the *old* ring and would leave `pushed_total` ahead of a consumer that has
+                // never popped anything.
+                let mut slot = self.producer.lock().await;
+                self.transport.pushed_total.store(0, Ordering::Relaxed);
+                self.transport.generation_start.store(0, Ordering::Release);
+                *slot = producer;
+                drop(slot);
                 *self
                     .stream
                     .lock()
@@ -679,12 +769,30 @@ mod tests {
         || nanos.get()
     }
 
+    /// The control-side half of starting a clip, in the same order [`Engine::play_pcm`] does
+    /// it: the generation's boundary is published *before* the generation itself, so whatever
+    /// is already in the ring is marked as belonging to the clip being superseded.
     fn playing(transport: &Transport, generation: u64, gain: f32) {
-        transport.generation.store(generation, Ordering::Relaxed);
+        transport.generation_start.store(
+            transport.pushed_total.load(Ordering::Relaxed),
+            Ordering::Release,
+        );
         transport.gain_bits.store(gain.to_bits(), Ordering::Relaxed);
         transport.want_playing.store(true, Ordering::Relaxed);
         transport.finished_generation.store(0, Ordering::Relaxed);
         transport.first_audible_nanos.store(0, Ordering::Relaxed);
+        transport.generation.store(generation, Ordering::Release);
+    }
+
+    /// A push through the producer half, keeping `pushed_total` in step the way the real
+    /// producer does. Tests that push behind `Transport`'s back describe a state the protocol
+    /// cannot reach.
+    fn push(transport: &Transport, prod: &mut RingProducer, pcm: &[f32]) -> usize {
+        let pushed = prod.push_slice(pcm);
+        transport
+            .pushed_total
+            .fetch_add(pushed as u64, Ordering::Relaxed);
+        pushed
     }
 
     /// A fresh [`CallbackState`] that has already observed `transport`'s current generation,
@@ -692,12 +800,9 @@ mod tests {
     ///
     /// In production the real-time callback runs continuously from the moment the stream opens,
     /// so by the time a decode-ahead task has anything to push, the callback has long since
-    /// caught up to the current (at-rest) generation -- the clear-on-change branch only ever
-    /// runs against an empty ring. A test that pre-fills the ring and only then calls `render`
-    /// for the first time would see that clear discard real data, which is not a bug in
-    /// `render`; it is a scenario `render` is never actually asked to handle. Priming with a
-    /// zero-length buffer reproduces the real ordering: the generation transition (and its
-    /// `consumer.clear()`) happens once, against nothing, before the caller pushes anything.
+    /// caught up to the current generation. Priming with a zero-length buffer reproduces that
+    /// ordering, so a test that then pushes and renders is measuring steady-state playback
+    /// rather than the transition -- which the two `a_new_generation_*` tests cover on purpose.
     fn primed(transport: &Transport, cons: &mut RingConsumer, sample_rate: u32) -> CallbackState {
         let mut state = CallbackState::new(sample_rate);
         render(&mut state, transport, cons, &mut [], 1, || 0);
@@ -841,11 +946,12 @@ mod tests {
     }
 
     #[test]
-    fn a_new_generation_clears_the_previous_ones_stale_audio() {
+    fn a_new_generation_drops_the_previous_ones_stale_audio() {
         let transport = Transport::new();
         let (mut prod, mut cons) = ring::ring(48_000, 1);
         // Generation 1's leftovers, still sitting in the ring.
-        prod.push_slice(&[9.0, 9.0, 9.0]);
+        playing(&transport, 1, 1.0);
+        push(&transport, &mut prod, &[9.0, 9.0, 9.0]);
 
         let mut state = CallbackState::new(48_000);
         state.generation = 1;
@@ -853,8 +959,7 @@ mod tests {
         state.envelope = 1.0;
 
         // Generation 2 has started but has not pushed anything yet.
-        transport.generation.store(2, Ordering::Relaxed);
-        transport.want_playing.store(true, Ordering::Relaxed);
+        playing(&transport, 2, 1.0);
 
         let mut out = [0.0f32];
         render(&mut state, &transport, &mut cons, &mut out, 1, || 0);
@@ -867,6 +972,41 @@ mod tests {
             state.phase,
             Phase::Attack,
             "a new generation always starts with an attack"
+        );
+    }
+
+    #[test]
+    fn a_new_generation_keeps_the_audio_it_pushed_before_the_callback_saw_it() {
+        // The retrigger race `Transport::generation_start` exists for: `play_pcm` primes the
+        // ring on its own thread, so by the time the callback notices the new generation the
+        // new clip's opening frames are already queued behind the old clip's leftovers. A
+        // blanket `clear()` here discards both, and the sound the user is waiting for starts a
+        // backoff tick late.
+        let transport = Transport::new();
+        let (mut prod, mut cons) = ring::ring(48_000, 1);
+
+        playing(&transport, 1, 1.0);
+        push(&transport, &mut prod, &[9.0, 9.0, 9.0]);
+
+        let mut state = CallbackState::new(48_000);
+        state.generation = 1;
+        state.phase = Phase::Sustain;
+        state.envelope = 1.0;
+
+        // Generation 2 claims its boundary, then primes -- `play_pcm`'s order exactly.
+        playing(&transport, 2, 1.0);
+        push(&transport, &mut prod, &[1.0, 1.0, 1.0, 1.0]);
+
+        let mut out = [0.0f32; 4];
+        render(&mut state, &transport, &mut cons, &mut out, 1, || 0);
+
+        assert!(
+            out.iter().all(|&s| s > 0.0),
+            "generation 2's primed frames must survive the transition, got {out:?}"
+        );
+        assert!(
+            cons.is_empty(),
+            "all four primed frames should have been played"
         );
     }
 

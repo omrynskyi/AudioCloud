@@ -9,11 +9,9 @@
 //!
 //! **The filter is built, not concatenated.** Every clause appends a bound parameter and
 //! every column name is a `&'static str` chosen by a `match` on an enum. Nothing the
-//! frontend sends becomes part of a statement's text, with one deliberate exception: the
-//! FTS5 `MATCH` argument, which is passed through as written so `KICK*` and `808 NOT snare`
-//! work. That argument is bound, not interpolated -- a malformed query is a
-//! `DbError::Sqlite` the search box renders as "no results", not an injection and not a
-//! panic.
+//! frontend sends becomes part of a statement's text. The FTS5 `MATCH` argument is the one
+//! piece derived from free text, and it goes through [`fts_query`] first, which is what makes
+//! typing a filename into the search box a search rather than a syntax error.
 //!
 //! [`Feature`] and [`QueryFilter`] carry their own serde and `ts-rs` derives rather than
 //! having DTO twins in `ipc::types`. They describe a *query*, not a record, and a
@@ -74,6 +72,231 @@ impl Feature {
             Feature::KeyConfidence => "f.key_confidence",
             Feature::DurationMs => "s.duration_ms",
         }
+    }
+}
+
+/// Turns what someone typed into a valid FTS5 query, or `None` if there is nothing to search
+/// for.
+///
+/// ### Why this exists
+///
+/// The text used to reach `MATCH` verbatim, on the reasoning that passing it through is what
+/// makes `KICK*` and `808 NOT snare` work. It does -- and it also makes the search box reject
+/// the most ordinary things a person can type. Measured against the development library, whose
+/// files are named like `@prodby.xero Snare - Crown.wav`:
+///
+/// | typed              | fts5 says                          |
+/// | ------------------ | ---------------------------------- |
+/// | `Snare - Crown`    | `no such column: Crown`            |
+/// | `@prodby.xero`     | `syntax error near "@"`            |
+/// | `crown.wav`        | `syntax error near "."`            |
+/// | `kic`              | 0 rows -- no prefix match          |
+///
+/// You could copy a filename out of the app's own inspector, paste it into the app's own
+/// search box, and get a syntax error. Raw passthrough is a good contract between programs and
+/// a bad one between a program and a text field, so this sits in between: punctuation becomes
+/// what fts5 already treats it as -- a separator -- and the tokens it separates are quoted, so
+/// nothing a person types can be a syntax error.
+///
+/// ### What survives
+///
+/// - **Bare words** become quoted terms, ANDed, exactly as fts5 does implicitly.
+/// - **The last word gets a `*`**, so results narrow as you type instead of appearing only on
+///   the final keystroke. `kic` finds the kicks.
+/// - **An explicit `*`** is honored wherever it appears: `kic* snare`.
+/// - **`AND` / `OR` / `NOT`**, uppercase as fts5 requires, stay operators -- so `808 NOT snare`
+///   still means what it did. Lowercase `and` is a word someone might be searching for, and is
+///   treated as one. A dangling or doubled operator is dropped rather than becoming an error.
+/// - **Double quotes** stay a phrase, and are the escape hatch from the automatic `*`:
+///   `"kick"` is the exact word, `kick` is the prefix.
+///
+/// Everything else -- `@`, `.`, `-`, `(`, an unclosed quote -- is a separator, because that is
+/// what `unicode61` made of it when the document was indexed. Searching for punctuation cannot
+/// match anything, so dropping it loses nothing and buys a box that never errors.
+pub fn fts_query(text: &str) -> Option<String> {
+    let mut pieces: Vec<Piece> = Vec::new();
+    for word in split_words(text) {
+        if !word.quoted {
+            if let Some(op) = as_operator(&word.text) {
+                pieces.push(Piece::Operator(op));
+                continue;
+            }
+        }
+        // Splitting on "not alphanumeric" is the same cut `unicode61` makes, near enough: a
+        // token that survives here is a token the index holds, and one that does not could not
+        // have matched anything anyway.
+        let tokens: Vec<&str> = word
+            .text
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|t| !t.is_empty())
+            .collect();
+        if tokens.is_empty() {
+            continue;
+        }
+
+        if word.quoted {
+            // Order matters inside quotes -- that is the entire difference between a phrase
+            // and a bag of words, and the reason someone reached for the quotes.
+            pieces.push(Piece::Term {
+                text: format!(
+                    "\"{}\"{}",
+                    tokens.join(" "),
+                    if word.starred { "*" } else { "" }
+                ),
+                auto_prefixable: false,
+            });
+            continue;
+        }
+
+        for (token_index, token) in tokens.iter().enumerate() {
+            let ends_word = token_index == tokens.len() - 1;
+            let starred = ends_word && word.starred;
+            pieces.push(Piece::Term {
+                text: format!("\"{token}\"{}", if starred { "*" } else { "" }),
+                auto_prefixable: ends_word && !starred,
+            });
+        }
+    }
+
+    drop_dangling_operators(&mut pieces);
+
+    // The automatic prefix goes on the last surviving *term*, which is not always the last
+    // word: half of `808 NOT snare` is `808 NOT`, and the token the cursor sits after there is
+    // `808`. Applying it before the dangling operators were dropped put the prefix on nothing.
+    if let Some(Piece::Term {
+        text,
+        auto_prefixable: true,
+    }) = pieces.last_mut()
+    {
+        text.push('*');
+    }
+
+    if pieces.is_empty() {
+        return None;
+    }
+    Some(
+        pieces
+            .iter()
+            .map(|p| match p {
+                Piece::Operator(op) => *op,
+                Piece::Term { text, .. } => text.as_str(),
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
+/// A term or an operator, kept apart so [`drop_dangling_operators`] can tell them apart after
+/// the fact -- a term's text is already quoted by then and would be ambiguous to re-inspect.
+enum Piece {
+    Operator(&'static str),
+    Term {
+        /// Already quoted, and carrying an explicit `*` if the user typed one.
+        text: String,
+        /// Eligible for the automatic trailing `*` if it ends up being the last term. False
+        /// for a phrase (quotes are how you opt out) and for a term that is starred already.
+        auto_prefixable: bool,
+    },
+}
+
+/// One whitespace- or quote-delimited chunk of what was typed, before tokenization.
+struct Word {
+    text: String,
+    /// Came from inside double quotes: a phrase, and exempt from the automatic prefix.
+    quoted: bool,
+    /// Was followed by `*`.
+    starred: bool,
+}
+
+/// Splits on whitespace, keeping a double-quoted span together as one word.
+///
+/// Nothing here can fail, including on input fts5 would reject. An unclosed quote closes at the
+/// end of the input; a `*` with nothing before it marks the previous word instead of erroring;
+/// stray punctuation rides along inside a word and is dropped later by tokenization.
+fn split_words(text: &str) -> Vec<Word> {
+    let mut words: Vec<Word> = Vec::new();
+    let mut buf = String::new();
+    let mut quoted = false;
+
+    for c in text.chars() {
+        match c {
+            '"' => {
+                if !buf.is_empty() {
+                    words.push(Word {
+                        text: std::mem::take(&mut buf),
+                        quoted,
+                        starred: false,
+                    });
+                }
+                quoted = !quoted;
+            }
+            '*' if !quoted => {
+                if !buf.is_empty() {
+                    words.push(Word {
+                        text: std::mem::take(&mut buf),
+                        quoted: false,
+                        starred: true,
+                    });
+                } else if let Some(last) = words.last_mut() {
+                    // `"a b"*` -- the star trails the phrase that just closed.
+                    last.starred = true;
+                }
+            }
+            c if c.is_whitespace() && !quoted => {
+                if !buf.is_empty() {
+                    words.push(Word {
+                        text: std::mem::take(&mut buf),
+                        quoted: false,
+                        starred: false,
+                    });
+                }
+            }
+            c => buf.push(c),
+        }
+    }
+    if !buf.is_empty() {
+        words.push(Word {
+            text: buf,
+            quoted,
+            starred: false,
+        });
+    }
+    words
+}
+
+/// `AND`, `OR` and `NOT` are operators only in the uppercase spelling fts5 itself requires.
+/// Lowercase `and` is a word, and someone searching a library of loops for `kick and snare`
+/// means three words, not a boolean.
+fn as_operator(word: &str) -> Option<&'static str> {
+    match word {
+        "AND" => Some("AND"),
+        "OR" => Some("OR"),
+        "NOT" => Some("NOT"),
+        _ => None,
+    }
+}
+
+/// Removes operators that have nothing on one side of them -- leading, trailing, or doubled.
+///
+/// Every one of those is a syntax error in fts5 and all three are states a half-typed query
+/// passes through: `kick NOT` exists for as long as it takes to type the next word. Dropping
+/// them keeps the results showing what the finished part of the query asks for, rather than
+/// blanking the panel until the sentence is complete.
+fn drop_dangling_operators(pieces: &mut Vec<Piece>) {
+    let mut previous_was_term = false;
+    pieces.retain(|piece| match piece {
+        Piece::Term { .. } => {
+            previous_was_term = true;
+            true
+        }
+        Piece::Operator(_) => {
+            let keep = previous_was_term;
+            previous_was_term = false;
+            keep
+        }
+    });
+    while matches!(pieces.last(), Some(Piece::Operator(_))) {
+        pieces.pop();
     }
 }
 
@@ -153,19 +376,17 @@ pub fn sample_ids(conn: &Connection, filter: &QueryFilter) -> Result<Vec<i64>, D
     }
     sql.push_str("\n         WHERE 1 = 1");
 
-    if let Some(text) = filter
-        .text
-        .as_deref()
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-    {
+    // `fts_query` rather than the text as typed -- see its doc comment for the syntax errors
+    // that passthrough handed to anyone who typed a filename. `None` means nothing searchable
+    // was typed (an empty box, or only punctuation), which is not a constraint.
+    if let Some(query) = filter.text.as_deref().and_then(fts_query) {
         // A subquery rather than a join: `samples_fts` is contentless, its `rowid` is the
         // sample id, and `IN` over a MATCH lets SQLite run the FTS scan once instead of
         // once per candidate row.
         sql.push_str(
             "\n           AND s.id IN (SELECT rowid FROM samples_fts WHERE samples_fts MATCH ?)",
         );
-        params.push(Value::Text(text.to_string()));
+        params.push(Value::Text(query));
     }
 
     push_in_list(
@@ -293,5 +514,167 @@ fn too_many(what: &'static str, count: usize) -> DbError {
         what,
         count,
         max: MAX_IN_LIST,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    #[test]
+    fn a_bare_word_becomes_a_quoted_prefix_term() {
+        // The prefix is the whole point of the last token: `kic` has to find the kicks while
+        // the user is still typing, not only once they reach the `k`.
+        assert_eq!(fts_query("kic").as_deref(), Some("\"kic\"*"));
+        assert_eq!(fts_query("kick snare").as_deref(), Some("\"kick\" \"snare\"*"));
+    }
+
+    #[test]
+    fn punctuation_is_a_separator_not_a_syntax_error() {
+        // Every one of these was an fts5 error before, and every one is something a person
+        // types when the files are named `@prodby.xero Snare - Crown.wav`.
+        assert_eq!(
+            fts_query("@prodby.xero").as_deref(),
+            Some("\"prodby\" \"xero\"*")
+        );
+        assert_eq!(fts_query("crown.wav").as_deref(), Some("\"crown\" \"wav\"*"));
+        assert_eq!(
+            fts_query("Snare - Crown").as_deref(),
+            Some("\"Snare\" \"Crown\"*")
+        );
+    }
+
+    #[test]
+    fn operators_survive_but_only_in_the_spelling_fts5_uses() {
+        assert_eq!(
+            fts_query("808 NOT snare").as_deref(),
+            Some("\"808\" NOT \"snare\"*")
+        );
+        // Lowercase `and` is a word someone could be searching for, not a boolean.
+        assert_eq!(
+            fts_query("kick and snare").as_deref(),
+            Some("\"kick\" \"and\" \"snare\"*")
+        );
+    }
+
+    #[test]
+    fn a_half_typed_boolean_does_not_blank_the_results() {
+        // Each of these is a state `808 NOT snare` passes through on the way to being typed,
+        // and each is a syntax error if handed to fts5 as-is.
+        assert_eq!(fts_query("kick NOT").as_deref(), Some("\"kick\"*"));
+        assert_eq!(fts_query("NOT kick").as_deref(), Some("\"kick\"*"));
+        assert_eq!(fts_query("kick AND OR snare").as_deref(), Some("\"kick\" AND \"snare\"*"));
+        assert_eq!(fts_query("NOT").as_deref(), None);
+    }
+
+    #[test]
+    fn quotes_are_a_phrase_and_the_way_out_of_the_automatic_prefix() {
+        assert_eq!(fts_query("\"kick\"").as_deref(), Some("\"kick\""));
+        assert_eq!(
+            fts_query("\"deep kick\"").as_deref(),
+            Some("\"deep kick\"")
+        );
+        // An unclosed quote is what every phrase search looks like halfway through typing it.
+        assert_eq!(fts_query("\"deep kick").as_deref(), Some("\"deep kick\""));
+    }
+
+    #[test]
+    fn an_explicit_star_is_honored_wherever_it_falls() {
+        assert_eq!(fts_query("kic* snare").as_deref(), Some("\"kic\"* \"snare\"*"));
+    }
+
+    #[test]
+    fn nothing_searchable_is_not_a_constraint() {
+        assert_eq!(fts_query(""), None);
+        assert_eq!(fts_query("   "), None);
+        // Punctuation cannot match a token, so a box holding only punctuation is an empty box.
+        assert_eq!(fts_query("--- ... @"), None);
+    }
+
+    /// The index as `V7__fts_index_path.sql` builds it, with two rows shaped like the
+    /// development library's.
+    fn indexed() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE samples_fts USING fts5(
+                 filename, path, tags, content = '',
+                 tokenize = \"unicode61 remove_diacritics 2\");",
+        )
+        .unwrap();
+        let rows = [
+            (
+                1i64,
+                "@prodby.xero Snare - Crown.wav",
+                "[FREE VERSION] @PRODBY.XERO UK UNDERGROUND DRUM KIT/Snares/@prodby.xero Snare - Crown.wav",
+            ),
+            (
+                2,
+                "@prodby.xero Kick - Apex.wav",
+                "[FREE VERSION] @PRODBY.XERO UK UNDERGROUND DRUM KIT/Kicks/@prodby.xero Kick - Apex.wav",
+            ),
+        ];
+        for (id, filename, path) in rows {
+            conn.execute(
+                "INSERT INTO samples_fts (rowid, filename, path, tags) VALUES (?1, ?2, ?3, '')",
+                (id, filename, path),
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    fn hits(conn: &Connection, typed: &str) -> Vec<i64> {
+        let Some(query) = fts_query(typed) else {
+            return Vec::new();
+        };
+        conn.prepare("SELECT rowid FROM samples_fts WHERE samples_fts MATCH ?1 ORDER BY rowid")
+            .unwrap()
+            .query_map([query], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<i64>>>()
+            .expect("a sanitized query must never be a syntax error")
+    }
+
+    #[test]
+    fn a_folder_name_finds_what_is_filed_under_it() {
+        // The whole reason V7 exists: `Kicks/` is where the kicks are, and before the `path`
+        // column no query could reach it.
+        let conn = indexed();
+        assert_eq!(hits(&conn, "kicks"), [2]);
+        assert_eq!(hits(&conn, "snares"), [1]);
+        assert_eq!(hits(&conn, "underground"), [1, 2]);
+    }
+
+    #[test]
+    fn a_filename_pasted_back_into_the_box_finds_its_own_file() {
+        // Copying a name out of the inspector and pasting it into search was a syntax error.
+        let conn = indexed();
+        assert_eq!(hits(&conn, "@prodby.xero Snare - Crown.wav"), [1]);
+    }
+
+    #[test]
+    fn nothing_a_person_can_type_reaches_fts5_as_an_error() {
+        let conn = indexed();
+        for typed in [
+            "@prodby.xero",
+            "crown.wav",
+            "Snare - Crown",
+            "kick NOT",
+            "NOT kick",
+            "(kick",
+            "kick)",
+            "\"unclosed",
+            "* ",
+            "^kick",
+            "kick:snare",
+            "a OR OR b",
+            "---",
+            "808 NOT snare",
+        ] {
+            // `hits` unwraps the query, so a syntax error fails the test by name.
+            let _ = hits(&conn, typed);
+        }
     }
 }

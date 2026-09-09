@@ -261,3 +261,17 @@ pub async fn stop_playback(player: State<'_, Arc<AudioPlayer>>) -> Result<(), Ap
     player.stop()?;
     Ok(())
 }
+
+/// Warms the decode cache for a sample the user has not asked to hear yet -- typically a
+/// neighbor of whatever they are currently hovering, so that hovering it next is a cache hit
+/// instead of a cold decode. A no-op, not an error, if no device has been opened yet or the
+/// sample is gone; see [`AudioPlayer::prefetch`] for why.
+#[tauri::command]
+pub async fn prefetch_sample(
+    player: State<'_, Arc<AudioPlayer>>,
+    db: State<'_, Database>,
+    sample_id: i64,
+) -> Result<(), AppError> {
+    player.prefetch(&db, sample_id).await?;
+    Ok(())
+}

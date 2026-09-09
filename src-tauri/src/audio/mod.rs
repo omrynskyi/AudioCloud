@@ -21,7 +21,10 @@ pub mod ring;
 use std::{
     collections::{HashMap, VecDeque},
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
@@ -43,10 +46,14 @@ pub use engine::{list_output_devices, AudioDeviceInfo};
 /// reasoning; it applies identically here.
 const RESAMPLE_CHUNK: usize = 1024;
 
-/// Device-formatted PCM buffers held at once. Small: each entry is at most ten seconds of
-/// stereo `f32` at a typical interface's rate (≈3.8 MB), and a listening session touches a
-/// handful of samples in quick succession, not hundreds.
-const PCM_CACHE_ENTRIES: usize = 24;
+/// Total device-formatted PCM held at once, in bytes. A byte budget rather than an entry count
+/// because an entry's size is not fixed: it is at most ten seconds of `f32` at the *device's*
+/// rate and channel count, and that varies by an order of magnitude across real interfaces --
+/// ~1.9 MB for ten seconds mono at 48 kHz, ~15.4 MB for ten seconds stereo at 192 kHz. An entry
+/// count sized safely for the low end wastes most of a small library's cache headroom on a
+/// typical setup; sized safely for the high end, it lets a pro interface's cache balloon past
+/// what was actually budgeted. A byte budget means what it says regardless of the device.
+const PCM_CACHE_BYTE_BUDGET: usize = 1024 * 1024 * 1024;
 
 /// What can go wrong turning a `sample_id` into sound.
 #[derive(Debug, thiserror::Error)]
@@ -65,12 +72,14 @@ pub enum PlaybackError {
 
 /// A session's worth of pre-decoded buffers, keyed to the format they were built for.
 ///
-/// FIFO with a cap, exactly like `peaks::PeakCache`'s `Entries` -- see that module for why a
-/// true LRU is not worth the extra bookkeeping at this entry count and this access pattern.
+/// FIFO with a byte budget, exactly like `peaks::PeakCache`'s `Entries` is a FIFO with an entry
+/// cap -- see that module for why a true LRU is not worth the extra bookkeeping at this access
+/// pattern. The budget is what differs: see [`PCM_CACHE_BYTE_BUDGET`] for why bytes, not count.
 #[derive(Debug, Default)]
 struct PcmCache {
     by_key: HashMap<(i64, u64), Arc<Vec<f32>>>,
     order: VecDeque<(i64, u64)>,
+    total_bytes: usize,
 }
 
 impl PcmCache {
@@ -80,12 +89,26 @@ impl PcmCache {
 
     fn insert(&mut self, sample_id: i64, format_epoch: u64, pcm: Arc<Vec<f32>>) {
         let key = (sample_id, format_epoch);
-        if self.by_key.insert(key, pcm).is_none() {
+        let bytes = std::mem::size_of_val(pcm.as_slice());
+        if let Some(previous) = self.by_key.insert(key, pcm) {
+            // Re-inserting a key already at the back of `order` (a re-decode after a device
+            // format change bumped the epoch, keyed fresh) would otherwise double-count it.
+            self.total_bytes -= std::mem::size_of_val(previous.as_slice());
+        } else {
             self.order.push_back(key);
         }
-        while self.order.len() > PCM_CACHE_ENTRIES {
+        self.total_bytes += bytes;
+
+        // The just-inserted entry is always the newest and is never the one popped here: it
+        // sits at the back of `order`, and the loop only ever removes from the front. A single
+        // entry larger than the whole budget is kept anyway -- rejecting it would mean refusing
+        // to cache (and eventually refusing to play) a sample for being itself, not for
+        // crowding anything else out.
+        while self.total_bytes > PCM_CACHE_BYTE_BUDGET && self.order.len() > 1 {
             if let Some(evicted) = self.order.pop_front() {
-                self.by_key.remove(&evicted);
+                if let Some(pcm) = self.by_key.remove(&evicted) {
+                    self.total_bytes -= std::mem::size_of_val(pcm.as_slice());
+                }
             }
         }
     }
@@ -150,6 +173,16 @@ impl LazyEngine {
     }
 }
 
+/// Which decode lane a request runs on. See [`AudioPlayer::prefetch_decoder`] for why there
+/// are two rather than one shared lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lane {
+    /// A hover or a click: someone is waiting to hear this.
+    Play,
+    /// Warming the cache for something nobody has asked for yet.
+    Prefetch,
+}
+
 /// Turns sample ids into sound: decode, resample and channel-format for the output device,
 /// cache, and hand the result to the [`Engine`].
 ///
@@ -158,12 +191,31 @@ impl LazyEngine {
 /// and building one per hover would allocate megabytes on a cursor sweep.
 pub struct AudioPlayer {
     lazy: LazyEngine,
+    /// The decode lane a real [`play`](AudioPlayer::play) uses, and nothing else.
     decoder: Mutex<Decoder>,
+    /// A second, identical lane used only by [`prefetch`](AudioPlayer::prefetch).
+    ///
+    /// One shared `Mutex<Decoder>` meant a hover could arrive one instruction after a
+    /// prefetch took the lock and then wait out that prefetch's entire decode -- measured at
+    /// up to 32 ms on this library, on the one path where milliseconds are the whole point.
+    /// Warming the cache must never be able to delay the sound the user is waiting for, and a
+    /// second decoder (one more pooled window, ~1.9 MB) is a cheaper way to guarantee that
+    /// than any priority scheme over a single lock.
+    prefetch_decoder: Mutex<Decoder>,
     /// One cached resampler, keyed by the device rate it was built for. A single slot rather
     /// than a map like `Decoder`'s: the device's output rate does not vary per file the way a
-    /// library's source rates do, so there is only ever one rate worth caching against.
+    /// library's source rates do, so there is only ever one rate worth caching against. One
+    /// per decode lane, for the same reason the decoders are split.
     resampler: Mutex<Option<(u32, Async<f32>)>>,
+    prefetch_resampler: Mutex<Option<(u32, Async<f32>)>>,
     cache: Mutex<PcmCache>,
+    /// Bumped at the start of every [`AudioPlayer::play`] call. A decode that finishes after a
+    /// *later* call has already started reads back something other than the sequence it was
+    /// given and drops its result instead of playing it -- without this, two hovers close
+    /// enough together that the first is still decoding when the second lands can finish in
+    /// either order, and a slow first decode completing after a fast second one would silently
+    /// override the sound the user is actually still hovering with a stale one.
+    request_seq: AtomicU64,
 }
 
 impl Default for AudioPlayer {
@@ -177,8 +229,11 @@ impl AudioPlayer {
         Self {
             lazy: LazyEngine::new(),
             decoder: Mutex::new(Decoder::new(BufferPool::for_decode())),
+            prefetch_decoder: Mutex::new(Decoder::new(BufferPool::for_decode())),
             resampler: Mutex::new(None),
+            prefetch_resampler: Mutex::new(None),
             cache: Mutex::new(PcmCache::default()),
+            request_seq: AtomicU64::new(0),
         }
     }
 
@@ -195,29 +250,90 @@ impl AudioPlayer {
         sample_id: i64,
         gain: f32,
     ) -> Result<(), PlaybackError> {
-        // The database is checked before the device is opened, deliberately: a bad id is the
-        // common shape of "the frontend is holding a stale selection," and answering it must
-        // not depend on -- or pay the cost of -- a machine having audio hardware at all.
-        let conn = db.read()?;
-        let row =
-            queries::sample_row(&conn, sample_id)?.ok_or(PlaybackError::NotFound(sample_id))?;
-        drop(conn);
+        // Claimed before anything else so that every call, including this one, has a
+        // strict order to be judged against -- see `request_seq`'s doc comment.
+        let my_seq = self.request_seq.fetch_add(1, Ordering::AcqRel) + 1;
 
         let engine = self.lazy.get()?;
         let format = engine.format();
 
-        let pcm = match self
+        // The cache is consulted before the database, not after. A warm hover -- which, once
+        // the background sweep has run, is nearly every hover -- has no use for the row: the
+        // path in it was already turned into device-format PCM, and the sample cannot have
+        // gone missing in a way that matters to a buffer already decoded. Fetching it anyway
+        // put a pool checkout and a query on the one path that is supposed to be nothing but a
+        // lookup and a hand-off to the engine.
+        let cached = self
             .cache
             .lock()
             .ok()
-            .and_then(|c| c.get(sample_id, format.epoch))
-        {
+            .and_then(|c| c.get(sample_id, format.epoch));
+
+        let pcm = match cached {
             Some(pcm) => pcm,
-            None => self.decode_for(row, format).await?,
+            None => {
+                // Cold: now the row is genuinely needed. A bad id is the common shape of "the
+                // frontend is holding a stale selection," and this is where it surfaces.
+                let conn = db.read()?;
+                let row = queries::sample_row(&conn, sample_id)?
+                    .ok_or(PlaybackError::NotFound(sample_id))?;
+                drop(conn);
+                self.decode_for(row, format, Lane::Play).await?
+            }
         };
 
-        let generation = engine.play_pcm(pcm, gain);
+        // A later call already claimed a higher sequence number while this one was decoding
+        // (or even just doing the DB lookup): that later call is what the user is actually
+        // hovering now, and it will already have played or is about to. Playing this one too
+        // would either glitch over it or, worse, win the engine's own generation race and
+        // replace the sound the user expects with a stale one.
+        if self.request_seq.load(Ordering::Acquire) != my_seq {
+            return Ok(());
+        }
+
+        let generation = engine.play_pcm(pcm, gain).await;
         log_latency(&engine, generation, sample_id);
+        Ok(())
+    }
+
+    /// Decodes and caches `sample_id` without playing it, so that a later [`play`](Self::play)
+    /// for the same sample is a cache hit instead of a cold decode.
+    ///
+    /// Only does anything once a device is already open. Prefetching must never be what opens
+    /// one -- that would mean hovering near a sample (not even playing one) triggers the same
+    /// device-permission and hardware-wake cost as pressing play, which is not a trade a mere
+    /// hover should be able to make. Once the user has played anything at all, though, the
+    /// device is already open and warming its neighbors costs nothing extra.
+    pub async fn prefetch(
+        self: &Arc<Self>,
+        db: &Database,
+        sample_id: i64,
+    ) -> Result<(), PlaybackError> {
+        if !self.lazy.is_initialized() {
+            return Ok(());
+        }
+        let engine = self.lazy.get()?;
+        let format = engine.format();
+
+        let already_cached = self
+            .cache
+            .lock()
+            .ok()
+            .is_some_and(|c| c.get(sample_id, format.epoch).is_some());
+        if already_cached {
+            return Ok(());
+        }
+
+        let conn = db.read()?;
+        let row = match queries::sample_row(&conn, sample_id)? {
+            Some(row) => row,
+            // A neighbor that no longer exists is not this call's problem to report --
+            // prefetching is a best-effort warm-up, not a request the user is waiting on.
+            None => return Ok(()),
+        };
+        drop(conn);
+
+        self.decode_for(row, format, Lane::Prefetch).await?;
         Ok(())
     }
 
@@ -245,6 +361,7 @@ impl AudioPlayer {
         self: &Arc<Self>,
         row: queries::SampleRow,
         format: DeviceFormat,
+        lane: Lane,
     ) -> Result<Arc<Vec<f32>>, PlaybackError> {
         let sample_id = row.id;
         let path = row.absolute_path();
@@ -253,7 +370,7 @@ impl AudioPlayer {
 
         let this = Arc::clone(self);
         let pcm = tokio::task::spawn_blocking(move || {
-            this.decode_and_format(&path, &ext, &rel_path, format)
+            this.decode_and_format(&path, &ext, &rel_path, format, lane)
         })
         .await
         .map_err(|e| {
@@ -275,9 +392,15 @@ impl AudioPlayer {
         ext: &str,
         rel_path: &str,
         format: DeviceFormat,
+        lane: Lane,
     ) -> Result<Vec<f32>, PlaybackError> {
+        let (decoder, resampler) = match lane {
+            Lane::Play => (&self.decoder, &self.resampler),
+            Lane::Prefetch => (&self.prefetch_decoder, &self.prefetch_resampler),
+        };
+
         let decoded = {
-            let mut decoder = self.decoder.lock().map_err(|_| {
+            let mut decoder = decoder.lock().map_err(|_| {
                 PlaybackError::Device(AudioError::Stream("the decoder is poisoned".into()))
             })?;
             decoder
@@ -285,7 +408,7 @@ impl AudioPlayer {
                 .map_err(|e| decode_error(rel_path, e))?
         };
 
-        let mut resampler = self.resampler.lock().map_err(|_| {
+        let mut resampler = resampler.lock().map_err(|_| {
             PlaybackError::Device(AudioError::Stream("the resampler is poisoned".into()))
         })?;
         to_device_format(&decoded.samples, format, &mut resampler)
@@ -490,17 +613,47 @@ mod tests {
     }
 
     #[test]
-    fn pcm_cache_evicts_oldest_first() {
+    fn pcm_cache_evicts_oldest_first_once_over_budget() {
+        // Entries sized so five of them exceed the budget but four do not, forcing exactly
+        // one eviction on the fifth insert.
+        let entry_bytes = PCM_CACHE_BYTE_BUDGET / 4 + 1;
+        let entry_len = entry_bytes / std::mem::size_of::<f32>();
         let mut cache = PcmCache::default();
-        for id in 0..(PCM_CACHE_ENTRIES as i64 + 5) {
-            cache.insert(id, 1, Arc::new(vec![0.0]));
+        for id in 0..5 {
+            cache.insert(id, 1, Arc::new(vec![0.0; entry_len]));
         }
-        assert_eq!(cache.by_key.len(), PCM_CACHE_ENTRIES);
+        assert_eq!(cache.by_key.len(), 4, "one eviction should have made room");
         assert!(
             cache.get(0, 1).is_none(),
             "the oldest entry should have been evicted"
         );
-        assert!(cache.get(PCM_CACHE_ENTRIES as i64 + 4, 1).is_some());
+        assert!(cache.get(4, 1).is_some(), "the newest entry must survive");
+        assert!(
+            cache.total_bytes <= PCM_CACHE_BYTE_BUDGET,
+            "total_bytes should track what is actually cached"
+        );
+    }
+
+    #[test]
+    fn pcm_cache_keeps_a_single_entry_larger_than_the_whole_budget() {
+        // A ten-minute ambience bed at a high sample rate can exceed the budget on its own;
+        // it must still play, not be silently refused caching.
+        let huge = PCM_CACHE_BYTE_BUDGET / std::mem::size_of::<f32>() + 1;
+        let mut cache = PcmCache::default();
+        cache.insert(1, 1, Arc::new(vec![0.0; huge]));
+        assert!(cache.get(1, 1).is_some());
+    }
+
+    #[test]
+    fn pcm_cache_re_inserting_a_key_does_not_double_count_its_bytes() {
+        let mut cache = PcmCache::default();
+        cache.insert(1, 1, Arc::new(vec![0.0; 100]));
+        let after_first = cache.total_bytes;
+        cache.insert(1, 1, Arc::new(vec![0.0; 100]));
+        assert_eq!(
+            cache.total_bytes, after_first,
+            "replacing an existing key's PCM should not grow total_bytes"
+        );
     }
 
     #[test]

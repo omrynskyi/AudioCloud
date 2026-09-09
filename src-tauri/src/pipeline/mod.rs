@@ -32,6 +32,7 @@ pub mod decode;
 pub mod dsp_embed;
 pub mod embed;
 pub mod features;
+pub mod fingerprint_embed;
 pub mod mel;
 pub mod progress;
 pub mod walk;
@@ -53,7 +54,6 @@ use crate::{
         queries, Database, DbError, EmbeddingLoc, NewSample, SampleFeatures, SampleStatus,
         ScanCounts, ScanStatus,
     },
-    model::session::ModelSession,
     pipeline::mel::Padding,
 };
 
@@ -142,10 +142,7 @@ impl CancellationToken {
 /// every call site again.
 pub struct ScanOptions<'a> {
     cancel: &'a CancellationToken,
-    /// What turns a spectrogram into a vector. `dyn` rather than a concrete session
-    /// because CLAP is not the only answer: `dsp_embed::DspEmbedder` implements the same
-    /// trait at a ten-thousandth of the cost, and `tests/evaluation.rs` exists to find out
-    /// which one a drum library is actually better served by.
+    /// What turns a spectrogram into a vector.
     embedder: Option<Arc<dyn Embed>>,
     padding: Padding,
     batch: BatchConfig,
@@ -193,12 +190,7 @@ impl<'a> ScanOptions<'a> {
         }
     }
 
-    /// Attaches the CLAP session, turning this into a full five-stage scan.
-    pub fn with_session(self, session: Arc<ModelSession>) -> Self {
-        self.with_embedder(session)
-    }
-
-    /// Attaches any embedder. The model is one; `dsp_embed::DspEmbedder` is another.
+    /// Attaches an embedder, turning this into a full five-stage scan.
     pub fn with_embedder(mut self, embedder: Arc<dyn Embed>) -> Self {
         self.embedder = Some(embedder);
         self
@@ -206,8 +198,6 @@ impl<'a> ScanOptions<'a> {
 
     /// Chooses what the mel front-end does with audio shorter than its ten-second window.
     ///
-    /// [`Padding::RepeatPad`] is CLAP's own and is what the parity gate is stated against,
-    /// so it is the default and must stay so for any scan feeding the model.
     /// [`Padding::ZeroPad`] is for embedders that measure the envelope, where tiling a
     /// 200 ms kick twenty-five times would manufacture a decay the file does not have.
     pub fn with_padding(mut self, padding: Padding) -> Self {

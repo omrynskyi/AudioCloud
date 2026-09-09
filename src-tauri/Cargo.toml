@@ -46,29 +46,8 @@ rayon = "1.12.0"
 realfft = "3.5.0"
 ebur128 = "0.1.10"
 crossbeam-channel = "0.5.16"
+tokio = { version = "1.49.0", features = ["rt", "sync", "time"] }
 symphonia = { version = "0.6.1", features = ["aac", "alac", "isomp4", "mp3", "aiff", "caf"] }
-
-# Model provisioning (overview.md 3.5). `stream` is the feature that makes the download
-# resumable: without it `reqwest` only yields a whole body, and materializing a whole
-# 200 MB body is precisely what this download must never do.
-reqwest = { version = "0.13.4", default-features = false, features = [
-  "rustls",
-  "http2",
-  "system-proxy",
-  "stream",
-] }
-sha2 = "0.11.0"
-futures-util = { version = "0.3.31", default-features = false, features = ["std"] }
-# Tauri already depends on tokio; naming it here is about features, not about the version.
-# `fs` for the async file handle the download writes through, `io-util` for `write_all`,
-# `time` for the progress throttle, `rt`/`sync` so the download can be driven from a test
-# without an `AppHandle`.
-tokio = { version = "1.49.0", features = ["fs", "io-util", "rt", "sync", "time"] }
-
-# Inference (overview.md 3.4). **Pinned exactly** -- cross-cutting rule 7. `ort` is a
-# release candidate whose API moves between rcs, which is why `model/session.rs` is the
-# only file in the crate permitted to name an `ort` type: an upgrade has one blast radius.
-ort = { version = "=2.0.0-rc.13", features = ["coreml"] }
 
 # Projection (overview.md 3.7). `nalgebra` is the small, boring half: PCA's eigenproblem
 # and Procrustes' 3x3 SVD, both dense and both deterministic.
@@ -99,6 +78,7 @@ hnsw_rs = "0.3.4"
 ts-rs = "12.0.1"
 cpal = "0.18"
 ringbuf = "0.5"
+bhtsne = "0.7.12"
 
 # One FFI call: `pthread_set_qos_class_self_np`, so a background re-fit is genuinely
 # background and not merely called that. `overview.md` §3.8 asks for "low priority" and on

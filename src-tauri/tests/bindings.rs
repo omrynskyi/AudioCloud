@@ -32,10 +32,10 @@ use ts_rs::{Config, TS};
 use audiobank_lib::{
     error::AppError,
     ipc::{
-        events::{DownloadEvent, RefitEvent, ScanEvent},
+        events::{RefitEvent, ScanEvent},
         types::{
             AppSettings, AudioDeviceInfo, Collection, CollectionDetail, Feature, LibraryRoot,
-            ModelStatus, Neighbor, QueryFilter, RefitParams, SampleDetail, Tag,
+            Neighbor, QueryFilter, RefitParams, SampleDetail, Tag,
         },
         BINDINGS_DIR,
     },
@@ -62,11 +62,9 @@ fn export_bindings() {
     AppSettings::export_all(&cfg).unwrap();
     Feature::export_all(&cfg).unwrap();
     QueryFilter::export_all(&cfg).unwrap();
-    ModelStatus::export_all(&cfg).unwrap();
     RefitParams::export_all(&cfg).unwrap();
     ScanEvent::export_all(&cfg).unwrap();
     RefitEvent::export_all(&cfg).unwrap();
-    DownloadEvent::export_all(&cfg).unwrap();
 }
 
 /// A 64-bit integer must land as `number`, not `bigint`.
@@ -86,6 +84,5 @@ fn sixty_four_bit_ids_are_typed_as_numbers() {
 #[test]
 fn the_error_type_is_a_discriminated_union() {
     let ts = AppError::export_to_string(&Config::new()).unwrap();
-    assert!(ts.contains(r#"{ "kind": "modelMissing" }"#), "{ts}");
     assert!(ts.contains(r#""kind": "internal""#), "{ts}");
 }

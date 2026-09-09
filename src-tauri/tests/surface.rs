@@ -21,7 +21,6 @@ use audiobank_lib::{
     commands::Jobs,
     db::{Database, NewSample, SampleStatus},
     ipc::binary,
-    model::Model,
 };
 use serde_json::json;
 use tauri::{
@@ -38,14 +37,11 @@ const DIM: usize = 8;
 fn app() -> (TempDir, WebviewWindow<tauri::test::MockRuntime>) {
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open(dir.path(), DIM).unwrap();
-    let model = Model::new(dir.path());
-
     let app = mock_builder()
         .invoke_handler(audiobank_lib::command_handler())
         .build(mock_context(noop_assets()))
         .unwrap();
     app.manage(db);
-    app.manage(model);
     app.manage(Jobs::new());
     app.manage(PeakCache::new());
     app.manage(Arc::new(AudioPlayer::new()));
@@ -118,7 +114,7 @@ fn seed(webview: &WebviewWindow<tauri::test::MockRuntime>, count: usize) -> Vec<
 
     let run = db
         .writer()
-        .begin_projection_run("pca", "{}", count as i64, 3)
+        .begin_projection_run("pca", "{}", count as i64)
         .unwrap();
     let points: Vec<(i64, [f32; 3])> = ids
         .iter()
@@ -137,11 +133,34 @@ fn the_point_cloud_arrives_as_raw_bytes_through_a_real_invoke() {
     let (_dir, webview) = app();
     let ids = seed(&webview, 32);
 
-    let bytes = raw_of(invoke(&webview, "get_point_cloud", json!({ "dims": 3 })).unwrap());
+    let bytes = raw_of(invoke(&webview, "get_point_cloud", json!({})).unwrap());
     let header = binary::header(&bytes).unwrap();
     assert_eq!(header.magic, binary::MAGIC_POINT_CLOUD);
     assert_eq!(header.count, ids.len());
     assert_eq!(bytes.len(), binary::HEADER_BYTES + ids.len() * 16);
+}
+
+/// A run with no fit colors -- every one seeded by [`seed`], which only ever calls
+/// `set_projection_points` -- answers with a full-length column of NaN, not an empty one or
+/// an error. That is what lets the frontend treat "no fit colors yet" identically to "this
+/// point has none", one NaN check instead of two code paths.
+#[test]
+fn point_colors_are_nan_for_a_run_that_never_set_any() {
+    let (_dir, webview) = app();
+    let ids = seed(&webview, 24);
+
+    let bytes = raw_of(invoke(&webview, "get_point_colors", json!({})).unwrap());
+    let header = binary::header(&bytes).unwrap();
+    assert_eq!(header.magic, binary::MAGIC_POINT_COLORS);
+    assert_eq!(header.count, ids.len());
+    assert_eq!(bytes.len(), binary::HEADER_BYTES + ids.len() * 12);
+
+    let first = f32::from_le_bytes(
+        bytes[binary::HEADER_BYTES..binary::HEADER_BYTES + 4]
+            .try_into()
+            .unwrap(),
+    );
+    assert!(first.is_nan());
 }
 
 /// The other two byte transports, including the `Feature` enum arriving as its camelCase
@@ -294,30 +313,12 @@ fn a_blank_name_is_an_invalid_argument_and_says_which_field() {
 fn an_empty_library_answers_rather_than_failing() {
     let (_dir, webview) = app();
 
-    let bytes = raw_of(invoke(&webview, "get_point_cloud", json!({ "dims": 3 })).unwrap());
+    let bytes = raw_of(invoke(&webview, "get_point_cloud", json!({})).unwrap());
     assert_eq!(bytes.len(), binary::HEADER_BYTES);
     assert_eq!(binary::header(&bytes).unwrap().count, 0);
 
     let roots = json_of(invoke(&webview, "list_library_roots", json!({})).unwrap());
     assert_eq!(roots, json!([]));
-}
-
-/// The model status command must not build the session. Cold start to interactive is
-/// budgeted excluding session init (`overview.md` §7), which is only honest if a status badge
-/// cannot trigger it.
-#[test]
-fn asking_for_the_model_status_does_not_build_a_session() {
-    let (_dir, webview) = app();
-
-    let status = json_of(invoke(&webview, "get_model_status", json!({})).unwrap());
-    assert_eq!(status["sessionReady"], json!(false));
-    assert_eq!(status["state"], json!("downloadable"));
-    assert!(status["version"].is_string());
-
-    assert!(
-        !webview.state::<Model>().session().is_initialized(),
-        "a status call built the ort session"
-    );
 }
 
 /// Cancelling something that is not running is not an error: the frontend cancelling a scan
@@ -327,7 +328,6 @@ fn cancelling_nothing_is_not_an_error() {
     let (_dir, webview) = app();
     assert!(invoke(&webview, "cancel_scan", json!({ "scanId": 1 })).is_ok());
     assert!(invoke(&webview, "cancel_refit", json!({ "jobId": 1 })).is_ok());
-    assert!(invoke(&webview, "cancel_download", json!({})).is_ok());
 }
 
 /// A root has to exist before it can be scanned, and the refusal has to be the typed one.
@@ -361,6 +361,7 @@ fn every_command_in_the_surface_is_reachable() {
         "scan_library",
         "cancel_scan",
         "get_point_cloud",
+        "get_point_colors",
         "get_feature_column",
         "query_samples",
         "get_sample_detail",
@@ -380,9 +381,6 @@ fn every_command_in_the_surface_is_reachable() {
         "stop_playback",
         "start_refit",
         "cancel_refit",
-        "get_model_status",
-        "download_model",
-        "cancel_download",
         "get_settings",
         "list_audio_devices",
         "set_audio_device",

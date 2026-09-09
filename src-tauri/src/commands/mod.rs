@@ -9,7 +9,6 @@
 pub mod cloud;
 pub mod collections;
 pub mod library;
-pub mod model;
 pub mod projection;
 pub mod samples;
 pub mod settings;
@@ -41,7 +40,6 @@ pub struct Jobs {
 struct Inner {
     scan: Mutex<Option<Running>>,
     refit: Mutex<Option<Running>>,
-    download: Mutex<Option<CancellationToken>>,
     /// Source of job ids for work whose real database id does not exist yet. See
     /// [`Jobs::begin_refit`].
     next_job_id: AtomicI64,
@@ -74,7 +72,6 @@ pub struct JobSlot {
 enum JobKind {
     Scan,
     Refit,
-    Download,
 }
 
 impl Drop for JobSlot {
@@ -83,11 +80,6 @@ impl Drop for JobSlot {
         match self.kind {
             JobKind::Scan => clear(&inner.scan),
             JobKind::Refit => clear(&inner.refit),
-            JobKind::Download => {
-                if let Ok(mut slot) = inner.download.lock() {
-                    *slot = None;
-                }
-            }
         }
     }
 }
@@ -210,48 +202,7 @@ impl Jobs {
         Ok(())
     }
 
-    /// Admits the model download. There is only one model, so there is no id to match on.
-    pub fn begin_download(&self) -> Result<(CancellationToken, JobSlot), AppError> {
-        let mut slot = self
-            .inner
-            .download
-            .lock()
-            .map_err(|_| AppError::internal("locking the download slot", "poisoned"))?;
-        if slot.is_some() {
-            // Not an error the user needs a dialog for: they pressed the button twice, and
-            // the download they wanted is running. Reported as `Cancelled` would be a lie,
-            // so this is the one place a duplicate request is simply refused with the
-            // reason.
-            return Err(AppError::Unavailable {
-                feature: "a second model download while one is running".into(),
-            });
-        }
-
-        let cancel = CancellationToken::new();
-        *slot = Some(cancel.clone());
-        Ok((
-            cancel,
-            JobSlot {
-                jobs: self.clone(),
-                kind: JobKind::Download,
-            },
-        ))
-    }
-
-    /// Stops the running download, keeping its `.partial` so the next call resumes.
-    pub fn cancel_download(&self) -> Result<(), AppError> {
-        let slot = self
-            .inner
-            .download
-            .lock()
-            .map_err(|_| AppError::internal("locking the download slot", "poisoned"))?;
-        if let Some(cancel) = slot.as_ref() {
-            cancel.cancel();
-        }
-        Ok(())
-    }
-
-    /// Whether a scan, re-fit or download is running.
+    /// Whether a scan or re-fit is running.
     ///
     /// What `settings::reset_database` refuses to run over: deleting the database out from
     /// under a job that is mid-write would not just fail that job, it would race the delete
@@ -259,13 +210,7 @@ impl Jobs {
     pub fn any_running(&self) -> bool {
         let scan = self.inner.scan.lock().map(|s| s.is_some()).unwrap_or(true);
         let refit = self.inner.refit.lock().map(|s| s.is_some()).unwrap_or(true);
-        let download = self
-            .inner
-            .download
-            .lock()
-            .map(|s| s.is_some())
-            .unwrap_or(true);
-        scan || refit || download
+        scan || refit
     }
 }
 
@@ -313,16 +258,6 @@ mod tests {
         assert!(!cancel.is_cancelled(), "cancelled the wrong scan");
         jobs.cancel_scan(7).unwrap();
         assert!(cancel.is_cancelled());
-    }
-
-    /// A scan and a download are unrelated jobs and must not block each other -- a library
-    /// is worth indexing before a 200 MB download finishes.
-    #[test]
-    fn unrelated_jobs_do_not_block_each_other() {
-        let jobs = Jobs::new();
-        let (_scan, _scan_slot) = jobs.begin_scan().unwrap();
-        let (_dl, _dl_slot) = jobs.begin_download().unwrap();
-        let (_job_id, _refit, _refit_slot) = jobs.begin_refit().unwrap();
     }
 
     #[test]

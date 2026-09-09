@@ -20,6 +20,7 @@ pub mod incremental;
 pub mod pca;
 pub mod procrustes;
 pub mod refit;
+pub mod tsne;
 pub mod umap;
 
 use crate::{
@@ -31,9 +32,10 @@ pub use incremental::{place_incremental, IncrementalReport};
 pub use pca::PcaProjector;
 pub use procrustes::Alignment;
 pub use refit::{
-    plan, refit, refit_at_low_priority, Plan, Refit, RefitPhase, RefitProgress, RefitReport,
-    RefitSnapshot,
+    plan, refit, refit_at_low_priority, ColorFit, Plan, Refit, RefitPhase, RefitProgress,
+    RefitReport, RefitSnapshot,
 };
+pub use tsne::{fit_color, TsneParams, TsneProjector};
 pub use umap::{UmapParams, UmapProjector};
 
 /// Coordinates are three floats. Named so the intent survives a signature change.

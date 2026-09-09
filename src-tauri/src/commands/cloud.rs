@@ -33,14 +33,30 @@ use crate::{
 /// a real state with a real screen behind it, and `NoProjection` would make the renderer
 /// treat "no map yet" as a failure.
 #[tauri::command]
-pub async fn get_point_cloud(db: State<'_, Database>, dims: u8) -> Result<Response, AppError> {
+pub async fn get_point_cloud(db: State<'_, Database>) -> Result<Response, AppError> {
     let conn = db.read()?;
-    let points = queries::active_projection_points(&conn, i64::from(dims))?;
+    let points = queries::active_projection_points(&conn)?;
     drop(conn);
 
     let buf = binary::point_cloud(&points)?;
     tracing::debug!(points = points.len(), bytes = buf.len(), "point cloud");
     Ok(Response::new(buf))
+}
+
+/// The active layout's fit colors, in the point cloud's order.
+///
+/// One triple per point, same length and order as [`get_point_cloud`] -- NaN in every
+/// channel wherever a point has none, which is every point of a run whose algorithm never
+/// produces one (PCA, UMAP, or a t-SNE run from before this existed) and not an error: a map
+/// with no fit colors is a real state, and the frontend's fallback to a flat default color is
+/// what "no such thing" looks like on screen.
+#[tauri::command]
+pub async fn get_point_colors(db: State<'_, Database>) -> Result<Response, AppError> {
+    let conn = db.read()?;
+    let colors = queries::active_projection_colors(&conn)?;
+    drop(conn);
+
+    Ok(Response::new(binary::point_colors(&colors)))
 }
 
 /// One scalar column over the active layout, in the point cloud's order.

@@ -239,54 +239,19 @@ pub struct AppSettings {
 
 pub use crate::db::search::{Feature, FeatureRange, QueryFilter};
 
-/// What `get_model_status` reports, without touching the network or the graph.
-#[derive(Debug, Clone, Serialize, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export_to = "ModelStatus.ts")]
-pub struct ModelStatus {
-    /// Model version, independent of the app's.
-    pub version: String,
-    pub state: ModelState,
-    /// Where an installed model lives, or would.
-    pub path: String,
-    /// Size of the published asset, when the release records one.
-    pub total_bytes: Option<u64>,
-    /// Bytes already on disk in the `.partial`, so a first-run screen can offer "Resume"
-    /// with a number on it rather than "Download" for the third time.
-    pub downloaded_bytes: Option<u64>,
-    /// Whether the `ort` session has been built. Reported, never *caused*: cold start is
-    /// budgeted at under two seconds excluding session init (`overview.md` §7), and a
-    /// status call that forced the session would spend that budget on a progress badge.
-    pub session_ready: bool,
-}
-
-/// The three states of [`crate::model::ModelStatus`], as a TypeScript union.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export_to = "ModelState.ts")]
-pub enum ModelState {
-    Installed,
-    Downloadable,
-    /// This build shipped without a published digest; nothing is fetchable.
-    Unpinned,
-}
-
-impl From<crate::model::ModelStatus> for ModelState {
-    fn from(s: crate::model::ModelStatus) -> Self {
-        match s {
-            crate::model::ModelStatus::Installed => ModelState::Installed,
-            crate::model::ModelStatus::Downloadable => ModelState::Downloadable,
-            crate::model::ModelStatus::Unpinned => ModelState::Unpinned,
-        }
-    }
-}
-
 /// Which projector a re-fit should use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "Algorithm.ts")]
 pub enum Algorithm {
-    /// `annembed`'s UMAP over an HNSW graph. The default, and the slow one.
+    /// Barnes-Hut t-SNE (`projection::tsne`). The default now: measured against this app's
+    /// own library, it roughly doubled on-screen neighbor accuracy over UMAP under UMAP's
+    /// own tuned defaults (`TsneParams`'s doc has the numbers) -- not a marginal win, a
+    /// different algorithm outright suiting this material better.
+    Tsne,
+    /// `annembed`'s UMAP over an HNSW graph. Kept as a selectable alternative, not the
+    /// fallback -- PCA is, for both -- because a wholesale win on one library is evidence,
+    /// not a proof it holds for every one.
     Umap,
     /// Deterministic, seconds rather than minutes, and always available as the fallback.
     Pca,
@@ -298,12 +263,26 @@ pub enum Algorithm {
 #[ts(export_to = "RefitParams.ts")]
 pub struct RefitParams {
     pub algorithm: Algorithm,
-    /// Which independently-active layout this re-fit builds: 2 or 3. The mode switcher's
-    /// current view, in practice -- "the map you build is the map you're looking at."
-    pub dims: u8,
-    /// UMAP's neighbourhood size. Ignored by PCA. `None` takes the vendored default.
+    /// UMAP's neighbourhood size. Ignored by PCA. `None` takes the tuned default (15).
     #[ts(optional)]
     pub n_neighbors: Option<usize>,
+    /// How tightly points may pack (`annembed`'s `scale_rho`, by way of `min_dist`). Ignored
+    /// by PCA. `None` takes the tuned default (0.01) -- see `UmapParams::min_dist`'s doc for
+    /// where that number came from.
+    #[ts(optional)]
+    pub min_dist: Option<f32>,
+    /// Exponent of the embedded-space kernel (`annembed`'s `b`). Ignored by PCA. `None` takes
+    /// the tuned default (0.2). Lower is tighter here, not higher -- see `UmapParams::sharpness`'s
+    /// doc before nudging this away from the measured-best value.
+    #[ts(optional)]
+    pub sharpness: Option<f64>,
+    /// Exponent of the edge weight in the original 512-dim kNN graph (`annembed`'s `beta`).
+    /// Ignored by PCA. `None` takes the tuned default (1.0, `annembed`'s own).
+    #[ts(optional)]
+    pub input_sharpness: Option<f64>,
+    /// Gradient batches. Ignored by PCA. `None` takes the tuned default (20).
+    #[ts(optional)]
+    pub n_epochs: Option<usize>,
     /// Run a full re-fit even when the planner would have placed the new points
     /// incrementally.
     ///
@@ -312,15 +291,23 @@ pub struct RefitParams {
     /// accumulates drift, and the user is the one who can see that the map has gone
     /// crooked. `overview.md` §3.8 says a re-fit is announced rather than silent, and this
     /// is the announcement's button.
+    ///
+    /// **Also the only way a UMAP parameter change actually takes effect.** Incremental
+    /// placement never calls the projector at all -- it barycenters new points into the
+    /// existing layout -- and an unchanged library plans as `UpToDate` and refits nothing.
+    /// A tuning UI that wants its sliders to do something has to set this.
     pub force_full: bool,
 }
 
 impl Default for RefitParams {
     fn default() -> Self {
         Self {
-            algorithm: Algorithm::Umap,
-            dims: 3,
+            algorithm: Algorithm::Tsne,
             n_neighbors: None,
+            min_dist: None,
+            sharpness: None,
+            input_sharpness: None,
+            n_epochs: None,
             force_full: false,
         }
     }

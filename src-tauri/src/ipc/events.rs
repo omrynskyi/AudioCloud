@@ -153,47 +153,6 @@ pub struct RefitFinished {
     pub error: Option<AppError>,
 }
 
-/// What the model download streams back (`overview.md` §3.5).
-#[derive(Debug, Clone, Serialize, TS)]
-#[serde(tag = "event", rename_all = "camelCase")]
-#[ts(export_to = "DownloadEvent.ts")]
-pub enum DownloadEvent {
-    Progress(DownloadProgressEvent),
-    Finished(DownloadFinished),
-}
-
-/// Bytes so far, and the total when the server admits to one.
-///
-/// `total` is `None` for a chunked response, and the first-run screen has to render that
-/// as a live byte count rather than a bar stuck at zero -- which is why it is an `Option`
-/// on the wire and not a hopeful guess made in Rust.
-#[derive(Debug, Clone, Copy, Serialize, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export_to = "DownloadProgressEvent.ts")]
-pub struct DownloadProgressEvent {
-    pub downloaded: u64,
-    pub total: Option<u64>,
-}
-
-impl From<crate::model::download::DownloadProgress> for DownloadProgressEvent {
-    fn from(p: crate::model::download::DownloadProgress) -> Self {
-        Self {
-            downloaded: p.downloaded,
-            total: p.total,
-        }
-    }
-}
-
-/// The terminal event of a download.
-#[derive(Debug, Clone, Serialize, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export_to = "DownloadFinished.ts")]
-pub struct DownloadFinished {
-    /// Where the verified model landed, on success.
-    pub path: Option<String>,
-    pub error: Option<AppError>,
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -265,15 +224,4 @@ mod tests {
         assert!(json["outcome"].is_null());
     }
 
-    #[test]
-    fn a_download_with_no_declared_total_says_so_rather_than_guessing() {
-        let json = serde_json::to_value(DownloadEvent::Progress(DownloadProgressEvent {
-            downloaded: 1024,
-            total: None,
-        }))
-        .unwrap();
-        assert_eq!(json["event"], "progress");
-        assert_eq!(json["downloaded"], 1024);
-        assert!(json["total"].is_null());
-    }
 }

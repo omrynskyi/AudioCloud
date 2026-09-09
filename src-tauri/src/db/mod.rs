@@ -21,6 +21,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use rusqlite::OptionalExtension;
+
 pub use embeddings::{EmbeddingLoc, EmbeddingMatrix, EmbeddingStore};
 pub use pool::{ReadConn, ReadPool};
 pub use writer::WriterHandle;
@@ -331,6 +333,7 @@ pub fn prepare_data_dir(dir: &Path) -> Result<(), DbError> {
 /// `refinery_schema_history` and skips them on the next run.
 fn run_migrations(db_path: &Path) -> Result<(), DbError> {
     let mut conn = pool::open_write_connection(db_path)?;
+    reconcile_legacy_v7(&mut conn)?;
     let report = embedded::migrations::runner().run(&mut conn)?;
 
     let applied = report.applied_migrations();
@@ -342,6 +345,88 @@ fn run_migrations(db_path: &Path) -> Result<(), DbError> {
         }
     }
 
+    Ok(())
+}
+
+/// Repairs exactly one historical migration-file edit before asking refinery to validate the
+/// migration chain.
+///
+/// V7 was applied on a development build while it created the original three-column FTS table.
+/// Its file was then extended in place with `contentless_delete` and a cleanup trigger. Refinery
+/// rightly refuses to continue when an applied migration's checksum no longer matches, but the
+/// correct data repair is forward-only: V8 rebuilds the index with the new definition. This small
+/// bridge updates *only* that known history row, and only after proving the database still has the
+/// original V7 table and lacks the new trigger. It never touches `samples` or any user metadata.
+fn reconcile_legacy_v7(conn: &mut rusqlite::Connection) -> Result<(), DbError> {
+    const VERSION: i32 = 7;
+    const LEGACY_CHECKSUM: &str = "11538323785542997172";
+
+    // A brand-new database has no refinery history yet. Let refinery create it while
+    // applying V1 instead of treating that normal first-run state as a failed repair.
+    let has_history: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'refinery_schema_history')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_history {
+        return Ok(());
+    }
+
+    let Some(current_checksum) = embedded::migrations::runner()
+        .get_migrations()
+        .iter()
+        .find(|migration| migration.version() == VERSION)
+        .map(|migration| migration.checksum().to_string())
+    else {
+        // The embedded list is compile-time generated. This is defensive only: without V7,
+        // there is no checksum that could be reconciled, so refinery should report its normal
+        // missing-migration error below.
+        return Ok(());
+    };
+
+    let applied_checksum: Option<String> = conn
+        .query_row(
+            "SELECT checksum FROM refinery_schema_history WHERE version = ?1",
+            [VERSION],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if applied_checksum.as_deref() != Some(LEGACY_CHECKSUM) {
+        return Ok(());
+    }
+
+    let table_sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'samples_fts'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let trigger_exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = 'samples_fts_delete')",
+        [],
+        |row| row.get(0),
+    )?;
+
+    let is_original_v7 = table_sql.as_deref().is_some_and(|sql| {
+        sql.contains("filename")
+            && sql.contains("path")
+            && sql.contains("tags")
+            && sql.contains("content = ''")
+            && !sql.contains("contentless_delete")
+    });
+    if !is_original_v7 || trigger_exists {
+        return Ok(());
+    }
+
+    conn.execute(
+        "UPDATE refinery_schema_history SET checksum = ?1 WHERE version = ?2 AND checksum = ?3",
+        (&current_checksum, VERSION, LEGACY_CHECKSUM),
+    )?;
+    tracing::warn!(
+        version = VERSION,
+        "reconciled legacy V7 migration history; V8 will rebuild the FTS index"
+    );
     Ok(())
 }
 
@@ -418,8 +503,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            applied_first, 3,
-            "V1, V2, and V3 should be the only migrations so far"
+            applied_first, 8,
+            "V1 through V8 should be the only migrations so far"
         );
         assert_eq!(
             applied_first, applied_second,
@@ -435,6 +520,67 @@ mod tests {
             )
             .unwrap();
         assert_eq!(tables, 1);
+    }
+
+    #[test]
+    fn legacy_v7_history_is_reconciled_before_v8_rebuilds_fts() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = Database::open(dir.path(), TEST_DIM).unwrap();
+        first.shutdown();
+        drop(first);
+
+        // Recreate the exact V7 state that escaped into the local development database:
+        // its history checksum predates the later contentless-delete revision, and the table
+        // has the original path index without a deletion trigger.
+        let db_path = dir.path().join(DB_FILENAME);
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "
+            DROP TRIGGER samples_fts_delete;
+            DROP TABLE samples_fts;
+            CREATE VIRTUAL TABLE samples_fts USING fts5(
+                filename,
+                path,
+                tags,
+                content = '',
+                tokenize = \"unicode61 remove_diacritics 2\"
+            );
+            DELETE FROM refinery_schema_history WHERE version = 8;
+            UPDATE refinery_schema_history
+            SET checksum = '11538323785542997172'
+            WHERE version = 7;
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let repaired = Database::open(dir.path(), TEST_DIM).unwrap();
+        let conn = repaired.read().unwrap();
+        let checksum: String = conn
+            .query_row(
+                "SELECT checksum FROM refinery_schema_history WHERE version = 7",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_ne!(checksum, "11538323785542997172");
+
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'samples_fts'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(sql.contains("contentless_delete = 1"));
+        let trigger_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name = 'samples_fts_delete'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(trigger_count, 1);
     }
 
     /// Exit criterion: `PRAGMA foreign_key_check` is clean.

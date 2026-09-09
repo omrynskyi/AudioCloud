@@ -74,14 +74,14 @@ pub enum Plan {
     Full { new: usize, total: usize },
 }
 
-/// Decides between incremental placement and a full re-fit, for one `dims` layout.
+/// Decides between incremental placement and a full re-fit.
 ///
 /// Reads two counts, not two corpora: this is called after every scan and must not be a
 /// reason to touch `embeddings.bin`.
-pub fn plan(db: &Database, dims: i64) -> Result<Plan, ProjectionError> {
+pub fn plan(db: &Database) -> Result<Plan, ProjectionError> {
     let conn = db.read()?;
     let total = queries::count_embedded_samples(&conn)? as usize;
-    let Some(active) = queries::active_projection_run(&conn, dims)? else {
+    let Some(active) = queries::active_projection_run(&conn)? else {
         return Ok(Plan::Full { new: total, total });
     };
     let placed = queries::count_projection_points(&conn, active.id)? as usize;
@@ -194,16 +194,17 @@ impl RefitSnapshot {
 
 /// How one re-fit should run. A struct rather than four positional arguments, matching
 /// [`crate::pipeline::ScanOptions`].
+/// A second, independent fit that colors points -- see [`Refit::with_color_fit`].
+#[allow(clippy::type_complexity)]
+pub type ColorFit<'a> = &'a (dyn Fn(&EmbeddingSet<'_>, &CancellationToken) -> Result<Vec<[f32; 3]>, ProjectionError>
+         + Sync);
+
 pub struct Refit<'a> {
     projector: &'a dyn Projector,
     fallback: Option<&'a dyn Projector>,
+    color_fit: Option<ColorFit<'a>>,
     cancel: &'a CancellationToken,
     align: bool,
-    /// Which independently-active layout (`idx_projection_active` is scoped per `dims`) this
-    /// run reads its previous layout from and writes its result into. Must agree with what
-    /// `projector` actually outputs -- the caller's responsibility, the same way `algorithm`
-    /// is recorded from `projector.name()` rather than re-derived.
-    dims: i64,
     progress: Arc<RefitProgress>,
     #[allow(clippy::type_complexity)]
     sink: Option<Box<dyn FnMut(RefitSnapshot) + Send + 'static>>,
@@ -214,9 +215,9 @@ impl std::fmt::Debug for Refit<'_> {
         f.debug_struct("Refit")
             .field("projector", &self.projector.name())
             .field("fallback", &self.fallback.map(Projector::name))
+            .field("color_fit", &self.color_fit.is_some())
             .field("cancelled", &self.cancel.is_cancelled())
             .field("align", &self.align)
-            .field("dims", &self.dims)
             .field("ticking", &self.sink.is_some())
             .finish()
     }
@@ -227,18 +228,12 @@ impl<'a> Refit<'a> {
         Self {
             projector,
             fallback: None,
+            color_fit: None,
             cancel,
             align: true,
-            dims: 3,
             progress: Arc::new(RefitProgress::new()),
             sink: None,
         }
-    }
-
-    /// Which layout this run belongs to: 2 or 3. Defaults to 3.
-    pub fn with_dims(mut self, dims: i64) -> Self {
-        self.dims = dims;
-        self
     }
 
     /// A second projector to try if the first one fails.
@@ -254,6 +249,18 @@ impl<'a> Refit<'a> {
     /// row over a PCA layout is a lie that survives in the database.
     pub fn with_fallback(mut self, fallback: &'a dyn Projector) -> Self {
         self.fallback = Some(fallback);
+        self
+    }
+
+    /// A second, independent fit that colors points instead of placing them.
+    ///
+    /// A plain closure rather than a `Projector` method: color is not a variant of the
+    /// position fit, it answers a different question of the same data (`tsne`'s module doc),
+    /// and today exactly one algorithm produces one at all. Forcing PCA and UMAP to answer
+    /// `fit_color` too, just to say "no", would be a method every [`Projector`] carries for
+    /// one caller's sake.
+    pub fn with_color_fit(mut self, f: ColorFit<'a>) -> Self {
+        self.color_fit = Some(f);
         self
     }
 
@@ -397,9 +404,9 @@ pub fn refit(db: &Database, options: Refit<'_>) -> Result<RefitReport, Projectio
     let Refit {
         projector,
         fallback,
+        color_fit,
         cancel,
         align,
-        dims,
         progress,
         sink,
     } = options;
@@ -409,7 +416,9 @@ pub fn refit(db: &Database, options: Refit<'_>) -> Result<RefitReport, Projectio
         sink.map(|sink| Ticker::watch(Arc::clone(&progress), RefitProgress::snapshot, sink));
     // A terminal snapshot is guaranteed by `Ticker`'s `Drop`, but only if the phase is
     // right when it runs -- so every exit from here forward goes through `finish`.
-    let result = run(db, projector, fallback, cancel, align, dims, &progress, started);
+    let result = run(
+        db, projector, fallback, color_fit, cancel, align, &progress, started,
+    );
     progress.enter(RefitPhase::Done);
     if let Some(ticker) = ticker.as_mut() {
         ticker.finish();
@@ -421,18 +430,22 @@ fn run(
     db: &Database,
     projector: &dyn Projector,
     fallback: Option<&dyn Projector>,
+    color_fit: Option<ColorFit<'_>>,
     cancel: &CancellationToken,
     align: bool,
-    dims: i64,
     progress: &RefitProgress,
     started: Instant,
 ) -> Result<RefitReport, ProjectionError> {
     progress.enter(RefitPhase::Reading);
+    tracing::debug!(
+        algorithm = projector.name(),
+        "refit: reading embedding locations"
+    );
     EmbeddingSet::check_cancelled(cancel)?;
 
     let conn = db.read()?;
     let rows: Vec<(i64, EmbeddingLoc)> = queries::all_embedding_locs(&conn)?;
-    let previous = queries::active_projection_run(&conn, dims)?;
+    let previous = queries::active_projection_run(&conn)?;
     // Read regardless of `align`: the previous layout is what displacement is *measured*
     // against, and an unaligned re-fit still owes that number -- it is the number that says
     // what alignment is worth.
@@ -443,6 +456,12 @@ fn run(
     drop(conn);
 
     progress.samples.store(rows.len() as u64, Ordering::Relaxed);
+    tracing::debug!(
+        samples = rows.len(),
+        has_previous_layout = previous.is_some(),
+        elapsed_ms = started.elapsed().as_millis(),
+        "refit: locations read"
+    );
 
     // The lock is held only long enough to create the mapping. `EmbeddingMatrix` owns its
     // `Mmap`, so the store goes back to the persist stage of any concurrent scan
@@ -459,8 +478,13 @@ fn run(
     let data = EmbeddingSet::new(&matrix, &distinct);
 
     progress.enter(RefitPhase::Fitting);
+    tracing::debug!(
+        algorithm = projector.name(),
+        distinct_vectors = distinct.len(),
+        elapsed_ms = started.elapsed().as_millis(),
+        "refit: fitting"
+    );
     let (fitted, projector) = fit(projector, fallback, &data, cancel)?;
-    drop(matrix);
     if fitted.len() != distinct.len() {
         return Err(ProjectionError::Umap(format!(
             "{} produced {} coordinates for {} vectors",
@@ -469,15 +493,53 @@ fn run(
             distinct.len()
         )));
     }
-    let mut points = fan_out(&rows, &members, &fitted, dims);
+    tracing::debug!(
+        algorithm = projector.name(),
+        elapsed_ms = started.elapsed().as_millis(),
+        "refit: fit complete"
+    );
+
+    // Same `data` the position fit just read, while the mapping backing it is still alive --
+    // an independent question asked of the same vectors, not a derivative of where they
+    // landed (`tsne`'s module doc).
+    let colors = match color_fit {
+        Some(f) => {
+            tracing::debug!(
+                elapsed_ms = started.elapsed().as_millis(),
+                "refit: color fitting"
+            );
+            let fitted_colors = f(&data, cancel)?;
+            if fitted_colors.len() != distinct.len() {
+                return Err(ProjectionError::Umap(format!(
+                    "color fit produced {} colors for {} vectors",
+                    fitted_colors.len(),
+                    distinct.len()
+                )));
+            }
+            tracing::debug!(
+                elapsed_ms = started.elapsed().as_millis(),
+                "refit: color fit complete"
+            );
+            Some(fan_out_colors(&rows, &members, &fitted_colors))
+        }
+        None => None,
+    };
+    drop(matrix);
+
+    let mut points = fan_out(&rows, &members, &fitted);
     EmbeddingSet::check_cancelled(cancel)?;
 
     progress.enter(RefitPhase::Aligning);
     let (alignment, correspondences) = if align {
-        align_onto_previous(&rows, &points, &previous_points, dims)
+        align_onto_previous(&rows, &points, &previous_points)
     } else {
         (Alignment::identity(), 0)
     };
+    tracing::debug!(
+        correspondences,
+        elapsed_ms = started.elapsed().as_millis(),
+        "refit: aligned"
+    );
     // Fitted on the shared points, applied to every point including the new ones: the
     // transform describes the relationship between two coordinate systems, not between two
     // sets of samples (`overview.md` §3.8, step 4).
@@ -488,20 +550,36 @@ fn run(
 
     EmbeddingSet::check_cancelled(cancel)?;
     progress.enter(RefitPhase::Writing);
+    tracing::debug!(
+        elapsed_ms = started.elapsed().as_millis(),
+        "refit: writing shadow run"
+    );
 
     let run_id = db.writer().begin_projection_run(
         projector.name(),
         &projector.params_json(),
         rows.len() as i64,
-        dims,
     )?;
 
     // Everything past this point owns a shadow row that must not outlive a failure.
-    let written = write_points(db, run_id, &rows, &points, cancel, progress);
+    let written = write_points(
+        db,
+        run_id,
+        &rows,
+        &points,
+        colors.as_deref(),
+        cancel,
+        progress,
+    );
     if let Err(e) = written {
         discard(db, run_id);
         return Err(e);
     }
+    tracing::debug!(
+        run_id,
+        elapsed_ms = started.elapsed().as_millis(),
+        "refit: shadow run written"
+    );
 
     progress.enter(RefitPhase::Swapping);
     if let Err(e) = db.writer().activate_projection_run(run_id) {
@@ -566,12 +644,7 @@ fn group_by_vector(rows: &[(i64, EmbeddingLoc)]) -> (Vec<(i64, EmbeddingLoc)>, V
 /// The first row holding a vector gets the fitted position exactly; the rest get it nudged,
 /// so that a file and its six copies are six pickable dots rather than one. The nudge is
 /// keyed by `sample_id`, so it is the same on every re-fit.
-fn fan_out(
-    rows: &[(i64, EmbeddingLoc)],
-    members: &[Vec<usize>],
-    fitted: &[Point3],
-    dims: i64,
-) -> Vec<Point3> {
+fn fan_out(rows: &[(i64, EmbeddingLoc)], members: &[Vec<usize>], fitted: &[Point3]) -> Vec<Point3> {
     let extent = BoundingBox::of(fitted).map_or(0.0, |b| b.diagonal());
     let mut points = vec![[0.0f32; 3]; rows.len()];
     for (vector, sharing) in members.iter().enumerate() {
@@ -579,11 +652,29 @@ fn fan_out(
             points[row] = if n == 0 {
                 fitted[vector]
             } else {
-                super::incremental::jitter(fitted[vector], rows[row].0, extent, dims as usize)
+                super::incremental::jitter(fitted[vector], rows[row].0, extent)
             };
         }
     }
     points
+}
+
+/// [`fan_out`] for colors: every row sharing a vector gets its exact color, not a jittered
+/// one. Jitter exists so two samples on one vector are two clickable dots; two dots one
+/// shade apart would only make the shared-vector case look like a rounding error instead of
+/// what it is.
+fn fan_out_colors(
+    rows: &[(i64, EmbeddingLoc)],
+    members: &[Vec<usize>],
+    fitted: &[[f32; 3]],
+) -> Vec<[f32; 3]> {
+    let mut colors = vec![[0.0f32; 3]; rows.len()];
+    for (vector, sharing) in members.iter().enumerate() {
+        for &row in sharing {
+            colors[row] = fitted[vector];
+        }
+    }
+    colors
 }
 
 /// Runs the projector, falling back to the second one on anything but a cancellation.
@@ -624,7 +715,6 @@ fn align_onto_previous(
     rows: &[(i64, EmbeddingLoc)],
     points: &[Point3],
     previous: &HashMap<i64, Point3>,
-    dims: i64,
 ) -> (Alignment, usize) {
     if previous.is_empty() {
         return (Alignment::identity(), 0);
@@ -638,15 +728,7 @@ fn align_onto_previous(
         }
     }
     let n = source.len();
-    // A 2D layout's z is always 0.0 on both sides, which leaves the 3D fit's rotation about
-    // z formally underdetermined (see `procrustes::fit_2d`'s doc comment); confining the fit
-    // to x/y sidesteps that rather than relying on it resolving itself.
-    let alignment = if dims == 2 {
-        procrustes::fit_2d(&source, &target)
-    } else {
-        procrustes::fit(&source, &target)
-    };
-    (alignment, n)
+    (procrustes::fit(&source, &target), n)
 }
 
 /// Median distance a pre-existing point moved, after alignment.
@@ -675,22 +757,48 @@ fn write_points(
     run_id: i64,
     rows: &[(i64, EmbeddingLoc)],
     points: &[Point3],
+    colors: Option<&[[f32; 3]]>,
     cancel: &CancellationToken,
     progress: &RefitProgress,
 ) -> Result<(), ProjectionError> {
+    write_chunked(rows, points, cancel, |batch| {
+        let n = batch.len() as u64;
+        db.writer().set_projection_points(run_id, batch)?;
+        progress.written.fetch_add(n, Ordering::Relaxed);
+        Ok(())
+    })?;
+    if let Some(colors) = colors {
+        write_chunked(rows, colors, cancel, |batch| {
+            db.writer().set_projection_colors(run_id, batch)?;
+            Ok(())
+        })?;
+    }
+    db.writer().flush()?;
+    Ok(())
+}
+
+/// Writes `values` (points, or colors) alongside `rows`' sample ids in chunks of
+/// [`WRITE_CHUNK`], checking for cancellation once per chunk rather than once per row.
+///
+/// Points and colors both write this way, differing only in which writer method `write`
+/// calls and whether it also has progress to report -- one shared loop instead of two
+/// identical ones.
+fn write_chunked<T: Copy>(
+    rows: &[(i64, EmbeddingLoc)],
+    values: &[T],
+    cancel: &CancellationToken,
+    mut write: impl FnMut(Vec<(i64, T)>) -> Result<(), ProjectionError>,
+) -> Result<(), ProjectionError> {
     for chunk in rows
         .iter()
-        .zip(points.iter())
+        .zip(values.iter())
         .collect::<Vec<_>>()
         .chunks(WRITE_CHUNK)
     {
         EmbeddingSet::check_cancelled(cancel)?;
-        let batch: Vec<(i64, Point3)> = chunk.iter().map(|((id, _), p)| (*id, **p)).collect();
-        let n = batch.len() as u64;
-        db.writer().set_projection_points(run_id, batch)?;
-        progress.written.fetch_add(n, Ordering::Relaxed);
+        let batch: Vec<(i64, T)> = chunk.iter().map(|((id, _), v)| (*id, **v)).collect();
+        write(batch)?;
     }
-    db.writer().flush()?;
     Ok(())
 }
 
@@ -751,7 +859,7 @@ mod tests {
     fn a_first_fit_has_no_correspondences_and_does_not_move() {
         let rows = vec![(1i64, EmbeddingLoc { offset: 0, dims: 4 })];
         let points = vec![[3.0, 4.0, 5.0]];
-        let (alignment, n) = align_onto_previous(&rows, &points, &HashMap::new(), 3);
+        let (alignment, n) = align_onto_previous(&rows, &points, &HashMap::new());
         assert_eq!(n, 0);
         assert!(alignment.is_identity());
     }
@@ -799,7 +907,7 @@ mod tests {
         let (_, members) = group_by_vector(&rows);
         let fitted = vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]];
 
-        let points = fan_out(&rows, &members, &fitted, 3);
+        let points = fan_out(&rows, &members, &fitted);
 
         assert_eq!(points.len(), 3);
         assert_eq!(
@@ -817,7 +925,7 @@ mod tests {
             points[2]
         );
         // Deterministic: the same rows fan out the same way every time.
-        assert_eq!(points, fan_out(&rows, &members, &fitted, 3));
+        assert_eq!(points, fan_out(&rows, &members, &fitted));
     }
 
     /// The projector is named in the report, so a run built by the fallback cannot be

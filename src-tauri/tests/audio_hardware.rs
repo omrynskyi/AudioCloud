@@ -52,7 +52,7 @@ async fn hover_to_audible_is_under_the_budget() {
     );
 
     let pcm = Arc::new(sine_burst(format.sample_rate, format.channels, 0.3, 440.0));
-    let generation = engine.play_pcm(pcm, 1.0);
+    let generation = engine.play_pcm(pcm, 1.0).await;
 
     let mut latency = None;
     for _ in 0..100 {
@@ -86,7 +86,7 @@ async fn stop_releases_without_a_panic() {
     let engine = Engine::open(None).expect("no default output device on this machine");
     let format = engine.format();
     let pcm = Arc::new(sine_burst(format.sample_rate, format.channels, 2.0, 220.0));
-    engine.play_pcm(pcm, 0.5);
+    engine.play_pcm(pcm, 0.5).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     engine.stop();
     // Long enough for the ~8ms release ramp to complete well before the assertion.
@@ -144,7 +144,7 @@ async fn rapid_retriggers_do_not_panic_or_deadlock() {
     let pcm = Arc::new(sine_burst(format.sample_rate, format.channels, 1.0, 330.0));
 
     for _ in 0..20 {
-        engine.play_pcm(Arc::clone(&pcm), 0.4);
+        engine.play_pcm(Arc::clone(&pcm), 0.4).await;
         tokio::time::sleep(Duration::from_millis(15)).await;
     }
     tokio::time::sleep(Duration::from_millis(200)).await;

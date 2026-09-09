@@ -15,7 +15,7 @@
 //! picture, because the old picture is now wrong. This turns "everything moved" into "most
 //! things stayed, some things genuinely changed" and nothing more.
 
-use nalgebra::{Matrix2, Matrix3, Vector2, Vector3};
+use nalgebra::{Matrix3, Vector3};
 
 use crate::projection::Point3;
 
@@ -25,10 +25,6 @@ use crate::projection::Point3;
 /// Three is the minimum that determines a rotation in 3D at all; four insists on one point
 /// of redundancy, so a degenerate triple cannot decide the transform by itself.
 pub const MIN_CORRESPONDENCES: usize = 4;
-
-/// The 2D analogue: two points determine a rotation in the plane, three insists on the same
-/// point of redundancy `MIN_CORRESPONDENCES` does for 3D.
-pub const MIN_CORRESPONDENCES_2D: usize = 3;
 
 /// A similarity transform: rotate (possibly reflecting), scale uniformly, translate.
 ///
@@ -156,69 +152,6 @@ pub fn fit(source: &[Point3], target: &[Point3]) -> Alignment {
         scale: scale as f32,
         source_centroid: source_centroid.map(|v| v as f32),
         target_centroid: target_centroid.map(|v| v as f32),
-    }
-}
-
-/// [`fit`], but for a 2D layout stored as `Point3` with `z` padded to `0.0`.
-///
-/// A 2D map's z is always exactly zero on both sides, which makes the third row and column
-/// of the 3×3 cross-covariance `H` used by [`fit`] identically zero -- the rotation about the
-/// z axis is then formally underdetermined (any rotation of a null space is as valid as any
-/// other), and while a well-conditioned corpus happens to recover `z=0` anyway, a degenerate
-/// one is not worth the risk. Confining the fit to the 2×2 `x`/`y` block sidesteps the
-/// question entirely: there is no third axis for the SVD to leave ambiguous, and `z` is fixed
-/// at `0.0` by construction rather than by a numerical coincidence.
-pub fn fit_2d(source: &[Point3], target: &[Point3]) -> Alignment {
-    let n = source.len().min(target.len());
-    if n < MIN_CORRESPONDENCES_2D {
-        return Alignment::identity();
-    }
-
-    let source_centroid = centroid(&source[..n]);
-    let target_centroid = centroid(&target[..n]);
-
-    let mut h = Matrix2::<f64>::zeros();
-    let mut source_variance = 0.0f64;
-    for i in 0..n {
-        let a3 = center(source[i], source_centroid);
-        let b3 = center(target[i], target_centroid);
-        let a = Vector2::new(a3.x, a3.y);
-        let b = Vector2::new(b3.x, b3.y);
-        source_variance += a.norm_squared();
-        h += a * b.transpose();
-    }
-
-    if source_variance <= 0.0 || !source_variance.is_finite() {
-        return Alignment::identity();
-    }
-
-    let svd = h.svd(true, true);
-    let (Some(u), Some(v_t)) = (svd.u, svd.v_t) else {
-        tracing::warn!("procrustes: the 2x2 SVD did not converge; leaving the layout unaligned");
-        return Alignment::identity();
-    };
-
-    // Same "no determinant correction" reasoning as `fit`: a 2D UMAP/PCA layout has no
-    // handedness either, so a mirrored solution is accepted rather than forced upright.
-    let rotation2 = v_t.transpose() * u.transpose();
-
-    let scale = svd.singular_values.sum() / source_variance;
-    if !scale.is_finite() || scale <= 0.0 {
-        return Alignment::identity();
-    }
-
-    let mut rotation = Matrix3::<f32>::identity();
-    for row in 0..2 {
-        for col in 0..2 {
-            rotation[(row, col)] = rotation2[(row, col)] as f32;
-        }
-    }
-
-    Alignment {
-        rotation,
-        scale: scale as f32,
-        source_centroid: Vector3::new(source_centroid.x as f32, source_centroid.y as f32, 0.0),
-        target_centroid: Vector3::new(target_centroid.x as f32, target_centroid.y as f32, 0.0),
     }
 }
 
@@ -378,24 +311,27 @@ mod tests {
         );
     }
 
-    /// A flat, z=0 layout, for `fit_2d`.
-    fn flat_cloud() -> Vec<Point3> {
-        (0..24)
+    /// Every layout is genuinely 2D now (`pca::AXES`, `umap::TARGET_DIM`): `z` is `0.0` on
+    /// both sides, every fit through here. `fit` has no separate 2D code path -- the general
+    /// 3x3 Kabsch solve is expected to degrade to it on its own, because a `z`-less cloud
+    /// makes the cross-covariance `H`'s third row and column exactly zero, which forces the
+    /// SVD's third singular vector to `±ez` rather than leaving it ambiguous (the two real
+    /// singular vectors span exactly the xy-plane already, and there is only one direction
+    /// left to be orthogonal to both). This is the regression test for that claim: if a
+    /// future `nalgebra` version's SVD ever broke it, this is what would catch a rotation
+    /// that quietly lifts points off `z = 0`.
+    #[test]
+    fn a_flat_layout_aligns_without_ever_lifting_z_off_zero() {
+        let target: Vec<Point3> = (0..24)
             .map(|i| {
                 let t = i as f32;
                 [(t * 0.7).sin() * 3.0, (t * 1.3).cos() * 2.0, 0.0]
             })
-            .collect()
-    }
-
-    /// `fit_2d` recovers a rotation/scale/translation confined to the xy-plane, exactly like
-    /// `fit` does in 3D -- and critically, it never lifts a point off `z = 0`.
-    #[test]
-    fn fit_2d_undoes_a_planar_rotation_scale_and_translation_and_keeps_z_at_zero() {
-        let target = flat_cloud();
+            .collect();
+        // A planar rotation, scale, and translation -- still confined to z = 0.
         let source = transformed(&target, |p| [-p[1] * 2.0 + 10.0, p[0] * 2.0 - 4.0, 0.0]);
 
-        let alignment = fit_2d(&source, &target);
+        let alignment = fit(&source, &target);
         let mut aligned = source.clone();
         alignment.apply_all(&mut aligned);
 
@@ -406,32 +342,10 @@ mod tests {
         );
         assert!((alignment.scale() - 0.5).abs() < 1e-4);
         for p in &aligned {
-            assert_eq!(p[2], 0.0, "fit_2d must never move a point off z = 0");
+            assert_eq!(
+                p[2], 0.0,
+                "a flat layout must never be lifted off z = 0: {p:?}"
+            );
         }
-    }
-
-    /// Reflection in the plane is allowed, the same way it is in 3D.
-    #[test]
-    fn fit_2d_recovers_a_planar_reflection() {
-        let target = flat_cloud();
-        let source = transformed(&target, |p| [-p[0], p[1], 0.0]);
-
-        let alignment = fit_2d(&source, &target);
-        let mut aligned = source.clone();
-        alignment.apply_all(&mut aligned);
-
-        assert!(alignment.determinant() < 0.0);
-        assert!(max_error(&aligned, &target) < 1e-3);
-    }
-
-    /// Fewer than `MIN_CORRESPONDENCES_2D` shared points must leave the layout untouched.
-    #[test]
-    fn fit_2d_with_too_few_correspondences_is_the_identity() {
-        let target = flat_cloud();
-        let source = transformed(&target, |p| [p[0] + 5.0, p[1], 0.0]);
-
-        let alignment = fit_2d(&source[..2], &target[..2]);
-
-        assert!(alignment.is_identity());
     }
 }

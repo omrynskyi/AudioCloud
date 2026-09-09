@@ -12,7 +12,7 @@ use crate::{
     },
     projection::{
         place_incremental, plan, refit_at_low_priority, PcaProjector, Plan, Projector, Refit,
-        UmapParams, UmapProjector,
+        TsneParams, TsneProjector, UmapParams, UmapProjector,
     },
 };
 
@@ -88,8 +88,7 @@ fn run(
     channel: &Channel<RefitEvent>,
     started: std::time::Instant,
 ) -> Result<RefitOutcome, AppError> {
-    let dims = i64::from(params.dims);
-    let decision = plan(db, dims)?;
+    let decision = plan(db)?;
 
     // Incremental placement is additive and fast -- there is nothing to stream, and no
     // shadow run to swap. It reports as a single terminal event with `incremental: true`,
@@ -98,7 +97,7 @@ fn run(
         match decision {
             Plan::UpToDate => {
                 let conn = db.read()?;
-                let active = crate::db::queries::active_projection_run(&conn, dims)?
+                let active = crate::db::queries::active_projection_run(&conn)?
                     .ok_or(AppError::NoProjection)?;
                 return Ok(RefitOutcome {
                     run_id: active.id,
@@ -111,7 +110,7 @@ fn run(
                 });
             }
             Plan::Incremental { .. } => {
-                let report = place_incremental(db, cancel, dims)?;
+                let report = place_incremental(db, cancel)?;
                 return Ok(RefitOutcome {
                     run_id: report.run_id,
                     algorithm: "incremental".into(),
@@ -126,29 +125,36 @@ fn run(
         }
     }
 
-    let pca = if params.dims == 2 {
-        PcaProjector::with_dims(2)
-    } else {
-        PcaProjector::new()
-    };
+    let pca = PcaProjector::new();
+    let tsne = TsneProjector::default();
+    let tuned = UmapParams::default();
     let umap = UmapProjector::new(UmapParams {
-        n_neighbors: params
-            .n_neighbors
-            .unwrap_or_else(|| UmapParams::default().n_neighbors),
-        target_dim: params.dims as usize,
-        ..Default::default()
+        n_neighbors: params.n_neighbors.unwrap_or(tuned.n_neighbors),
+        min_dist: params.min_dist.unwrap_or(tuned.min_dist),
+        sharpness: params.sharpness.unwrap_or(tuned.sharpness),
+        input_sharpness: params.input_sharpness.unwrap_or(tuned.input_sharpness),
+        n_epochs: params.n_epochs.unwrap_or(tuned.n_epochs),
     });
     let primary: &dyn Projector = match params.algorithm {
+        Algorithm::Tsne => &tsne,
         Algorithm::Umap => &umap,
         Algorithm::Pca => &pca,
+    };
+
+    // A color independent of position, and today only t-SNE produces one (`tsne`'s module
+    // doc) -- so this is the one place that decision is made, not a method every `Projector`
+    // has to answer.
+    let color_params = TsneParams::default();
+    let color_fit = move |data: &crate::projection::EmbeddingSet<'_>,
+                          cancel: &crate::pipeline::CancellationToken| {
+        crate::projection::fit_color(data, &color_params, cancel)
     };
 
     // PCA is always the fallback, including when PCA is what was asked for -- the second
     // attempt then costs nothing and the branch stays uniform. A library with no map at all
     // is worse than a library with a plainer one (`overview.md` §3.7).
-    let options = Refit::new(primary, cancel)
+    let mut options = Refit::new(primary, cancel)
         .with_fallback(&pca)
-        .with_dims(dims)
         .with_progress({
             let channel = channel.clone();
             move |snapshot| {
@@ -157,6 +163,9 @@ fn run(
                 )));
             }
         });
+    if matches!(params.algorithm, Algorithm::Tsne) {
+        options = options.with_color_fit(&color_fit);
+    }
 
     let report = refit_at_low_priority(db, options)?;
     let relative_displacement = report.relative_displacement();

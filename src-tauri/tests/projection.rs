@@ -27,9 +27,9 @@ use audiobank_lib::{
     db::{queries, Database, NewSample, SampleStatus},
     pipeline::CancellationToken,
     projection::{
-        distance, place_incremental, plan, procrustes, refit, refit_at_low_priority, BoundingBox,
-        PcaProjector, Plan, Point3, ProjectionError, Projector, Refit, RefitPhase, RefitSnapshot,
-        UmapProjector,
+        distance, fit_color, place_incremental, plan, procrustes, refit, refit_at_low_priority,
+        BoundingBox, EmbeddingSet, PcaProjector, Plan, Point3, ProjectionError, Projector, Refit,
+        RefitPhase, RefitSnapshot, TsneParams, TsneProjector, UmapProjector,
     },
 };
 use tempfile::TempDir;
@@ -104,9 +104,20 @@ fn vector(i: usize, clusters: usize, seed: u64) -> Vec<f32> {
         ((state >> 40) as f32 / 8_388_608.0) - 1.0
     };
     let center = i % clusters;
-    let mut v: Vec<f32> = (0..DIM).map(|_| 0.55 * next()).collect();
-    v[center % DIM] += 1.0;
-    v[(center * 7 + 5) % DIM] += 0.55;
+    let mut v: Vec<f32> = (0..DIM).map(|_| 0.5 * next()).collect();
+    // Cluster centers sit on a circle inside a fixed 2D subspace (dims 0 and 1), not each on
+    // its own orthogonal "hot" dimension the way a single boosted component per cluster
+    // used to place them. PCA fits two axes now, not three (`pca::AXES` -- the app only ever
+    // shows a flat map), and mutually-orthogonal cluster directions cannot be multiplexed
+    // into two dimensions no matter how little noise there is: five one-hot centers span a
+    // four-dimensional simplex, and any two-axis projection of that loses real pairwise
+    // separation for some pair of clusters, by construction, not by bad luck. An
+    // arrangement that is genuinely two-dimensional to begin with is what makes "PCA keeps
+    // five clusters apart" a claim about the projector rather than about how many axes
+    // happened to exist to hide the fixture's own shape in.
+    let angle = (center as f32 / clusters as f32) * std::f32::consts::TAU;
+    v[0] += angle.cos() * 1.0;
+    v[1] += angle.sin() * 1.0;
     let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
     for x in &mut v {
         *x /= norm;
@@ -138,7 +149,7 @@ fn both_projectors_give_every_sample_a_coordinate() {
         assert_eq!(report.sample_count, ids.len());
 
         let conn = db.read().unwrap();
-        let points = queries::active_projection_points(&conn, 3).unwrap();
+        let points = queries::active_projection_points(&conn).unwrap();
         assert_eq!(
             points.len(),
             ids.len(),
@@ -164,6 +175,43 @@ fn both_projectors_give_every_sample_a_coordinate() {
     }
 }
 
+/// A color fit runs only when asked for, and lands as real numbers when it does.
+///
+/// Two refits over the same corpus -- PCA with no color fit attached, then t-SNE with one --
+/// so "colors are absent" and "colors are present" are both demonstrated against the same
+/// data rather than trusted from opposite ends of the codebase.
+#[test]
+fn a_color_fit_writes_colors_only_when_asked_for() {
+    let (_dir, db, ids) = library(60, 4, 21);
+
+    run_refit(&db, &PcaProjector::new());
+    let conn = db.read().unwrap();
+    let uncolored = queries::active_projection_colors(&conn).unwrap();
+    drop(conn);
+    assert_eq!(uncolored.len(), ids.len());
+    assert!(
+        uncolored.iter().all(|c| c.iter().all(|v| v.is_nan())),
+        "PCA asked for no color fit, but some point has one"
+    );
+
+    let cancel = CancellationToken::new();
+    let color_params = TsneParams::default();
+    let color_fit = |data: &EmbeddingSet<'_>, cancel: &CancellationToken| {
+        fit_color(data, &color_params, cancel)
+    };
+    let tsne = TsneProjector::new(TsneParams::default());
+    refit(&db, Refit::new(&tsne, &cancel).with_color_fit(&color_fit)).unwrap();
+
+    let conn = db.read().unwrap();
+    let colored = queries::active_projection_colors(&conn).unwrap();
+    drop(conn);
+    assert_eq!(colored.len(), ids.len());
+    assert!(
+        colored.iter().all(|c| c.iter().all(|v| v.is_finite())),
+        "t-SNE was given a color fit, but some point has none"
+    );
+}
+
 /// **Exit criterion: a re-fit with 5% new data leaves existing points substantially in
 /// place after alignment.**
 ///
@@ -179,7 +227,7 @@ fn a_five_percent_import_leaves_the_rest_of_the_library_in_place() {
     let first = run_refit(&db, &PcaProjector::new());
     let before: std::collections::HashMap<i64, Point3> = {
         let conn = db.read().unwrap();
-        queries::active_projection_points(&conn, 3)
+        queries::active_projection_points(&conn)
             .unwrap()
             .into_iter()
             .collect()
@@ -189,7 +237,7 @@ fn a_five_percent_import_leaves_the_rest_of_the_library_in_place() {
     // real re-fit -- the path this criterion is about.
     add_samples(&db, 400, 20, 6, 23);
     assert!(matches!(
-        plan(&db, 3).unwrap(),
+        plan(&db).unwrap(),
         Plan::Full {
             new: 20,
             total: 420
@@ -204,7 +252,7 @@ fn a_five_percent_import_leaves_the_rest_of_the_library_in_place() {
 
     let after: std::collections::HashMap<i64, Point3> = {
         let conn = db.read().unwrap();
-        queries::active_projection_points(&conn, 3)
+        queries::active_projection_points(&conn)
             .unwrap()
             .into_iter()
             .collect()
@@ -247,7 +295,7 @@ fn alignment_is_what_keeps_the_layout_still() {
         run_refit(&db, &PcaProjector::new());
         let before: std::collections::HashMap<i64, Point3> = {
             let conn = db.read().unwrap();
-            queries::active_projection_points(&conn, 3)
+            queries::active_projection_points(&conn)
                 .unwrap()
                 .into_iter()
                 .collect()
@@ -265,7 +313,7 @@ fn alignment_is_what_keeps_the_layout_still() {
 
         let after: std::collections::HashMap<i64, Point3> = {
             let conn = db.read().unwrap();
-            queries::active_projection_points(&conn, 3)
+            queries::active_projection_points(&conn)
                 .unwrap()
                 .into_iter()
                 .collect()
@@ -317,7 +365,7 @@ fn a_concurrent_reader_never_sees_a_half_swapped_map() {
         std::thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
                 let conn = db.read().unwrap();
-                let points = queries::active_projection_points(&conn, 3).unwrap();
+                let points = queries::active_projection_points(&conn).unwrap();
                 observations.fetch_add(1, Ordering::Relaxed);
                 // Either the old map or the new one, whole. Never anything else.
                 if points.len() != baseline && points.len() != baseline + 60 {
@@ -392,7 +440,7 @@ fn a_cancelled_refit_leaves_the_active_map_exactly_as_it_was() {
     let established = run_refit(&db, &PcaProjector::new());
     let before: Vec<(i64, Point3)> = {
         let conn = db.read().unwrap();
-        queries::active_projection_points(&conn, 3).unwrap()
+        queries::active_projection_points(&conn).unwrap()
     };
 
     add_samples(&db, 200, 50, 4, 17);
@@ -403,10 +451,10 @@ fn a_cancelled_refit_leaves_the_active_map_exactly_as_it_was() {
     assert!(matches!(err, ProjectionError::Cancelled), "got {err:?}");
 
     let conn = db.read().unwrap();
-    let active = queries::active_projection_run(&conn, 3).unwrap().unwrap();
+    let active = queries::active_projection_run(&conn).unwrap().unwrap();
     assert_eq!(active.id, established.run_id, "the active run changed");
     assert_eq!(
-        queries::active_projection_points(&conn, 3).unwrap(),
+        queries::active_projection_points(&conn).unwrap(),
         before,
         "the map moved under a cancelled re-fit"
     );
@@ -426,7 +474,7 @@ fn an_incremental_import_places_new_points_and_moves_no_old_ones() {
     let established = run_refit(&db, &PcaProjector::new());
     let before: std::collections::HashMap<i64, Point3> = {
         let conn = db.read().unwrap();
-        queries::active_projection_points(&conn, 3)
+        queries::active_projection_points(&conn)
             .unwrap()
             .into_iter()
             .collect()
@@ -435,17 +483,17 @@ fn an_incremental_import_places_new_points_and_moves_no_old_ones() {
     // 5 on 505 is under 1%, which is the incremental path.
     let new_ids = add_samples(&db, 500, 5, 5, 41);
     assert!(matches!(
-        plan(&db, 3).unwrap(),
+        plan(&db).unwrap(),
         Plan::Incremental { new: 5, total: 505 }
     ));
 
-    let report = place_incremental(&db, &CancellationToken::new(), 3).unwrap();
+    let report = place_incremental(&db, &CancellationToken::new()).unwrap();
     assert_eq!(report.run_id, established.run_id, "a new run was created");
     assert_eq!(report.placed, 5);
     assert_eq!(report.unplaceable, 0);
 
     let conn = db.read().unwrap();
-    let after: std::collections::HashMap<i64, Point3> = queries::active_projection_points(&conn, 3)
+    let after: std::collections::HashMap<i64, Point3> = queries::active_projection_points(&conn)
         .unwrap()
         .into_iter()
         .collect();
@@ -460,7 +508,7 @@ fn an_incremental_import_places_new_points_and_moves_no_old_ones() {
     for id in &new_ids {
         assert!(after.contains_key(id), "sample {id} was never placed");
     }
-    assert!(matches!(plan(&db, 3).unwrap(), Plan::UpToDate));
+    assert!(matches!(plan(&db).unwrap(), Plan::UpToDate));
 }
 
 /// A placement is only worth anything if it lands near the right neighbors. A new sample
@@ -474,7 +522,7 @@ fn an_incrementally_placed_point_lands_among_its_own_cluster() {
 
     let before: std::collections::HashMap<i64, Point3> = {
         let conn = db.read().unwrap();
-        queries::active_projection_points(&conn, 3)
+        queries::active_projection_points(&conn)
             .unwrap()
             .into_iter()
             .collect()
@@ -482,10 +530,10 @@ fn an_incrementally_placed_point_lands_among_its_own_cluster() {
 
     // Sample 500 belongs to cluster 0, same as samples 0, 5, 10 ...
     let new_ids = add_samples(&db, 500, 1, clusters, 53);
-    place_incremental(&db, &CancellationToken::new(), 3).unwrap();
+    place_incremental(&db, &CancellationToken::new()).unwrap();
 
     let conn = db.read().unwrap();
-    let after: std::collections::HashMap<i64, Point3> = queries::active_projection_points(&conn, 3)
+    let after: std::collections::HashMap<i64, Point3> = queries::active_projection_points(&conn)
         .unwrap()
         .into_iter()
         .collect();
@@ -545,14 +593,14 @@ fn a_refit_reports_progress_and_always_finishes_it() {
 fn incremental_placement_needs_a_map_to_place_into() {
     let (_dir, db, _) = library(50, 3, 3);
 
-    let err = place_incremental(&db, &CancellationToken::new(), 3).unwrap_err();
+    let err = place_incremental(&db, &CancellationToken::new()).unwrap_err();
 
     assert!(
         matches!(err, ProjectionError::NoActiveProjection),
         "got {err:?}"
     );
     assert!(matches!(
-        plan(&db, 3).unwrap(),
+        plan(&db).unwrap(),
         Plan::Full { new: 50, total: 50 }
     ));
 }
@@ -582,54 +630,7 @@ fn a_refused_projection_writes_no_run_at_all() {
     );
     let conn = db.read().unwrap();
     assert!(queries::projection_runs(&conn).unwrap().is_empty());
-    assert!(queries::active_projection_run(&conn, 3).unwrap().is_none());
-}
-
-/// A 2D layout and a 3D layout are independently-active runs over the same library, each
-/// addressable by its own `dims`, and re-fitting one must never disturb the other.
-///
-/// This exercises the real `refit` path end to end; the SQL-level invariant it depends on
-/// (`activate_projection_run`'s deactivate/prune scoped to `dims`) has its own regression test
-/// in `db::writer::tests::activating_a_run_of_one_dims_does_not_touch_the_other`.
-#[test]
-fn a_2d_and_a_3d_layout_coexist_independently() {
-    let (_dir, db, ids) = library(200, 5, 91);
-    let cancel = CancellationToken::new();
-
-    let report_3d = refit(&db, Refit::new(&PcaProjector::new(), &cancel).with_dims(3)).unwrap();
-    let report_2d = refit(
-        &db,
-        Refit::new(&PcaProjector::with_dims(2), &cancel).with_dims(2),
-    )
-    .unwrap();
-    assert_ne!(report_3d.run_id, report_2d.run_id);
-
-    let conn = db.read().unwrap();
-    let points_3d = queries::active_projection_points(&conn, 3).unwrap();
-    let points_2d = queries::active_projection_points(&conn, 2).unwrap();
-
-    assert_eq!(points_3d.len(), ids.len());
-    assert_eq!(points_2d.len(), ids.len());
-    assert!(
-        points_2d.iter().all(|(_, p)| p[2] == 0.0),
-        "a 2D fit must pad z to exactly 0.0"
-    );
-
-    // Re-fitting the 2D layout again must leave the still-active 3D one exactly as it was.
-    let report_2d_again = refit(
-        &db,
-        Refit::new(&PcaProjector::with_dims(2), &cancel).with_dims(2),
-    )
-    .unwrap();
-    assert_ne!(report_2d_again.run_id, report_2d.run_id);
-    assert_eq!(
-        queries::active_projection_run(&conn, 3)
-            .unwrap()
-            .unwrap()
-            .id,
-        report_3d.run_id,
-        "re-fitting the 2D layout must not touch the active 3D run"
-    );
+    assert!(queries::active_projection_run(&conn).unwrap().is_none());
 }
 
 /// **The failure mode that made [`Refit::with_fallback`] necessary.**
@@ -675,10 +676,10 @@ fn a_disconnected_corpus_falls_back_instead_of_panicking() {
     assert_eq!(report.sample_count, ids.len());
 
     let conn = db.read().unwrap();
-    let run = queries::active_projection_run(&conn, 3).unwrap().unwrap();
+    let run = queries::active_projection_run(&conn).unwrap().unwrap();
     assert_eq!(run.algorithm, "pca");
     assert_eq!(
-        queries::active_projection_points(&conn, 3).unwrap().len(),
+        queries::active_projection_points(&conn).unwrap().len(),
         ids.len()
     );
 }
@@ -965,7 +966,7 @@ fn a_low_priority_refit_produces_the_same_map() {
 /// The active layout, keyed by sample id.
 fn layout(db: &Database) -> std::collections::HashMap<i64, Point3> {
     let conn = db.read().unwrap();
-    queries::active_projection_points(&conn, 3)
+    queries::active_projection_points(&conn)
         .unwrap()
         .into_iter()
         .collect()
