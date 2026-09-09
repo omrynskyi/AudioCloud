@@ -68,7 +68,7 @@ export function readCaps(gl: WebGL2RenderingContext | WebGLRenderingContext): Gl
 
   if (caps.belowPointsFloor) {
     console.warn(
-      `[audiobank] ALIASED_POINT_SIZE_RANGE is [${min}, ${max}] on "${renderer}". ` +
+      `[audiocloud] ALIASED_POINT_SIZE_RANGE is [${min}, ${max}] on "${renderer}". ` +
         `overview.md §5.1 puts the floor for the THREE.Points path at ${POINTS_PATH_FLOOR_PX} px; ` +
         'below it the layer is meant to become InstancedMesh quads. Sprites will be clamped ' +
         'and the zoomed-in view will look wrong.',

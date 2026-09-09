@@ -1,7 +1,7 @@
 /**
  * Welcome → add a library root → scan.
  *
- * Scanning uses AudioBank's built-in fingerprint embedder and needs no model download.
+ * Scanning uses AudioCloud's built-in fingerprint embedder and needs no model download.
  */
 
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
@@ -53,7 +53,7 @@ export function FirstRun({ onComplete }: { onComplete: () => void }) {
   if (step === 'welcome') {
     return (
       <Centered>
-        <h1 className="text-lg font-medium text-neutral-100">Welcome to AudioBank</h1>
+        <h1 className="text-lg font-medium text-neutral-100">Welcome to AudioCloud</h1>
         <p className="max-w-sm text-sm text-neutral-400">
           Point it at a folder of samples and it builds a map you can fly through —
           similar sounds land near each other.

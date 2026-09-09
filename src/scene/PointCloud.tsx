@@ -617,7 +617,7 @@ export function PointCloud({
       // canvas is dead until the app is relaunched. This one line is the difference
       // between a recoverable hiccup and a support ticket.
       event.preventDefault();
-      console.warn('[audiobank] WebGL context lost; waiting for restore');
+      console.warn('[audiocloud] WebGL context lost; waiting for restore');
     };
 
     const onRestored = () => {
@@ -630,7 +630,7 @@ export function PointCloud({
       materials.points.needsUpdate = true;
       materials.pick.needsUpdate = true;
       invalidate();
-      console.info('[audiobank] WebGL context restored from the cached payload');
+      console.info('[audiocloud] WebGL context restored from the cached payload');
     };
 
     canvas.addEventListener('webglcontextlost', onLost);

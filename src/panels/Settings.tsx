@@ -202,9 +202,9 @@ function DataSection() {
     return (
       <Section
         title="Library data"
-        detail="Manage the files AudioBank keeps on this Mac."
+        detail="Manage the files AudioCloud keeps on this Mac."
       >
-        <LoadingState label="Resetting… AudioBank will restart." />
+        <LoadingState label="Resetting… AudioCloud will restart." />
       </Section>
     );
   }
@@ -212,7 +212,7 @@ function DataSection() {
   return (
     <Section
       title="Library data"
-      detail="Manage the files AudioBank keeps on this Mac."
+      detail="Manage the files AudioCloud keeps on this Mac."
     >
       <div className="settings-card space-y-3">
         <div className="flex items-center justify-between gap-4">
@@ -240,7 +240,7 @@ function DataSection() {
                 !
               </div>
               <p className="leading-relaxed text-red-300">
-              This permanently deletes your library and embeddings. Type AUDIOBANK to
+              This permanently deletes your library and embeddings. Type AUDIOCLOUD to
               confirm.
               </p>
             </div>
@@ -248,14 +248,14 @@ function DataSection() {
               type="text"
               value={confirmText}
               onChange={(e) => setConfirmText(e.target.value)}
-              placeholder="Type AUDIOBANK"
-              aria-label="Type AUDIOBANK to confirm database reset"
+              placeholder="Type AUDIOCLOUD"
+              aria-label="Type AUDIOCLOUD to confirm database reset"
               className="settings-text-input"
             />
             <div className="flex gap-2">
               <PanelButton
                 variant="danger"
-                disabled={confirmText !== 'AUDIOBANK'}
+                disabled={confirmText !== 'AUDIOCLOUD'}
                 onClick={() => void doReset()}
                 className="settings-danger-button"
               >

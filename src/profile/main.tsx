@@ -90,7 +90,7 @@ export interface HarnessReport {
 declare global {
   interface Window {
     /** Called by `scripts/orbit_profile.mjs` through `webview-eval`. */
-    audiobankHarness?: {
+    audiocloudHarness?: {
       run(options?: OrbitProfileOptions): Promise<HarnessReport>;
       /**
        * What the run is currently doing.
@@ -254,7 +254,7 @@ function Harness() {
           };
         },
       };
-      window.audiobankHarness = harness;
+      window.audiocloudHarness = harness;
     },
     [buffer],
   );
