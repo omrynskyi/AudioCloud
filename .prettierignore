@@ -1,4 +1,6 @@
 dist/
+dist-profile/
+build/
 node_modules/
 src/bindings/
 src-tauri/target/
@@ -8,4 +10,6 @@ src-tauri/gen/
 src-tauri/tests/fixtures/
 package-lock.json
 *.md
-!README.md
+# Anchored: an unanchored `!README.md` un-ignores every README.md at every depth, including
+# the vendored `src-tauri/vendor/annembed/README.md`, which is not this project's to format.
+!/README.md

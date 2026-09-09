@@ -133,6 +133,64 @@ enum Command {
         error: Option<String>,
         reply: Reply<()>,
     },
+    BeginProjectionRun {
+        algorithm: String,
+        params_json: String,
+        sample_count: i64,
+        reply: Reply<i64>,
+    },
+    SetProjectionPoints {
+        run_id: i64,
+        rows: Vec<(i64, [f32; 3])>,
+        reply: Reply<()>,
+    },
+    SetProjectionColors {
+        run_id: i64,
+        rows: Vec<(i64, [f32; 3])>,
+        reply: Reply<()>,
+    },
+    ActivateProjectionRun {
+        run_id: i64,
+        reply: Reply<()>,
+    },
+    DiscardProjectionRun {
+        run_id: i64,
+        reply: Reply<()>,
+    },
+    SetTag {
+        sample_id: i64,
+        tag_name: String,
+        reply: Reply<()>,
+    },
+    UnsetTag {
+        sample_id: i64,
+        tag_name: String,
+        reply: Reply<()>,
+    },
+    SetTagColor {
+        tag_id: i64,
+        color: Option<String>,
+        reply: Reply<()>,
+    },
+    CreateCollection {
+        name: String,
+        sample_ids: Vec<i64>,
+        reply: Reply<i64>,
+    },
+    ReorderCollection {
+        collection_id: i64,
+        sample_ids: Vec<i64>,
+        reply: Reply<()>,
+    },
+    DeleteCollection {
+        collection_id: i64,
+        reply: Reply<()>,
+    },
+    SetSetting {
+        key: String,
+        value: String,
+        reply: Reply<()>,
+    },
     Flush {
         reply: Reply<()>,
     },
@@ -147,6 +205,8 @@ impl Command {
             Command::SetFeatures { rows, .. } => rows.len(),
             Command::SetEmbeddings { rows, .. } => rows.len(),
             Command::MarkDecodeFailed { rows, .. } => rows.len(),
+            Command::SetProjectionPoints { rows, .. } => rows.len(),
+            Command::SetProjectionColors { rows, .. } => rows.len(),
             _ => 0,
         }
     }
@@ -164,6 +224,28 @@ impl Command {
                 | Command::RemoveRoot { .. }
                 | Command::StartScan { .. }
                 | Command::FinishScan { .. }
+                // The swap, and the two commands that bracket it. `is_durable` opens one
+                // `BEGIN IMMEDIATE` around the command and commits before answering, which
+                // is exactly `overview.md` §3.8 step 5's atomic swap -- readers never
+                // observe a half-swapped map because there is no moment at which two runs
+                // are active or none is.
+                | Command::BeginProjectionRun { .. }
+                | Command::ActivateProjectionRun { .. }
+                | Command::DiscardProjectionRun { .. }
+                // Tags and collections are real user work, not a derived cache. A tag the
+                // user typed and a crash a moment later must not be a tag they have to type
+                // again, and the FTS reindex that accompanies it has to land in the same
+                // transaction or search would disagree with the sidebar.
+                | Command::SetTag { .. }
+                | Command::UnsetTag { .. }
+                | Command::SetTagColor { .. }
+                | Command::CreateCollection { .. }
+                | Command::ReorderCollection { .. }
+                | Command::DeleteCollection { .. }
+                // A setting a user just changed in the Settings panel must not appear to
+                // have taken effect and then evaporate on a crash before the next batch
+                // flushes -- the same reasoning as a tag.
+                | Command::SetSetting { .. }
                 | Command::Flush { .. }
         )
     }
@@ -193,7 +275,7 @@ impl WriterHandle {
             batch: None,
         };
         let thread = std::thread::Builder::new()
-            .name("audiobank-db-writer".into())
+            .name("audiocloud-db-writer".into())
             .spawn(move || writer.run(rx))
             .map_err(|e| {
                 io_error(
@@ -286,6 +368,162 @@ impl WriterHandle {
             error,
             reply,
         })
+    }
+
+    /// Opens a shadow `projection_runs` row. Not active, not complete: just a home for the
+    /// coordinates a re-fit is about to write.
+    pub fn begin_projection_run(
+        &self,
+        algorithm: &str,
+        params_json: &str,
+        sample_count: i64,
+    ) -> Result<i64, DbError> {
+        let algorithm = algorithm.to_string();
+        let params_json = params_json.to_string();
+        self.request(|reply| Command::BeginProjectionRun {
+            algorithm,
+            params_json,
+            sample_count,
+            reply,
+        })
+    }
+
+    /// Writes coordinates into a run. Upserts, so a re-run over the same run replaces
+    /// rather than conflicting.
+    pub fn set_projection_points(
+        &self,
+        run_id: i64,
+        rows: Vec<(i64, [f32; 3])>,
+    ) -> Result<(), DbError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        self.request(|reply| Command::SetProjectionPoints {
+            run_id,
+            rows,
+            reply,
+        })
+    }
+
+    /// Writes colors into a run whose points already exist -- an `UPDATE`, not an upsert,
+    /// since a color with no position to attach to is not a state this ever produces.
+    pub fn set_projection_colors(
+        &self,
+        run_id: i64,
+        rows: Vec<(i64, [f32; 3])>,
+    ) -> Result<(), DbError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        self.request(|reply| Command::SetProjectionColors {
+            run_id,
+            rows,
+            reply,
+        })
+    }
+
+    /// **The atomic swap** (`overview.md` §3.8, step 5).
+    ///
+    /// Deactivates whatever was active, activates `run_id`, stamps its `completed_at`, and
+    /// drops the runs it supersedes -- all inside the single `BEGIN IMMEDIATE` the writer
+    /// wraps a durable command in. A reader either sees the whole new map or the whole old
+    /// one.
+    pub fn activate_projection_run(&self, run_id: i64) -> Result<(), DbError> {
+        self.request(|reply| Command::ActivateProjectionRun { run_id, reply })
+    }
+
+    /// Deletes a run and, by cascade, its coordinates.
+    ///
+    /// What a cancelled or failed re-fit calls on its shadow row. Refuses to delete the
+    /// active run: dropping it would leave the app with no map at all, and no caller has a
+    /// reason to want that.
+    pub fn discard_projection_run(&self, run_id: i64) -> Result<(), DbError> {
+        self.request(|reply| Command::DiscardProjectionRun { run_id, reply })
+    }
+
+    /// Attaches a tag to a sample, creating the tag if this is its first use.
+    ///
+    /// Idempotent: tagging an already-tagged sample succeeds and changes nothing.
+    pub fn set_tag(&self, sample_id: i64, tag_name: impl Into<String>) -> Result<(), DbError> {
+        let tag_name = tag_name.into();
+        self.request(|reply| Command::SetTag {
+            sample_id,
+            tag_name,
+            reply,
+        })
+    }
+
+    /// Removes a tag from a sample. The tag itself survives with a count of zero -- see
+    /// [`queries::all_tags`].
+    ///
+    /// [`queries::all_tags`]: super::queries::all_tags
+    pub fn unset_tag(&self, sample_id: i64, tag_name: impl Into<String>) -> Result<(), DbError> {
+        let tag_name = tag_name.into();
+        self.request(|reply| Command::UnsetTag {
+            sample_id,
+            tag_name,
+            reply,
+        })
+    }
+
+    /// Sets (or clears, for `None`) a tag's display color.
+    pub fn set_tag_color(&self, tag_id: i64, color: Option<String>) -> Result<(), DbError> {
+        self.request(|reply| Command::SetTagColor {
+            tag_id,
+            color,
+            reply,
+        })
+    }
+
+    /// Creates a collection holding the given samples, in the order given.
+    pub fn create_collection(
+        &self,
+        name: impl Into<String>,
+        sample_ids: Vec<i64>,
+    ) -> Result<i64, DbError> {
+        let name = name.into();
+        self.request(|reply| Command::CreateCollection {
+            name,
+            sample_ids,
+            reply,
+        })
+    }
+
+    /// Rewrites a collection's member order to match `sample_ids`.
+    ///
+    /// The caller -- `commands::collections::reorder_collection` -- has already checked
+    /// `sample_ids` is exactly the collection's current membership; this just writes the new
+    /// positions.
+    pub fn reorder_collection(
+        &self,
+        collection_id: i64,
+        sample_ids: Vec<i64>,
+    ) -> Result<(), DbError> {
+        self.request(|reply| Command::ReorderCollection {
+            collection_id,
+            sample_ids,
+            reply,
+        })
+    }
+
+    /// Deletes a collection and, by cascade, its membership rows. The samples themselves are
+    /// untouched -- a collection is a saved arrangement, not ownership.
+    pub fn delete_collection(&self, collection_id: i64) -> Result<(), DbError> {
+        self.request(|reply| Command::DeleteCollection {
+            collection_id,
+            reply,
+        })
+    }
+
+    /// Writes one key in the `app_settings` table, creating or overwriting it.
+    pub fn set_setting(
+        &self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Result<(), DbError> {
+        let key = key.into();
+        let value = value.into();
+        self.request(|reply| Command::SetSetting { key, value, reply })
     }
 
     /// Commits the open batch and returns once it is durable.
@@ -432,6 +670,63 @@ impl Writer {
                 reply,
                 finish_scan(conn, scan_id, status, counts, error.as_deref()),
             ),
+            Command::BeginProjectionRun {
+                algorithm,
+                params_json,
+                sample_count,
+                reply,
+            } => answer(
+                reply,
+                begin_projection_run(conn, &algorithm, &params_json, sample_count),
+            ),
+            Command::SetProjectionPoints {
+                run_id,
+                rows,
+                reply,
+            } => answer(reply, set_projection_points(conn, run_id, &rows)),
+            Command::SetProjectionColors {
+                run_id,
+                rows,
+                reply,
+            } => answer(reply, set_projection_colors(conn, run_id, &rows)),
+            Command::ActivateProjectionRun { run_id, reply } => {
+                answer(reply, activate_projection_run(conn, run_id))
+            }
+            Command::DiscardProjectionRun { run_id, reply } => {
+                answer(reply, discard_projection_run(conn, run_id))
+            }
+            Command::SetTag {
+                sample_id,
+                tag_name,
+                reply,
+            } => answer(reply, set_tag(conn, sample_id, &tag_name)),
+            Command::UnsetTag {
+                sample_id,
+                tag_name,
+                reply,
+            } => answer(reply, unset_tag(conn, sample_id, &tag_name)),
+            Command::SetTagColor {
+                tag_id,
+                color,
+                reply,
+            } => answer(reply, set_tag_color(conn, tag_id, color.as_deref())),
+            Command::CreateCollection {
+                name,
+                sample_ids,
+                reply,
+            } => answer(reply, create_collection(conn, &name, &sample_ids)),
+            Command::ReorderCollection {
+                collection_id,
+                sample_ids,
+                reply,
+            } => answer(reply, reorder_collection(conn, collection_id, &sample_ids)),
+            Command::DeleteCollection {
+                collection_id,
+                reply,
+            } => answer(reply, delete_collection(conn, collection_id)),
+            Command::SetSetting { key, value, reply } => {
+                answer(reply, set_setting(conn, &key, &value))
+            }
             Command::Flush { reply } => answer(reply, Ok(())),
             Command::Shutdown => Box::new(|| {}),
         }
@@ -533,11 +828,12 @@ fn upsert_samples(conn: &Connection, rows: &[NewSample]) -> Result<Vec<i64>, DbE
              updated_at   = ?11
          WHERE id = ?1",
     )?;
-    // Contentless FTS: the row is written once, at insert. `filename` is a function of
-    // `rel_path`, which together with `root_id` *is* the row's identity, so an update can
-    // never change it. Tag maintenance (Phase 9) owns the `tags` column.
-    let mut fts =
-        conn.prepare_cached("INSERT INTO samples_fts (rowid, filename, tags) VALUES (?1, ?2, '')")?;
+    // Contentless FTS: the row is written once, at insert. Both `filename` and `path` are
+    // functions of `rel_path`, which together with `root_id` *is* the row's identity, so an
+    // update can never change either. Tag maintenance (Phase 9) owns the `tags` column.
+    let mut fts = conn.prepare_cached(
+        "INSERT INTO samples_fts (rowid, filename, path, tags) VALUES (?1, ?2, ?3, '')",
+    )?;
 
     for row in rows {
         let hash = row.content_hash.as_ref().map(|h| h.as_slice());
@@ -581,7 +877,7 @@ fn upsert_samples(conn: &Connection, rows: &[NewSample]) -> Result<Vec<i64>, DbE
                     now,
                 ))?;
                 let id = conn.last_insert_rowid();
-                fts.execute((id, &row.filename))?;
+                fts.execute((id, &row.filename, &row.rel_path))?;
                 id
             }
         };
@@ -664,6 +960,247 @@ fn mark_decode_failed(conn: &Connection, rows: &[(i64, String)]) -> Result<(), D
         stmt.execute((sample_id, SampleStatus::DecodeFailed.as_str(), error, now))?;
     }
 
+    Ok(())
+}
+
+fn begin_projection_run(
+    conn: &Connection,
+    algorithm: &str,
+    params_json: &str,
+    sample_count: i64,
+) -> Result<i64, DbError> {
+    let id = conn.query_row(
+        "INSERT INTO projection_runs (algorithm, params_json, sample_count, created_at, is_active)
+         VALUES (?1, ?2, ?3, ?4, 0) RETURNING id",
+        (algorithm, params_json, sample_count, now_ms()),
+        |r| r.get(0),
+    )?;
+    Ok(id)
+}
+
+fn set_projection_points(
+    conn: &Connection,
+    run_id: i64,
+    rows: &[(i64, [f32; 3])],
+) -> Result<(), DbError> {
+    let mut stmt = conn.prepare_cached(
+        "INSERT INTO projections (run_id, sample_id, x, y, z) VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(run_id, sample_id) DO UPDATE SET
+             x = excluded.x, y = excluded.y, z = excluded.z",
+    )?;
+    for (sample_id, [x, y, z]) in rows {
+        stmt.execute((run_id, sample_id, x, y, z))?;
+    }
+    Ok(())
+}
+
+fn set_projection_colors(
+    conn: &Connection,
+    run_id: i64,
+    rows: &[(i64, [f32; 3])],
+) -> Result<(), DbError> {
+    let mut stmt = conn.prepare_cached(
+        "UPDATE projections SET r = ?1, g = ?2, b = ?3 WHERE run_id = ?4 AND sample_id = ?5",
+    )?;
+    for (sample_id, [r, g, b]) in rows {
+        stmt.execute((r, g, b, run_id, sample_id))?;
+    }
+    Ok(())
+}
+
+/// Clear, set, prune -- in that order, in one transaction.
+///
+/// The order is forced by the schema. `idx_projection_active` is a partial unique index on
+/// `is_active = 1`, so setting the new flag before clearing the old one is a constraint
+/// violation rather than a momentary inconsistency. That the index makes the wrong order
+/// *fail* rather than *corrupt* is the whole reason it is there.
+///
+/// The prune is deliberately limited to runs that finished. A shadow run being built by
+/// another job has `completed_at IS NULL` and survives, so activating one re-fit cannot
+/// delete another re-fit's work out from under it.
+fn activate_projection_run(conn: &Connection, run_id: i64) -> Result<(), DbError> {
+    let exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM projection_runs WHERE id = ?1",
+        [run_id],
+        |r| r.get(0),
+    )?;
+    if exists == 0 {
+        return Err(DbError::Sqlite(rusqlite::Error::QueryReturnedNoRows));
+    }
+
+    conn.execute(
+        "UPDATE projection_runs SET is_active = 0 WHERE is_active = 1 AND id <> ?1",
+        [run_id],
+    )?;
+    conn.execute(
+        "UPDATE projection_runs SET is_active = 1, completed_at = COALESCE(completed_at, ?2)
+         WHERE id = ?1",
+        (run_id, now_ms()),
+    )?;
+    conn.execute(
+        "DELETE FROM projection_runs WHERE id <> ?1 AND completed_at IS NOT NULL",
+        [run_id],
+    )?;
+    Ok(())
+}
+
+fn discard_projection_run(conn: &Connection, run_id: i64) -> Result<(), DbError> {
+    conn.execute(
+        "DELETE FROM projection_runs WHERE id = ?1 AND is_active = 0",
+        [run_id],
+    )?;
+    Ok(())
+}
+
+/// The tag names indexed against one sample: joined by a space, ordered by name,
+/// case-insensitively.
+///
+/// `V7__fts_index_path.sql`'s rebuild reproduces this expression in SQL, so the two have to
+/// agree on the ordering and the separator or a migrated row indexes differently from one
+/// written by a retag.
+fn fts_tag_text(conn: &Connection, sample_id: i64) -> Result<String, DbError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT t.name FROM tags t
+         JOIN sample_tags st ON st.tag_id = t.id
+         WHERE st.sample_id = ?1
+         ORDER BY t.name COLLATE NOCASE",
+    )?;
+    let names = stmt
+        .query_map([sample_id], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(names.join(" "))
+}
+
+/// Rewrites one sample's `samples_fts` row so search sees the tags the sidebar shows.
+///
+/// A plain `DELETE` then an `INSERT`, which is only possible because V7 recreated the table
+/// with `contentless_delete = 1`. Before that a contentless row was removed by re-supplying
+/// the exact text it had been indexed with, so this took an `old_tags` argument that every
+/// caller had to read *before* making its change -- and a caller that got it wrong corrupted
+/// the index silently rather than failing. Nothing here needs to know what it is replacing
+/// any more.
+fn reindex_sample(conn: &Connection, sample_id: i64) -> Result<(), DbError> {
+    let (filename, path): (String, String) = conn.query_row(
+        "SELECT filename, rel_path FROM samples WHERE id = ?1",
+        [sample_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+
+    conn.prepare_cached("DELETE FROM samples_fts WHERE rowid = ?1")?
+        .execute([sample_id])?;
+
+    let tags = fts_tag_text(conn, sample_id)?;
+    conn.prepare_cached(
+        "INSERT INTO samples_fts (rowid, filename, path, tags) VALUES (?1, ?2, ?3, ?4)",
+    )?
+    .execute((sample_id, &filename, &path, &tags))?;
+
+    Ok(())
+}
+
+/// Attaches a tag, creating it on first use.
+///
+/// The `ON CONFLICT DO NOTHING` plus a separate `SELECT` rather than `RETURNING id`: the
+/// name column is `COLLATE NOCASE`, so "Kick" and "kick" are the same tag, and `RETURNING`
+/// on a no-op conflict returns nothing at all. Two statements say what is meant.
+fn set_tag(conn: &Connection, sample_id: i64, tag_name: &str) -> Result<(), DbError> {
+    let name = tag_name.trim();
+    if name.is_empty() {
+        return Ok(());
+    }
+
+    conn.prepare_cached("INSERT INTO tags (name) VALUES (?1) ON CONFLICT(name) DO NOTHING")?
+        .execute([name])?;
+    let tag_id: i64 =
+        conn.query_row("SELECT id FROM tags WHERE name = ?1", [name], |r| r.get(0))?;
+
+    // The foreign key is what rejects a tag on a sample that does not exist, so an unknown
+    // id is a constraint violation with a real message rather than a silent no-op.
+    conn.prepare_cached(
+        "INSERT INTO sample_tags (sample_id, tag_id) VALUES (?1, ?2)
+         ON CONFLICT(sample_id, tag_id) DO NOTHING",
+    )?
+    .execute((sample_id, tag_id))?;
+
+    reindex_sample(conn, sample_id)
+}
+
+/// Detaches a tag. The `tags` row survives with a count of zero -- a tag the user invented
+/// and then cleared off every sample is still a tag they invented.
+fn unset_tag(conn: &Connection, sample_id: i64, tag_name: &str) -> Result<(), DbError> {
+    let name = tag_name.trim();
+    let removed = conn
+        .prepare_cached(
+            "DELETE FROM sample_tags
+             WHERE sample_id = ?1
+               AND tag_id = (SELECT id FROM tags WHERE name = ?2)",
+        )?
+        .execute((sample_id, name))?;
+
+    if removed == 0 {
+        return Ok(());
+    }
+    reindex_sample(conn, sample_id)
+}
+
+/// Sets or clears one tag's display color.
+fn set_tag_color(conn: &Connection, tag_id: i64, color: Option<&str>) -> Result<(), DbError> {
+    conn.prepare_cached("UPDATE tags SET color = ?2 WHERE id = ?1")?
+        .execute((tag_id, color))?;
+    Ok(())
+}
+
+/// Creates a collection over the given samples, preserving the order they were given in.
+///
+/// `position` is that order, and it is the reason a collection is not just a tag: a tag is a
+/// set, and a collection is a sequence the user arranged.
+fn create_collection(conn: &Connection, name: &str, sample_ids: &[i64]) -> Result<i64, DbError> {
+    conn.prepare_cached("INSERT INTO collections (name, created_at) VALUES (?1, ?2)")?
+        .execute((name.trim(), now_ms()))?;
+    let collection_id = conn.last_insert_rowid();
+
+    let mut insert = conn.prepare_cached(
+        "INSERT INTO collection_members (collection_id, sample_id, position)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(collection_id, sample_id) DO NOTHING",
+    )?;
+    for (position, sample_id) in sample_ids.iter().enumerate() {
+        insert.execute((collection_id, sample_id, position as i64))?;
+    }
+
+    Ok(collection_id)
+}
+
+/// Rewrites `position` for every member of `collection_id` to match `sample_ids`'s order.
+fn reorder_collection(
+    conn: &Connection,
+    collection_id: i64,
+    sample_ids: &[i64],
+) -> Result<(), DbError> {
+    let mut update = conn.prepare_cached(
+        "UPDATE collection_members SET position = ?3
+         WHERE collection_id = ?1 AND sample_id = ?2",
+    )?;
+    for (position, sample_id) in sample_ids.iter().enumerate() {
+        update.execute((collection_id, sample_id, position as i64))?;
+    }
+    Ok(())
+}
+
+/// Deletes a collection. `collection_members` cascades via its foreign key.
+fn delete_collection(conn: &Connection, collection_id: i64) -> Result<(), DbError> {
+    conn.prepare_cached("DELETE FROM collections WHERE id = ?1")?
+        .execute([collection_id])?;
+    Ok(())
+}
+
+/// Upserts one `app_settings` row.
+fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<(), DbError> {
+    conn.prepare_cached(
+        "INSERT INTO app_settings (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )?
+    .execute((key, value))?;
     Ok(())
 }
 
@@ -897,6 +1434,117 @@ mod tests {
             .is_empty());
     }
 
+    /// The index has to cover the folders, because the folders are how a sample library is
+    /// organized -- `Kicks/` is where the kicks are, and V1 could not see it.
+    #[test]
+    fn search_finds_a_sample_by_the_folder_it_is_filed_under() {
+        let (_dir, db) = temp_db();
+        let writer = db.writer();
+        let root = writer.add_root("/samples", None).unwrap();
+        let ids = writer
+            .upsert_samples(vec![
+                sample(root, "UK UNDERGROUND KIT/Kicks/Apex.wav"),
+                sample(root, "UK UNDERGROUND KIT/Snares/Crown.wav"),
+            ])
+            .unwrap();
+        writer.flush().unwrap();
+
+        let conn = db.read().unwrap();
+        assert_eq!(queries::search_samples(&conn, "kicks", 10).unwrap(), [ids[0]]);
+        assert_eq!(
+            queries::search_samples(&conn, "snares", 10).unwrap(),
+            [ids[1]]
+        );
+        let mut both = queries::search_samples(&conn, "underground", 10).unwrap();
+        both.sort_unstable();
+        assert_eq!(both, ids, "a kit name should reach everything filed under it");
+    }
+
+    /// The corruption V7 exists to end.
+    ///
+    /// `samples_fts` is a virtual table, so the `ON DELETE CASCADE` from `library_roots` never
+    /// reached it and nothing else deleted from it either. `samples.id` is a plain
+    /// `INTEGER PRIMARY KEY`, so the next scan reissued the ids the removed library had been
+    /// using and the index started answering with the *old* library's filenames -- on the
+    /// development database, `kick` returned a file called `Snare - Razor.wav`. This is that
+    /// exact sequence: fill a root, remove it, scan a different one into the reissued ids.
+    #[test]
+    fn removing_a_root_takes_its_rows_out_of_the_search_index() {
+        let (_dir, db) = temp_db();
+        let writer = db.writer();
+
+        let first = writer.add_root("/first", None).unwrap();
+        writer
+            .upsert_samples(vec![sample(first, "kits/KICK_Distorted.wav")])
+            .unwrap();
+        writer.flush().unwrap();
+
+        writer.remove_root(first).unwrap();
+        writer.flush().unwrap();
+
+        {
+            let conn = db.read().unwrap();
+            assert!(
+                queries::search_samples(&conn, "kick", 10).unwrap().is_empty(),
+                "a removed root's samples must not still be searchable"
+            );
+        }
+
+        let second = writer.add_root("/second", None).unwrap();
+        let reissued = writer
+            .upsert_samples(vec![sample(second, "kits/Snare_Razor.wav")])
+            .unwrap();
+        writer.flush().unwrap();
+
+        let conn = db.read().unwrap();
+        assert!(
+            queries::search_samples(&conn, "kick", 10).unwrap().is_empty(),
+            "searching for the removed library's word must not return the new library's file"
+        );
+        assert_eq!(
+            queries::search_samples(&conn, "snare", 10).unwrap(),
+            reissued,
+            "the new file must be findable by its own name"
+        );
+    }
+
+    /// Retagging deletes and reinserts the fts row. Under `contentless_delete` that is a real
+    /// delete; before V7 it was a re-supply of the old text, and getting it wrong left the
+    /// index holding both versions at once.
+    #[test]
+    fn retagging_leaves_exactly_one_indexed_row() {
+        let (_dir, db) = temp_db();
+        let writer = db.writer();
+        let root = writer.add_root("/samples", None).unwrap();
+        let ids = writer
+            .upsert_samples(vec![sample(root, "kits/Apex.wav")])
+            .unwrap();
+        writer.flush().unwrap();
+
+        writer.set_tag(ids[0], "punchy").unwrap();
+        writer.set_tag(ids[0], "vinyl").unwrap();
+        writer.unset_tag(ids[0], "punchy").unwrap();
+        writer.flush().unwrap();
+
+        let conn = db.read().unwrap();
+        assert_eq!(
+            queries::search_samples(&conn, "vinyl", 10).unwrap(),
+            ids,
+            "a surviving tag must still be searchable"
+        );
+        assert!(
+            queries::search_samples(&conn, "punchy", 10)
+                .unwrap()
+                .is_empty(),
+            "a removed tag must leave no trace in the index"
+        );
+        assert_eq!(
+            queries::search_samples(&conn, "apex", 10).unwrap(),
+            ids,
+            "one row, not three: the filename must match exactly once"
+        );
+    }
+
     /// An upsert must not erase what a later stage already learned about the row.
     #[test]
     fn an_upsert_preserves_columns_the_caller_left_unset() {
@@ -1102,5 +1750,97 @@ mod tests {
 
         db.writer().flush().unwrap();
         assert_eq!(committed(&db), 800);
+    }
+
+    /// The invariant the schema enforces and the writer must not violate: setting the new
+    /// active flag before clearing the old one is a constraint violation, not a momentary
+    /// inconsistency. This is the test that fails if the two `UPDATE`s ever swap places.
+    #[test]
+    fn activating_a_run_deactivates_the_one_it_replaces() {
+        let (_dir, db) = temp_db();
+        let writer = db.writer();
+
+        let first = writer.begin_projection_run("pca", "{}", 3).unwrap();
+        writer.activate_projection_run(first).unwrap();
+        let second = writer.begin_projection_run("umap", "{}", 3).unwrap();
+        writer.activate_projection_run(second).unwrap();
+
+        let conn = db.read().unwrap();
+        let active: Vec<i64> = conn
+            .prepare("SELECT id FROM projection_runs WHERE is_active = 1")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(active, vec![second]);
+
+        let run = queries::projection_run(&conn, second).unwrap().unwrap();
+        assert_eq!(run.algorithm, "umap");
+        assert!(run.completed_at.is_some(), "an active run must be complete");
+    }
+
+    /// Activation prunes what it supersedes -- but only runs that finished. A shadow run
+    /// another job is still filling has no `completed_at` and must survive, or two
+    /// concurrent re-fits delete each other's work.
+    #[test]
+    fn activation_prunes_finished_runs_and_spares_shadows() {
+        let (_dir, db) = temp_db();
+        let writer = db.writer();
+        let root = writer.add_root("/samples", None).unwrap();
+        let ids = writer
+            .upsert_samples(vec![sample(root, "a.wav"), sample(root, "b.wav")])
+            .unwrap();
+
+        let old = writer.begin_projection_run("pca", "{}", 2).unwrap();
+        writer
+            .set_projection_points(old, vec![(ids[0], [1.0, 2.0, 3.0])])
+            .unwrap();
+        writer.activate_projection_run(old).unwrap();
+
+        let shadow = writer.begin_projection_run("umap", "{}", 2).unwrap();
+        let fresh = writer.begin_projection_run("pca", "{}", 2).unwrap();
+        writer
+            .set_projection_points(fresh, vec![(ids[1], [4.0, 5.0, 6.0])])
+            .unwrap();
+        writer.activate_projection_run(fresh).unwrap();
+
+        let conn = db.read().unwrap();
+        let ids_left: Vec<i64> = queries::projection_runs(&conn)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert!(ids_left.contains(&fresh), "the new run was pruned");
+        assert!(
+            ids_left.contains(&shadow),
+            "an unfinished shadow run was pruned"
+        );
+        assert!(!ids_left.contains(&old), "the superseded run survived");
+
+        // And the pruned run's coordinates went with it, by cascade.
+        assert_eq!(queries::count_projection_points(&conn, old).unwrap(), 0);
+        assert_eq!(
+            queries::active_projection_points(&conn).unwrap(),
+            vec![(ids[1], [4.0, 5.0, 6.0])]
+        );
+    }
+
+    /// Discarding is for shadows. The active run is the map the user is looking at, and no
+    /// caller has a reason to want it gone.
+    #[test]
+    fn the_active_run_cannot_be_discarded() {
+        let (_dir, db) = temp_db();
+        let writer = db.writer();
+        let run = writer.begin_projection_run("pca", "{}", 0).unwrap();
+        writer.activate_projection_run(run).unwrap();
+
+        writer.discard_projection_run(run).unwrap();
+
+        let conn = db.read().unwrap();
+        assert_eq!(
+            queries::active_projection_run(&conn).unwrap().map(|r| r.id),
+            Some(run)
+        );
     }
 }

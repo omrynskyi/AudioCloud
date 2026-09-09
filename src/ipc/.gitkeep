@@ -1,2 +1,0 @@
-Phase 6: commands.ts (typed invoke wrappers), binary.ts (ArrayBuffer decoders for
-overview.md 6.3 payloads), channels.ts (progress Channel subscriptions).

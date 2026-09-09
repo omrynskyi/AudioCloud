@@ -1,4 +1,4 @@
-# AudioBank — System Architecture & Design
+# AudioCloud — System Architecture & Design
 
 A desktop ML sample visualizer for macOS. Scans a user's sample library, embeds every
 file with a CLAP audio encoder, projects the embedding space to 3D, and renders the
@@ -11,7 +11,7 @@ implementation roadmap.
 
 ## 1. System Overview
 
-AudioBank turns a folder of audio files into a navigable space. Similar-sounding samples
+AudioCloud turns a folder of audio files into a navigable space. Similar-sounding samples
 land near each other, so a user finds "that kind of kick" by flying to a region rather
 than by remembering a filename.
 
@@ -75,6 +75,13 @@ measurable target with a method.
 | Cold start       | < 2 s to interactive                 | Lazy ML session init; point cloud loads as one binary blob |
 | Binary size      | ~15 MB `.app`                        | No Chromium, no Node runtime, no Python interpreter        |
 | Audition latency | < 50 ms hover-to-sound               | Native audio thread, decode-ahead cache                    |
+
+Hover-to-sound is not a property of the map. Anywhere a sample is *named* — a point, a search
+result, a collection member, the inspector's neighbor list — hovering it plays it. The map
+reports its GPU pick and a list row reports its pointer enter into the same
+`store/scene.ts` field, and `src/audition.ts` is the only thing that turns that field into
+sound, so the rule is written once and every surface gets it (along with the map highlight and
+the neighbor lookup that already watch the same field).
 
 ### What "no Node/Python dependencies" actually means
 
@@ -159,7 +166,7 @@ the threat model.
 
 ### Why the app is not App-Sandboxed
 
-AudioBank's core function is scanning arbitrary user-chosen folders, typically large
+AudioCloud's core function is scanning arbitrary user-chosen folders, typically large
 sample libraries on external drives. The macOS App Sandbox permits this only through
 security-scoped bookmarks, which must be re-resolved per launch and are fragile across
 volume remounts — exactly the failure mode that would make a library silently empty
@@ -703,8 +710,16 @@ Instead, an ID-color pass:
 3. `readPixels` one pixel, decode, look up the sample.
 
 `readPixels` synchronizes the GPU pipeline, which is a real stall — so it runs **on
-demand only**: on click always, and on hover throttled to ~20 Hz behind a
-`requestAnimationFrame` gate. Not every frame, and never during an active orbit drag.
+demand only**: on click always, and on hover behind a rate gate, never during an active
+orbit drag.
+
+That gate was originally ~20 Hz, and that was a mistake worth recording. Suppressing picks
+during a drag already removes the case the stall actually hurts, and the scene renders on
+demand, so a pick between drags stalls a pipeline with nothing else queued — while 20 Hz put
+0–50 ms of dead time in front of *every* audition, more than the whole rest of the
+hover-to-sound chain combined, and quantized a cursor sweep so coarsely that most points
+crossed were skipped without a sound. The gate is now 120 Hz: a bound against a pointer
+device reporting faster than the display can matter, not a cost budget.
 
 The alternative — a WebGL2 `PIXEL_PACK_BUFFER` with an async fence — removes the stall
 and is worth doing if profiling shows the sync read hurting. It is a Phase 10
@@ -1030,7 +1045,7 @@ a 220 MB delta.
 ## 9. Repository Layout
 
 ```
-audiobank/
+audiocloud/
 ├── overview.md                 # this document
 ├── task.md                     # implementation roadmap
 ├── package.json                # build-time only: vite, react, tailwind, three, r3f

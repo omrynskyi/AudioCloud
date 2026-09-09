@@ -1,7 +1,12 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "main",
-  "description": "Minimum permission set for the main window. Phase 6 revisits this; the `fs` plugin is deliberately NOT granted -- all filesystem access goes through typed Rust commands (overview.md 2, Capabilities and the ACL).",
+  "description": "Minimum permission set for the main window (overview.md 2, 'Capabilities and the ACL'). Everything the frontend does, it does through the typed commands in overview.md 6.1; this list is what it may call OUTSIDE them, and it is deliberately almost empty. Notably absent, each on purpose: (1) the `fs` plugin -- the frontend never touches the filesystem, it asks the core for data by sample id and gets bytes back, which removes an entire class of path-traversal bug from the threat model; (2) `opener` -- the plugin is registered so `reveal_in_finder` can call it from Rust with a path built from the database, and granting the JS side would hand the WebView the ability to open arbitrary paths, which is the one thing that command exists to avoid. `dialog:allow-open` and `dialog:allow-save` (Phase 9) are the one narrow exception to 'the frontend never touches the filesystem': both show native OS UI and hand back only the single path the user picked through it, which is the same 'a path the user chose, passed as an argument' shape `add_library_root` already accepts -- the frontend still never discovers or constructs a path on its own. `core:window:allow-start-dragging` is here because the window has titleBarStyle 'Overlay' and the custom title bar has to be draggable.",
   "windows": ["main"],
-  "permissions": ["core:default", "opener:default"]
+  "permissions": [
+    "core:default",
+    "core:window:allow-start-dragging",
+    "dialog:allow-open",
+    "dialog:allow-save"
+  ]
 }

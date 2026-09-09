@@ -10,6 +10,9 @@
 //! changes nothing on the producer side, which is the point -- the throttle is a property
 //! of the pipeline, not a favour the IPC layer does for it.
 
+use serde::Serialize;
+use ts_rs::TS;
+
 use std::{
     sync::{
         atomic::{AtomicU64, AtomicU8, Ordering},
@@ -29,7 +32,9 @@ pub const TICK: Duration = Duration::from_millis(100);
 /// "Mostly", because the stages overlap by design -- the walker is still finding files
 /// while the embedder is running batches. The phase is the furthest stage that has started,
 /// which is what a progress label is actually asking about.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "ScanPhase.ts")]
 #[repr(u8)]
 pub enum ScanPhase {
     Walking = 0,
@@ -183,9 +188,14 @@ impl ScanProgress {
 
 /// What one tick reports.
 ///
-/// `ts-rs` derives and the `Channel<ScanProgress>` that carries this are Phase 6; the shape
-/// is `overview.md` §6.5's, so that phase adds derives rather than a translation layer.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The shape is `overview.md` §6.5's, which is why Phase 6 could add derives here rather
+/// than a translation layer: this *is* the wire type, carried by `Channel<ScanEvent>` as
+/// the `progress` variant and exported to TypeScript as `ScanProgress`. It is named
+/// `ProgressSnapshot` in Rust only because [`ScanProgress`] -- the counter set -- got the
+/// obvious name first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename = "ScanProgress", export_to = "ScanProgress.ts")]
 pub struct ProgressSnapshot {
     pub scan_id: i64,
     pub phase: ScanPhase,
@@ -241,27 +251,48 @@ impl Ticker {
     /// The sink runs on the ticker's own thread and must not block for long: it is between
     /// the counters and the UI, and a slow sink turns a 10 Hz throttle into whatever the
     /// sink's latency is.
-    pub fn spawn<F>(progress: Arc<ScanProgress>, scan_id: i64, mut sink: F) -> Self
+    pub fn spawn<F>(progress: Arc<ScanProgress>, scan_id: i64, sink: F) -> Self
     where
         F: FnMut(ProgressSnapshot) + Send + 'static,
+    {
+        Self::watch(progress, move |p| p.snapshot(scan_id), sink)
+    }
+
+    /// The general form: sample any shared state through `snapshot`, hand the result to
+    /// `sink`, at most once per [`TICK`], skipping repeats and guaranteeing a last one.
+    ///
+    /// Generic because the throttle is a property of the *pipeline*, not of scanning:
+    /// Phase 5's projection re-fit is a long operation that reports progress under the same
+    /// rule (cross-cutting rule 6), and it deserves the coalescing and the terminal-event
+    /// guarantee rather than a second thread that reimplements them slightly differently.
+    ///
+    /// The `snapshot` closure and the sink both run on the ticker's own thread. Neither may
+    /// block for long: they sit between the counters and the UI, and a slow one turns a
+    /// 10 Hz throttle into whatever its latency is.
+    pub fn watch<T, S, N, F>(state: Arc<T>, snapshot: N, mut sink: F) -> Self
+    where
+        T: Send + Sync + 'static,
+        S: Clone + PartialEq + Send + 'static,
+        N: Fn(&T) -> S + Send + 'static,
+        F: FnMut(S) + Send + 'static,
     {
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = Arc::clone(&stop);
 
         let handle = std::thread::Builder::new()
-            .name("audiobank-progress".into())
+            .name("audiocloud-progress".into())
             .spawn(move || {
-                let mut last: Option<ProgressSnapshot> = None;
+                let mut last: Option<S> = None;
                 loop {
                     let stopping = flag.load(Ordering::Relaxed);
-                    let snapshot = progress.snapshot(scan_id);
+                    let current = snapshot(&state);
 
                     // Identical snapshots are dropped: an idle stage should cost the
                     // WebView nothing at all, and a progress bar that re-renders 10 times a
                     // second with the same numbers is the anti-pattern in a smaller hat.
-                    if stopping || last.as_ref() != Some(&snapshot) {
-                        sink(snapshot.clone());
-                        last = Some(snapshot);
+                    if stopping || last.as_ref() != Some(&current) {
+                        sink(current.clone());
+                        last = Some(current);
                     }
                     if stopping {
                         break;

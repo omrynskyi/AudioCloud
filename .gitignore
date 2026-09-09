@@ -7,6 +7,12 @@ node_modules/
 dist/
 dist-ssr/
 *.local
+# The Phase 7 measurement harness's bundle. Built on demand by `npm run profile`; it must
+# never ship, which is why it is a separate Vite mode and a separate directory.
+dist-profile/
+# Scratch: the compiled WKWebView runner, the pages the probes serve, downloaded models, and
+# any profile JSON. Nothing in here is tracked and nothing in here is an input to a build.
+/build/
 
 # Tauri generated
 src-tauri/gen/

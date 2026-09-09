@@ -1,14 +1,14 @@
 [package]
-name = "audiobank"
+name = "audiocloud"
 version = "0.1.0"
 description = "Spatial browser for large sample libraries"
-authors = ["AudioBank"]
+authors = ["AudioCloud"]
 edition = "2021"
 rust-version = "1.88"
 
 [lib]
 # Tauri's mobile entry point requires a cdylib; the desktop binary links the rlib.
-name = "audiobank_lib"
+name = "audiocloud_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
@@ -17,6 +17,9 @@ tauri-build = { version = "2.6.3", features = [] }
 [dependencies]
 tauri = { version = "2.11.5", features = [] }
 tauri-plugin-opener = "2.5.4"
+# Folder picker ("add library root") and save-destination picker ("export collection") --
+# `task.md` Phase 9.
+tauri-plugin-dialog = "2.7.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 thiserror = "2.0.20"
@@ -43,32 +46,58 @@ rayon = "1.12.0"
 realfft = "3.5.0"
 ebur128 = "0.1.10"
 crossbeam-channel = "0.5.16"
+tokio = { version = "1.49.0", features = ["rt", "sync", "time"] }
 symphonia = { version = "0.6.1", features = ["aac", "alac", "isomp4", "mp3", "aiff", "caf"] }
 
-# Model provisioning (overview.md 3.5). `stream` is the feature that makes the download
-# resumable: without it `reqwest` only yields a whole body, and materializing a whole
-# 200 MB body is precisely what this download must never do.
-reqwest = { version = "0.13.4", default-features = false, features = [
-  "rustls",
-  "http2",
-  "system-proxy",
-  "stream",
-] }
-sha2 = "0.11.0"
-futures-util = { version = "0.3.31", default-features = false, features = ["std"] }
-# Tauri already depends on tokio; naming it here is about features, not about the version.
-# `fs` for the async file handle the download writes through, `io-util` for `write_all`,
-# `time` for the progress throttle, `rt`/`sync` so the download can be driven from a test
-# without an `AppHandle`.
-tokio = { version = "1.49.0", features = ["fs", "io-util", "rt", "sync", "time"] }
+# Projection (overview.md 3.7). `nalgebra` is the small, boring half: PCA's eigenproblem
+# and Procrustes' 3x3 SVD, both dense and both deterministic.
+nalgebra = { version = "0.35.0", default-features = false, features = ["std"] }
 
-# Inference (overview.md 3.4). **Pinned exactly** -- cross-cutting rule 7. `ort` is a
-# release candidate whose API moves between rcs, which is why `model/session.rs` is the
-# only file in the crate permitted to name an `ort` type: an upgrade has one blast radius.
-ort = { version = "=2.0.0-rc.13", features = ["coreml"] }
+# The other half. `annembed` is **vendored** (`src-tauri/vendor/annembed`) rather than
+# resolved from crates.io -- overview.md 10, risk 2: a 0.1.x crate with one maintainer
+# decides the layout of the user's entire map, so a yank must not be able to break a build.
+# See that directory's Cargo.toml for what was changed (the manifest, nothing else).
+#
+# `macos-accelerate` is the LAPACK backend. AudioCloud is a macOS application and Accelerate
+# is already on every machine it runs on; the alternative features build or link OpenBLAS.
+annembed = { path = "vendor/annembed", features = ["macos-accelerate"] }
+
+# The kNN graph `annembed` embeds. Named here rather than reached through `annembed`'s
+# re-export because `projection/umap.rs` builds the index itself: it is what decides that
+# the metric is cosine and that vectors arrive from the mmap a chunk at a time.
+hnsw_rs = "0.3.4"
+
+# TypeScript bindings (`overview.md` §6.8). Chosen over `specta` because `specta` is still
+# on a `2.0.0-rc` line and this project already carries one pre-1.0 dependency on the
+# critical path (`ort`). Derives live on the IPC types; `cargo test` writes `src/bindings/`,
+# and CI fails the build if what it writes differs from what is committed.
+#
+# A normal dependency rather than a dev-dependency: `#[derive(TS)]` sits on types the crate
+# compiles in every profile, so the trait has to be there in every profile too. The export
+# itself is a `#[test]`, and none of it is reachable from a release build.
+ts-rs = "12.0.1"
+cpal = "0.18"
+ringbuf = "0.5"
+bhtsne = "0.7.12"
+
+# One FFI call: `pthread_set_qos_class_self_np`, so a background re-fit is genuinely
+# background and not merely called that. `overview.md` §3.8 asks for "low priority" and on
+# macOS that word means a QoS class, which no portable Rust API exposes. Already in the tree
+# transitively; named here so the direct use has a direct dependency, and scoped to Apple
+# targets because `qos_class_t` does not exist anywhere else.
+[target.'cfg(target_vendor = "apple")'.dependencies]
+libc = "0.2.189"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+# `test` gives the mock runtime, which is the only way to invoke a `#[tauri::command]`
+# without a window. `tests/surface.rs` uses it to prove that the commands in `overview.md`
+# §6.1 are actually reachable -- that they deserialize their arguments, hand back the right
+# transport, and serialize `AppError` as the tagged union the frontend switches on. Nothing
+# else in the crate can check any of that, because none of it exists until Tauri routes a
+# request. Dev-only: `cargo build --release` does not compile dev-dependencies, so the
+# feature is not in the shipped binary.
+tauri = { version = "2.11.5", features = ["test"] }
 # `macros` for `#[tokio::test]`, which the download tests need in order to drive an async
 # `ensure` to completion. The HTTP server they run against is `std::net` on a plain thread
 # -- see `model::download`'s tests for why it is hand-rolled.

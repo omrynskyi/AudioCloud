@@ -1,20 +1,12 @@
-//! CLAP inference: the batching accumulator over one shared session.
+//! Embedding: the batching accumulator over one shared embedder.
 //!
-//! One session, shared as an `Arc` across every stage that wants it -- never one per
-//! thread. `overview.md` §3.4 asks for `Arc<Session>` on the grounds that concurrent
-//! `run()` is safe; it is not (see [`crate::model::session`]), so inference is serialized
-//! behind that session's own `Mutex` and the parallelism lives upstream in decode and mel.
-//! **Batching is what makes that affordable**, which is why it is load-bearing here rather
-//! than an optimization: the serialized region is one matmul per [`BatchConfig::size`]
-//! spectrograms instead of one per file.
+//! Batching keeps the spectrogram-to-vector stage bounded and lets the active embedder
+//! process several samples at a time.
 //!
 //! Two things this module does *not* do, both deliberate:
 //!
-//! - **It never names an `ort` type.** It talks to the [`Embed`] trait, which
-//!   [`ModelSession`] implements. That keeps cross-cutting rule 7's blast radius at one
-//!   file, and it is also what lets the accumulator's own behaviour -- batch sizing, the
-//!   flush timeout, the tail of a scan -- be tested against a counting fake with no ONNX
-//!   Runtime in the process at all.
+//! - It talks only to the [`Embed`] trait, keeping the batching logic independent of the
+//!   concrete fingerprint implementation.
 //! - **It does not decide what a batch means for the database.** It attaches vectors to
 //!   rows and passes them on; `pipeline::persist_stage` owns `embeddings.bin` and the
 //!   `samples` update.
@@ -27,7 +19,6 @@ use std::{
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 
 use crate::{
-    model::session::{ModelSession, SessionError},
     pipeline::{
         decode::{BufferPool, PooledBuffer},
         mel::{MEL_BINS, MEL_FRAMES},
@@ -92,21 +83,9 @@ pub trait Embed: Send + Sync {
     fn embedding_dim(&self) -> usize;
 }
 
-impl Embed for ModelSession {
-    fn embed_batch(&self, mels: &[f32], count: usize) -> Result<Vec<f32>, EmbedError> {
-        ModelSession::embed_batch(self, mels, count).map_err(EmbedError::from)
-    }
-
-    fn embedding_dim(&self) -> usize {
-        ModelSession::embedding_dim(self)
-    }
-}
-
 /// What inference can fail at, from the pipeline's side of the trait.
 #[derive(Debug, thiserror::Error)]
 pub enum EmbedError {
-    #[error(transparent)]
-    Session(#[from] SessionError),
 
     #[error("the model returned {actual} values for a batch of {count} x {dim}")]
     ShortBatch {

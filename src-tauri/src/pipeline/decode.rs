@@ -54,7 +54,7 @@ const RESAMPLE_CHUNK: usize = 1024;
 /// `f_cutoff: None` is rubato's recommended setting: it picks the highest cutoff that keeps
 /// aliasing under the window's sidelobe level for this filter length, which is a better
 /// answer than any constant guessed here.
-fn sinc_parameters() -> SincInterpolationParameters {
+pub(crate) fn sinc_parameters() -> SincInterpolationParameters {
     SincInterpolationParameters {
         sinc_len: 64,
         f_cutoff: None,

@@ -32,6 +32,7 @@ pub mod decode;
 pub mod dsp_embed;
 pub mod embed;
 pub mod features;
+pub mod fingerprint_embed;
 pub mod mel;
 pub mod progress;
 pub mod walk;
@@ -53,7 +54,6 @@ use crate::{
         queries, Database, DbError, EmbeddingLoc, NewSample, SampleFeatures, SampleStatus,
         ScanCounts, ScanStatus,
     },
-    model::session::ModelSession,
     pipeline::mel::Padding,
 };
 
@@ -142,10 +142,7 @@ impl CancellationToken {
 /// every call site again.
 pub struct ScanOptions<'a> {
     cancel: &'a CancellationToken,
-    /// What turns a spectrogram into a vector. `dyn` rather than a concrete session
-    /// because CLAP is not the only answer: `dsp_embed::DspEmbedder` implements the same
-    /// trait at a ten-thousandth of the cost, and `tests/evaluation.rs` exists to find out
-    /// which one a drum library is actually better served by.
+    /// What turns a spectrogram into a vector.
     embedder: Option<Arc<dyn Embed>>,
     padding: Padding,
     batch: BatchConfig,
@@ -155,6 +152,15 @@ pub struct ScanOptions<'a> {
     /// the middle of a measurement.
     #[allow(clippy::type_complexity)]
     sink: Option<Box<dyn FnMut(ProgressSnapshot) + Send + 'static>>,
+    /// Called once per root, with the `scan_runs` id, the instant that row is opened.
+    ///
+    /// The seam Phase 6's `scan_library` needs. `overview.md` §6.1 has that command return
+    /// a `scanId` while the scan itself keeps running, and the id is assigned by the insert
+    /// in [`scan_root_with`] -- so the command spawns the job, waits on this callback for
+    /// the id, registers the cancellation token under it, and answers. Milliseconds, not a
+    /// scan's duration.
+    #[allow(clippy::type_complexity)]
+    on_start: Option<Box<dyn Fn(i64) + Send + Sync + 'static>>,
 }
 
 impl std::fmt::Debug for ScanOptions<'_> {
@@ -165,6 +171,7 @@ impl std::fmt::Debug for ScanOptions<'_> {
             .field("padding", &self.padding)
             .field("batch", &self.batch)
             .field("ticking", &self.sink.is_some())
+            .field("watched", &self.on_start.is_some())
             .finish()
     }
 }
@@ -179,15 +186,11 @@ impl<'a> ScanOptions<'a> {
             batch: BatchConfig::default(),
             progress: Arc::new(ScanProgress::new()),
             sink: None,
+            on_start: None,
         }
     }
 
-    /// Attaches the CLAP session, turning this into a full five-stage scan.
-    pub fn with_session(self, session: Arc<ModelSession>) -> Self {
-        self.with_embedder(session)
-    }
-
-    /// Attaches any embedder. The model is one; `dsp_embed::DspEmbedder` is another.
+    /// Attaches an embedder, turning this into a full five-stage scan.
     pub fn with_embedder(mut self, embedder: Arc<dyn Embed>) -> Self {
         self.embedder = Some(embedder);
         self
@@ -195,8 +198,6 @@ impl<'a> ScanOptions<'a> {
 
     /// Chooses what the mel front-end does with audio shorter than its ten-second window.
     ///
-    /// [`Padding::RepeatPad`] is CLAP's own and is what the parity gate is stated against,
-    /// so it is the default and must stay so for any scan feeding the model.
     /// [`Padding::ZeroPad`] is for embedders that measure the envelope, where tiling a
     /// 200 ms kick twenty-five times would manufacture a decay the file does not have.
     pub fn with_padding(mut self, padding: Padding) -> Self {
@@ -218,6 +219,16 @@ impl<'a> ScanOptions<'a> {
         F: FnMut(ProgressSnapshot) + Send + 'static,
     {
         self.sink = Some(Box::new(sink));
+        self
+    }
+
+    /// Registers a callback that receives the `scan_runs` id as soon as the row is opened,
+    /// before any file is touched.
+    pub fn on_start<F>(mut self, f: F) -> Self
+    where
+        F: Fn(i64) + Send + Sync + 'static,
+    {
+        self.on_start = Some(Box::new(f));
         self
     }
 
@@ -510,6 +521,9 @@ pub fn scan_root_with(
     );
 
     let scan_id = db.writer().start_scan(Some(root_id))?;
+    if let Some(on_start) = options.on_start.as_ref() {
+        on_start(scan_id);
+    }
     // The ticker starts before the stages and is dropped after them, so the terminal
     // snapshot reports the scan's real final counts rather than whatever the last 100 ms
     // boundary happened to catch (`overview.md` §6.5).
@@ -616,7 +630,7 @@ fn run_stages(
 
     std::thread::scope(|scope| -> Result<(u64, u64), PipelineError> {
         let persist = std::thread::Builder::new()
-            .name("audiobank-persist".into())
+            .name("audiocloud-persist".into())
             .spawn_scoped(scope, || persist_stage(db, done_rx, progress))
             .map_err(|e| DbError::Io {
                 context: "spawning the persist stage".into(),
@@ -624,7 +638,7 @@ fn run_stages(
             })?;
 
         let embedder = std::thread::Builder::new()
-            .name("audiobank-embed".into())
+            .name("audiocloud-embed".into())
             .spawn_scoped(scope, {
                 let embedder = embedder.clone();
                 move || {
@@ -668,7 +682,7 @@ fn run_stages(
             })?;
 
         let walker = std::thread::Builder::new()
-            .name("audiobank-walk".into())
+            .name("audiocloud-walk".into())
             .spawn_scoped(scope, move || {
                 let ctx = walk::WalkContext {
                     root_id,

@@ -1,51 +1,84 @@
 //! Application assembly: the Tauri builder, plugin registration, and managed state.
 //!
 //! Nothing that can block belongs here. Long-lived resources (the SQLite writer thread,
-//! the read pool, the `ort` session, the audio engine) are constructed lazily and handed
+//! the read pool, the audio engine) are constructed lazily and handed
 //! to `.manage()`; see `overview.md` §7 on keeping cold start off the critical path.
 
 pub mod audio;
 pub mod commands;
 pub mod db;
 pub mod error;
-pub mod model;
+pub mod ipc;
 pub mod pipeline;
 pub mod projection;
 pub mod protocol;
 
+use std::sync::Arc;
+
 use tauri::Manager;
 
-use crate::{db::Database, model::Model};
+use crate::{
+    audio::{peaks::PeakCache, AudioPlayer},
+    commands::Jobs,
+    db::Database,
+    protocol::peaks,
+};
 
-/// Dimensionality of a CLAP audio-tower embedding (`overview.md` §3.4).
+/// Dimensionality of the stored per-sample vector.
 ///
-/// Fixed here rather than discovered from the ONNX graph so the data layer can be built and
-/// benchmarked before the model exists (Phase 3). Phase 3's parity gate is what proves the
-/// two agree.
-pub const EMBEDDING_DIM: usize = 512;
+/// [`pipeline::fingerprint_embed::FINGERPRINT_DIM`] -- the active embedder and the width
+/// `embeddings.bin` is opened at.
+pub const EMBEDDING_DIM: usize = pipeline::fingerprint_embed::FINGERPRINT_DIM;
 
-/// The command surface.
+/// The command surface (`overview.md` §6.1).
 ///
-/// Empty in release: Phase 2's only commands are the development scan triggers in
-/// [`commands::dev`], and the real surface (`overview.md` §6.1) is Phase 6. Shipping a
-/// release build with no commands is correct for a phase whose frontend is still an empty
-/// window.
-#[cfg(debug_assertions)]
-fn dev_commands() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static {
+/// Every command the frontend can call, in one list. Four of them -- `get_point_cloud`,
+/// `get_point_colors`, `get_feature_column`, `query_samples` -- answer in raw bytes; the
+/// rest are JSON. Waveform
+/// peaks are not here at all: they travel over the `abpeaks://` scheme registered below, so
+/// bulk asset traffic never competes with commands (`overview.md` §6.4).
+///
+/// `pub` so `tests/surface.rs` can mount the same list on a mock runtime. A test that
+/// registered its own subset would prove that the subset works and say nothing about the
+/// surface the app actually exposes.
+pub fn command_handler<R: tauri::Runtime>(
+) -> impl Fn(tauri::ipc::Invoke<R>) -> bool + Send + Sync + 'static {
     tauri::generate_handler![
-        commands::dev::dev_add_root,
-        commands::dev::dev_list_roots,
-        commands::dev::dev_scan,
-        commands::dev::dev_neighbors,
-        commands::dev::dev_model_status,
-        commands::dev::dev_download_model,
-        commands::dev::dev_session_info,
+        commands::library::add_library_root,
+        commands::library::list_library_roots,
+        commands::library::remove_library_root,
+        commands::library::set_root_enabled,
+        commands::library::scan_library,
+        commands::library::cancel_scan,
+        commands::cloud::get_point_cloud,
+        commands::cloud::get_point_colors,
+        commands::cloud::get_feature_column,
+        commands::cloud::query_samples,
+        commands::samples::get_sample_detail,
+        commands::samples::get_similar,
+        commands::samples::set_tag,
+        commands::samples::unset_tag,
+        commands::samples::list_tags,
+        commands::samples::set_tag_color,
+        commands::samples::reveal_in_finder,
+        commands::samples::play_sample,
+        commands::samples::stop_playback,
+        commands::samples::prefetch_sample,
+        commands::collections::create_collection,
+        commands::collections::list_collections,
+        commands::collections::get_collection,
+        commands::collections::reorder_collection,
+        commands::collections::delete_collection,
+        commands::collections::export_collection,
+        commands::projection::start_refit,
+        commands::projection::cancel_refit,
+        commands::settings::get_settings,
+        commands::settings::list_audio_devices,
+        commands::settings::set_audio_device,
+        commands::settings::set_gain,
+        commands::settings::reveal_data_dir,
+        commands::settings::reset_database,
     ]
-}
-
-#[cfg(not(debug_assertions))]
-fn dev_commands() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static {
-    tauri::generate_handler![]
 }
 
 /// Builds and runs the desktop application.
@@ -56,7 +89,7 @@ pub fn run() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "audiobank=info,warn".into()),
+                .unwrap_or_else(|_| "audiocloud=info,warn".into()),
         )
         .init();
 
@@ -67,23 +100,47 @@ pub fn run() {
     #[allow(clippy::expect_used)]
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(dev_commands())
+        // Folder picker for "add a library root" and the destination picker for
+        // "export collection" (`task.md` Phase 9) -- see `capabilities/main.json` for why
+        // this was not a dependency before this phase.
+        .plugin(tauri_plugin_dialog::init())
+        .invoke_handler(command_handler())
+        // Transport 3 (`overview.md` §6.4). Registered on the builder rather than served
+        // from a command so waveform fetches get the WebView's own HTTP cache and never
+        // queue behind the point cloud on the IPC handler.
+        .register_uri_scheme_protocol(peaks::SCHEME, peaks::handle)
         .setup(|app| {
             // ~/Library/Application Support/<bundle-id>/, created on first run.
             let data_dir = app.path().app_data_dir()?;
             let db = Database::open(&data_dir, EMBEDDING_DIM)?;
             app.manage(db);
 
-            // Path joins and an empty cell. The model is not read, the network is not
-            // touched, and no `ort` session is built -- `overview.md` §7 budgets cold start
-            // to interactive at under two seconds *excluding* ML session init, which is
-            // only honest if init genuinely happens somewhere else. See
-            // `model::session::LazySession`.
-            app.manage(Model::new(&data_dir));
+            // Three empty containers. `Jobs` is three mutexes; `PeakCache` holds one decoder
+            // whose buffer pool allocates lazily; `AudioPlayer` holds a `LazyEngine` that does
+            // not open an audio device until the first `play_sample`. None of the three reads
+            // a file, touches the network, or opens a device during setup.
+            app.manage(Jobs::new());
+            app.manage(PeakCache::new());
+
+            let player = AudioPlayer::new();
+            // Priming the preference is a Mutex write, not a device open -- `AudioPlayer`
+            // stays lazy (`overview.md` §7's cold-start budget), and the name just sits
+            // ready for whenever the first `play_sample` actually opens a stream.
+            //
+            // `db` was already moved into `app.manage` above, so this reads it back through
+            // the app handle rather than the local binding.
+            if let Ok(conn) = app.state::<Database>().read() {
+                if let Ok(Some(name)) = crate::db::queries::setting(&conn, "audio_device") {
+                    if !name.is_empty() {
+                        player.set_preferred_device(Some(name));
+                    }
+                }
+            }
+            app.manage(Arc::new(player));
             Ok(())
         })
         .build(tauri::generate_context!())
-        .expect("error while starting AudioBank");
+        .expect("error while starting AudioCloud");
 
     app.run(|app, event| {
         // The writer holds up to 250 ms of uncommitted rows by design. Exiting without
