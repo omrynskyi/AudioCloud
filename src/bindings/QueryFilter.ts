@@ -21,7 +21,7 @@ rootIds: Array<number>,
 /**
  * A sample must carry **all** of these.
  */
-tags: Array<string>,
+tags: Array<string>, 
 /**
  * A sample must belong to **all** of these saved collections.
  *
@@ -29,7 +29,7 @@ tags: Array<string>,
  * not a list trapped inside its management area. Keeping the same intersection
  * semantics as tags makes a future multi-collection control unsurprising.
  */
-collectionIds: Array<number>,
+collectionIds: Array<number>, 
 /**
  * Lowercase, without the dot. Empty means every extension.
  */
