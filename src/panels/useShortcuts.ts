@@ -10,7 +10,6 @@ import { useEffect, useRef } from 'react';
 
 import { playSample, stopPlayback } from '../ipc';
 import { useSceneStore } from '../store/scene';
-import { useShellStore } from '../store/shell';
 
 function isTypingTarget(target: EventTarget | null): boolean {
   const el = target as HTMLElement | null;
@@ -55,7 +54,6 @@ export function useShortcuts() {
         case 'Escape': {
           useSceneStore.getState().select(null);
           useSceneStore.getState().clearSelectedIds();
-          useShellStore.getState().closeSettings();
           break;
         }
       }

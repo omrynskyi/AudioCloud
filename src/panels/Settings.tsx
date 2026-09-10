@@ -1,6 +1,6 @@
 /**
- * Settings modal: projection params + re-fit, audio device + gain, data directory, and
- * reset-database (`task.md` Phase 9).
+ * Settings content: projection params + re-fit, audio device + gain, data directory, and
+ * reset-database. The shell places it in the same contextual surface as every other tool.
  */
 
 import { CaretDown, Check, WarningCircle } from '@phosphor-icons/react';
@@ -18,30 +18,23 @@ import {
   type AudioDeviceInfo,
 } from '../ipc';
 import { useProjectionStore } from '../store/projection';
-import { useShellStore } from '../store/shell';
-import { ErrorState, LoadingState, Modal, PanelButton } from './StateViews';
+import { ErrorState, LoadingState, PanelButton } from './StateViews';
 
-export function Settings() {
-  const open = useShellStore((s) => s.settingsOpen);
-  const close = useShellStore((s) => s.closeSettings);
-  if (!open) return null;
-
+export function SettingsPanel() {
   return (
-    <Modal
-      title="Settings"
-      onClose={close}
-      closeLabel="Close settings"
-      panelClassName="glass rise-in max-h-[86vh] w-[500px]"
-    >
-      <div className="settings-content">
+    <div className="settings-content">
+      <header>
+        <h2 className="text-xs font-medium tracking-wide text-neutral-300 uppercase">
+          Settings
+        </h2>
         <p className="settings-intro">
           Tune the map and audition playback to your workspace.
         </p>
-        <ProjectionSection />
-        <AudioSection />
-        <DataSection />
-      </div>
-    </Modal>
+      </header>
+      <ProjectionSection />
+      <AudioSection />
+      <DataSection />
+    </div>
   );
 }
 

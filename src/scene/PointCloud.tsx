@@ -24,7 +24,9 @@ import { useFrame, useThree } from '@react-three/fiber';
 import { useCallback, useEffect, useMemo, useRef, type ComponentRef } from 'react';
 import {
   MOUSE,
+  Plane,
   Points,
+  Raycaster,
   TOUCH,
   Vector2,
   Vector3,
@@ -643,11 +645,32 @@ export function PointCloud({
   // natively by `OrbitControls` via the `mouseButtons`/`touches` remap on the JSX below.
   useEffect(() => {
     const canvas = gl.domElement;
+    const raycaster = new Raycaster();
+    const cursorNdc = new Vector2();
+    const cursorWorldBefore = new Vector3();
+    const cursorWorldAfter = new Vector3();
+    const zoomPlane = new Plane(new Vector3(0, 0, 1), -buffers.bounds.center.z);
+
+    const cursorWorldAt = (event: WheelEvent, target: Vector3) => {
+      const rect = canvas.getBoundingClientRect();
+      cursorNdc.set(
+        ((event.clientX - rect.left) / rect.width) * 2 - 1,
+        -((event.clientY - rect.top) / rect.height) * 2 + 1,
+      );
+      raycaster.setFromCamera(cursorNdc, camera);
+      return raycaster.ray.intersectPlane(zoomPlane, target);
+    };
 
     const onWheel = (event: WheelEvent) => {
       const controls = controlsRef.current;
       if (!controls) return;
       event.preventDefault();
+
+      // Capture the map location under the cursor before changing the camera. The cloud is
+      // flat and top-down, so keeping this plane intersection fixed gives wheel zoom the
+      // same behaviour as a map: the user zooms into what they are pointing at, not into the
+      // current orbit target.
+      if (!cursorWorldAt(event, cursorWorldBefore)) return;
 
       // `deltaMode` is almost always 0 (pixels) for trackpads and modern mice; the other two
       // only show up on the rare wheel that reports lines or pages, and a rough px-per-unit
@@ -665,6 +688,15 @@ export function PointCloud({
       camera.position.copy(controls.target).add(offset);
 
       controls.update();
+
+      // OrbitControls has now applied the dolly. Re-project the same screen pixel and shift
+      // both camera and target by the error so the pre-zoom map location stays under it.
+      if (cursorWorldAt(event, cursorWorldAfter)) {
+        const correction = cursorWorldBefore.sub(cursorWorldAfter);
+        camera.position.add(correction);
+        controls.target.add(correction);
+        controls.update();
+      }
       invalidate();
     };
 
@@ -672,7 +704,7 @@ export function PointCloud({
     // without it the page (and the browser's own pinch-zoom) scrolls right along with the map.
     canvas.addEventListener('wheel', onWheel, { passive: false });
     return () => canvas.removeEventListener('wheel', onWheel);
-  }, [gl, camera, invalidate]);
+  }, [gl, camera, buffers, invalidate]);
 
   // ── Viewport prefetch ─────────────────────────────────────────────────────────
   //

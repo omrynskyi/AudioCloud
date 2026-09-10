@@ -1,6 +1,5 @@
 /**
- * The floating chrome primitives: the buttons on the map's top bar, and the panels they
- * drop.
+ * The floating chrome primitives: the buttons on the map's top bar and its content.
  *
  * These exist because the shell stopped being two walled-off columns. Everything that is
  * not the map is now a `glass` surface sitting on top of it, which means "a control" and "a
@@ -9,7 +8,7 @@
  * scale, one accent) hold across five call sites.
  */
 
-import { useEffect, useRef, useState, type Ref, type ReactNode } from 'react';
+import { type FocusEventHandler, type Ref, type ReactNode } from 'react';
 
 /**
  * A square icon button on the top bar.
@@ -48,74 +47,7 @@ export function IconButton({
   );
 }
 
-/**
- * A button that drops a panel beneath itself.
- *
- * Not a modal: a scrim over the map to pick a tag would be a heavier gesture than the thing
- * it is for, and the map staying visible behind an open panel is the point of the whole
- * layout. Closing is therefore the ordinary pair - click outside, or press escape.
- *
- * The escape handler is registered on `document` in the **capture** phase and stops
- * propagation, which is load-bearing: `useShortcuts.ts` also listens for escape, on
- * `window` in the bubble phase, and clears the selection. Without the capture-phase stop,
- * dismissing a popover would also throw away whatever sample you had selected.
- */
-export function Popover({
-  label,
-  icon,
-  align = 'right',
-  width = 'w-72',
-  children,
-}: {
-  label: string;
-  icon: ReactNode;
-  align?: 'left' | 'right';
-  /** Tailwind width class. Each panel's content decides how wide it wants to be. */
-  width?: string;
-  children: ReactNode;
-}) {
-  const [open, setOpen] = useState(false);
-  const root = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    if (!open) return;
-
-    function onPointerDown(e: PointerEvent) {
-      if (!root.current?.contains(e.target as Node)) setOpen(false);
-    }
-    function onKeyDown(e: KeyboardEvent) {
-      if (e.key !== 'Escape') return;
-      e.stopPropagation();
-      setOpen(false);
-    }
-
-    document.addEventListener('pointerdown', onPointerDown);
-    document.addEventListener('keydown', onKeyDown, true);
-    return () => {
-      document.removeEventListener('pointerdown', onPointerDown);
-      document.removeEventListener('keydown', onKeyDown, true);
-    };
-  }, [open]);
-
-  return (
-    <div ref={root} className="relative">
-      <IconButton label={label} active={open} onClick={() => setOpen(!open)}>
-        {icon}
-      </IconButton>
-      {open && (
-        <div
-          className={`glass rise-in rounded-panel absolute top-9 ${
-            align === 'right' ? 'right-0' : 'left-0'
-          } ${width} max-h-[70vh] overflow-y-auto p-3`}
-        >
-          {children}
-        </div>
-      )}
-    </div>
-  );
-}
-
-/** The heading over a group inside a popover or the inspector. */
+/** The heading over a group inside the contextual area or the inspector. */
 export function PanelHeading({ children }: { children: ReactNode }) {
   return (
     <h2 className="mb-2 text-[10px] font-medium tracking-[0.14em] text-neutral-500 uppercase">
@@ -170,6 +102,7 @@ export function TextInput({
   placeholder,
   disabled = false,
   onBlur,
+  onFocus,
   ariaLabel,
   className = '',
   inputRef,
@@ -181,6 +114,7 @@ export function TextInput({
   placeholder?: string;
   disabled?: boolean;
   onBlur?: () => void;
+  onFocus?: FocusEventHandler<HTMLInputElement>;
   ariaLabel?: string;
   className?: string;
   inputRef?: Ref<HTMLInputElement>;
@@ -201,6 +135,7 @@ export function TextInput({
       value={value}
       onChange={(e) => onChange(e.target.value)}
       onBlur={onBlur}
+      onFocus={onFocus}
       placeholder={placeholder}
       aria-label={ariaLabel ?? placeholder ?? ''}
       disabled={disabled}

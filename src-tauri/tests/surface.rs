@@ -282,6 +282,123 @@ fn tagging_answers_with_state_a_reader_can_already_observe() {
     assert_eq!(listed[0]["sampleCount"], json!(0));
 }
 
+/// A collection is a view as well as a saved order: it can grow from a fresh selection,
+/// shrink without touching the underlying library, be renamed, and drive the same binary
+/// filter transport that powers a tag or text search.
+#[test]
+fn collections_can_be_browsed_and_edited_without_recreating_them() {
+    let (_dir, webview) = app();
+    let ids = seed(&webview, 3);
+
+    let created = json_of(
+        invoke(
+            &webview,
+            "create_collection",
+            json!({ "name": "Set one", "sampleIds": [ids[0]] }),
+        )
+        .unwrap(),
+    );
+    let collection_id = created["id"].as_i64().unwrap();
+
+    let added = json_of(
+        invoke(
+            &webview,
+            "add_to_collection",
+            json!({ "collectionId": collection_id, "sampleIds": [ids[1], ids[0]] }),
+        )
+        .unwrap(),
+    );
+    assert_eq!(added["members"].as_array().unwrap().len(), 2);
+    assert_eq!(added["members"][0]["sampleId"], json!(ids[0]));
+    assert_eq!(added["members"][1]["sampleId"], json!(ids[1]));
+
+    let bytes = raw_of(
+        invoke(
+            &webview,
+            "query_samples",
+            json!({ "filter": { "collectionIds": [collection_id] } }),
+        )
+        .unwrap(),
+    );
+    let header = binary::header(&bytes).unwrap();
+    assert_eq!(header.magic, binary::MAGIC_QUERY_RESULT);
+    assert_eq!(header.count, 2);
+
+    let remaining = json_of(
+        invoke(
+            &webview,
+            "remove_from_collection",
+            json!({ "collectionId": collection_id, "sampleId": ids[0] }),
+        )
+        .unwrap(),
+    );
+    assert_eq!(remaining["members"].as_array().unwrap().len(), 1);
+    assert_eq!(remaining["members"][0]["sampleId"], json!(ids[1]));
+
+    let renamed = json_of(
+        invoke(
+            &webview,
+            "rename_collection",
+            json!({ "collectionId": collection_id, "name": "Set two" }),
+        )
+        .unwrap(),
+    );
+    assert_eq!(renamed["name"], json!("Set two"));
+}
+
+/// Renaming or deleting a tag changes the FTS text behind every affected sample, so these
+/// commands must be real durable operations instead of panel-local labels.
+#[test]
+fn tags_can_be_renamed_and_deleted_without_leaving_search_stale() {
+    let (_dir, webview) = app();
+    let ids = seed(&webview, 2);
+    invoke(
+        &webview,
+        "set_tag",
+        json!({ "sampleId": ids[0], "tagName": "kick" }),
+    )
+    .unwrap();
+
+    let renamed = json_of(
+        invoke(
+            &webview,
+            "rename_tag",
+            json!({ "tagId": 1, "name": "oddtag" }),
+        )
+        .unwrap(),
+    );
+    assert_eq!(renamed["name"], json!("oddtag"));
+
+    let detail =
+        json_of(invoke(&webview, "get_sample_detail", json!({ "sampleId": ids[0] })).unwrap());
+    assert_eq!(detail["tags"], json!(["oddtag"]));
+
+    let bytes = raw_of(
+        invoke(
+            &webview,
+            "query_samples",
+            json!({ "filter": { "text": "oddtag" } }),
+        )
+        .unwrap(),
+    );
+    assert_eq!(binary::header(&bytes).unwrap().count, 1);
+
+    invoke(&webview, "delete_tag", json!({ "tagId": 1 })).unwrap();
+    let detail =
+        json_of(invoke(&webview, "get_sample_detail", json!({ "sampleId": ids[0] })).unwrap());
+    assert_eq!(detail["tags"], json!([]));
+
+    let bytes = raw_of(
+        invoke(
+            &webview,
+            "query_samples",
+            json!({ "filter": { "text": "oddtag" } }),
+        )
+        .unwrap(),
+    );
+    assert_eq!(binary::header(&bytes).unwrap().count, 0);
+}
+
 /// A durable write commits even when it fails, so an argument that cannot work has to be
 /// refused before the writer sees it — otherwise `set_tag` on a bad id leaves behind a tag
 /// the user never finished making.
@@ -384,9 +501,14 @@ fn every_command_in_the_surface_is_reachable() {
         "unset_tag",
         "list_tags",
         "set_tag_color",
+        "rename_tag",
+        "delete_tag",
         "create_collection",
         "list_collections",
         "get_collection",
+        "add_to_collection",
+        "remove_from_collection",
+        "rename_collection",
         "reorder_collection",
         "delete_collection",
         "export_collection",

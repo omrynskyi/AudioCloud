@@ -27,7 +27,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use super::{
     io_error, now_ms, pool, DbError, EmbeddingLoc, NewSample, SampleFeatures, SampleStatus,
@@ -172,10 +172,34 @@ enum Command {
         color: Option<String>,
         reply: Reply<()>,
     },
+    RenameTag {
+        tag_id: i64,
+        name: String,
+        reply: Reply<()>,
+    },
+    DeleteTag {
+        tag_id: i64,
+        reply: Reply<()>,
+    },
     CreateCollection {
         name: String,
         sample_ids: Vec<i64>,
         reply: Reply<i64>,
+    },
+    AddToCollection {
+        collection_id: i64,
+        sample_ids: Vec<i64>,
+        reply: Reply<()>,
+    },
+    RemoveFromCollection {
+        collection_id: i64,
+        sample_id: i64,
+        reply: Reply<()>,
+    },
+    RenameCollection {
+        collection_id: i64,
+        name: String,
+        reply: Reply<()>,
     },
     ReorderCollection {
         collection_id: i64,
@@ -239,7 +263,12 @@ impl Command {
                 | Command::SetTag { .. }
                 | Command::UnsetTag { .. }
                 | Command::SetTagColor { .. }
+                | Command::RenameTag { .. }
+                | Command::DeleteTag { .. }
                 | Command::CreateCollection { .. }
+                | Command::AddToCollection { .. }
+                | Command::RemoveFromCollection { .. }
+                | Command::RenameCollection { .. }
                 | Command::ReorderCollection { .. }
                 | Command::DeleteCollection { .. }
                 // A setting a user just changed in the Settings panel must not appear to
@@ -475,6 +504,21 @@ impl WriterHandle {
         })
     }
 
+    /// Renames a tag after the command layer has checked the target name is available.
+    pub fn rename_tag(&self, tag_id: i64, name: impl Into<String>) -> Result<(), DbError> {
+        let name = name.into();
+        self.request(|reply| Command::RenameTag {
+            tag_id,
+            name,
+            reply,
+        })
+    }
+
+    /// Deletes a tag and detaches it from every sample that carried it.
+    pub fn delete_tag(&self, tag_id: i64) -> Result<(), DbError> {
+        self.request(|reply| Command::DeleteTag { tag_id, reply })
+    }
+
     /// Creates a collection holding the given samples, in the order given.
     pub fn create_collection(
         &self,
@@ -485,6 +529,46 @@ impl WriterHandle {
         self.request(|reply| Command::CreateCollection {
             name,
             sample_ids,
+            reply,
+        })
+    }
+
+    /// Adds samples to the end of an existing collection. Existing members are left in place.
+    pub fn add_to_collection(
+        &self,
+        collection_id: i64,
+        sample_ids: Vec<i64>,
+    ) -> Result<(), DbError> {
+        self.request(|reply| Command::AddToCollection {
+            collection_id,
+            sample_ids,
+            reply,
+        })
+    }
+
+    /// Removes one member while keeping the remaining sequence contiguous.
+    pub fn remove_from_collection(
+        &self,
+        collection_id: i64,
+        sample_id: i64,
+    ) -> Result<(), DbError> {
+        self.request(|reply| Command::RemoveFromCollection {
+            collection_id,
+            sample_id,
+            reply,
+        })
+    }
+
+    /// Changes a collection's display name without disturbing its ordered members.
+    pub fn rename_collection(
+        &self,
+        collection_id: i64,
+        name: impl Into<String>,
+    ) -> Result<(), DbError> {
+        let name = name.into();
+        self.request(|reply| Command::RenameCollection {
+            collection_id,
+            name,
             reply,
         })
     }
@@ -710,11 +794,35 @@ impl Writer {
                 color,
                 reply,
             } => answer(reply, set_tag_color(conn, tag_id, color.as_deref())),
+            Command::RenameTag {
+                tag_id,
+                name,
+                reply,
+            } => answer(reply, rename_tag(conn, tag_id, &name)),
+            Command::DeleteTag { tag_id, reply } => answer(reply, delete_tag(conn, tag_id)),
             Command::CreateCollection {
                 name,
                 sample_ids,
                 reply,
             } => answer(reply, create_collection(conn, &name, &sample_ids)),
+            Command::AddToCollection {
+                collection_id,
+                sample_ids,
+                reply,
+            } => answer(reply, add_to_collection(conn, collection_id, &sample_ids)),
+            Command::RemoveFromCollection {
+                collection_id,
+                sample_id,
+                reply,
+            } => answer(
+                reply,
+                remove_from_collection(conn, collection_id, sample_id),
+            ),
+            Command::RenameCollection {
+                collection_id,
+                name,
+                reply,
+            } => answer(reply, rename_collection(conn, collection_id, &name)),
             Command::ReorderCollection {
                 collection_id,
                 sample_ids,
@@ -1150,6 +1258,39 @@ fn set_tag_color(conn: &Connection, tag_id: i64, color: Option<&str>) -> Result<
     Ok(())
 }
 
+/// Renames a tag, then rebuilds the FTS row for every sample whose searchable tag text
+/// changed. The command layer prevents a duplicate name before this durable write begins.
+fn rename_tag(conn: &Connection, tag_id: i64, name: &str) -> Result<(), DbError> {
+    let sample_ids = conn
+        .prepare_cached("SELECT sample_id FROM sample_tags WHERE tag_id = ?1")?
+        .query_map([tag_id], |r| r.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    conn.prepare_cached("UPDATE tags SET name = ?2 WHERE id = ?1")?
+        .execute((tag_id, name.trim()))?;
+
+    for sample_id in sample_ids {
+        reindex_sample(conn, sample_id)?;
+    }
+    Ok(())
+}
+
+/// Deletes a tag, then rebuilds each affected sample's FTS row after the cascade detaches it.
+fn delete_tag(conn: &Connection, tag_id: i64) -> Result<(), DbError> {
+    let sample_ids = conn
+        .prepare_cached("SELECT sample_id FROM sample_tags WHERE tag_id = ?1")?
+        .query_map([tag_id], |r| r.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    conn.prepare_cached("DELETE FROM tags WHERE id = ?1")?
+        .execute([tag_id])?;
+
+    for sample_id in sample_ids {
+        reindex_sample(conn, sample_id)?;
+    }
+    Ok(())
+}
+
 /// Creates a collection over the given samples, preserving the order they were given in.
 ///
 /// `position` is that order, and it is the reason a collection is not just a tag: a tag is a
@@ -1164,11 +1305,78 @@ fn create_collection(conn: &Connection, name: &str, sample_ids: &[i64]) -> Resul
          VALUES (?1, ?2, ?3)
          ON CONFLICT(collection_id, sample_id) DO NOTHING",
     )?;
-    for (position, sample_id) in sample_ids.iter().enumerate() {
-        insert.execute((collection_id, sample_id, position as i64))?;
+    // Selections can contain the same sample more than once after a mixed keyboard/drag
+    // gesture. `ON CONFLICT` keeps the membership unique; advancing only after an insert
+    // keeps its sequence contiguous instead of preserving a gap for every duplicate.
+    let mut position = 0_i64;
+    for sample_id in sample_ids {
+        if insert.execute((collection_id, sample_id, position))? != 0 {
+            position += 1;
+        }
     }
 
     Ok(collection_id)
+}
+
+/// Appends new members in the order supplied. A duplicate is a no-op and never consumes a
+/// position, so bulk-adding a selection is safely repeatable.
+fn add_to_collection(
+    conn: &Connection,
+    collection_id: i64,
+    sample_ids: &[i64],
+) -> Result<(), DbError> {
+    let mut next_position: i64 = conn.query_row(
+        "SELECT COALESCE(MAX(position), -1) + 1 FROM collection_members WHERE collection_id = ?1",
+        [collection_id],
+        |r| r.get(0),
+    )?;
+    let mut insert = conn.prepare_cached(
+        "INSERT INTO collection_members (collection_id, sample_id, position)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(collection_id, sample_id) DO NOTHING",
+    )?;
+    for sample_id in sample_ids {
+        if insert.execute((collection_id, sample_id, next_position))? != 0 {
+            next_position += 1;
+        }
+    }
+    Ok(())
+}
+
+/// Deletes one member and closes the gap in the sequence. A stale duplicate remove is a
+/// no-op, which is the benign outcome for a detail panel that was open in another window.
+fn remove_from_collection(
+    conn: &Connection,
+    collection_id: i64,
+    sample_id: i64,
+) -> Result<(), DbError> {
+    let position = conn
+        .query_row(
+            "SELECT position FROM collection_members WHERE collection_id = ?1 AND sample_id = ?2",
+            (collection_id, sample_id),
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()?;
+    let Some(position) = position else {
+        return Ok(());
+    };
+
+    conn.prepare_cached(
+        "DELETE FROM collection_members WHERE collection_id = ?1 AND sample_id = ?2",
+    )?
+    .execute((collection_id, sample_id))?;
+    conn.prepare_cached(
+        "UPDATE collection_members SET position = position - 1
+         WHERE collection_id = ?1 AND position > ?2",
+    )?
+    .execute((collection_id, position))?;
+    Ok(())
+}
+
+fn rename_collection(conn: &Connection, collection_id: i64, name: &str) -> Result<(), DbError> {
+    conn.prepare_cached("UPDATE collections SET name = ?2 WHERE id = ?1")?
+        .execute((collection_id, name.trim()))?;
+    Ok(())
 }
 
 /// Rewrites `position` for every member of `collection_id` to match `sample_ids`'s order.

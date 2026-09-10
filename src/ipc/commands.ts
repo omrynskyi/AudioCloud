@@ -165,6 +165,7 @@ export async function getFeatureColumn(
 export const NO_FILTER: QueryFilter = {
   rootIds: [],
   tags: [],
+  collectionIds: [],
   exts: [],
   features: [],
   projectedOnly: false,
@@ -218,6 +219,16 @@ export function listTags(): Promise<Tag[]> {
 /** Sets (or clears, for `null`) a tag's display color. */
 export function setTagColor(tagId: number, color: string | null): Promise<Tag> {
   return invoke('set_tag_color', { tagId, color });
+}
+
+/** Renames a tag while retaining its assignments and display color. */
+export function renameTag(tagId: number, name: string): Promise<Tag> {
+  return invoke('rename_tag', { tagId, name });
+}
+
+/** Removes a tag from the library and from every sound that carries it. */
+export function deleteTag(tagId: number): Promise<void> {
+  return invoke('delete_tag', { tagId });
 }
 
 /**
@@ -303,6 +314,30 @@ export function listCollections(): Promise<Collection[]> {
 /** One collection with its members, in the order the user arranged them. */
 export function getCollection(collectionId: number): Promise<CollectionDetail> {
   return invoke('get_collection', { collectionId });
+}
+
+/** Appends a selection to an existing collection; members already present are kept once. */
+export function addToCollection(
+  collectionId: number,
+  sampleIds: number[],
+): Promise<CollectionDetail> {
+  return invoke('add_to_collection', { collectionId, sampleIds });
+}
+
+/** Removes a sound from a collection without affecting the sound in the library. */
+export function removeFromCollection(
+  collectionId: number,
+  sampleId: number,
+): Promise<CollectionDetail> {
+  return invoke('remove_from_collection', { collectionId, sampleId });
+}
+
+/** Changes a collection name while retaining its ordered members. */
+export function renameCollection(
+  collectionId: number,
+  name: string,
+): Promise<Collection> {
+  return invoke('rename_collection', { collectionId, name });
 }
 
 /**

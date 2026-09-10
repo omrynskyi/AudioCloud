@@ -120,16 +120,19 @@ export function PanelButton({
   disabled,
   variant = 'default',
   className = '',
+  type = 'button',
 }: {
   children: ReactNode;
   onClick?: () => void;
   disabled?: boolean;
   variant?: 'default' | 'danger';
   className?: string;
+  /** Forms in contextual panels opt in explicitly; accidental submits stay impossible. */
+  type?: 'button' | 'submit';
 }) {
   return (
     <button
-      type="button"
+      type={type}
       onClick={onClick}
       disabled={disabled}
       className={`rounded border px-2.5 py-1 text-xs transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${

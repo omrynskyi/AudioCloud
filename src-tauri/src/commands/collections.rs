@@ -67,9 +67,9 @@ pub async fn get_collection(
 
 /// Rewrites a collection's member order.
 ///
-/// `sample_ids` must be exactly the collection's current membership, reordered -- adding or
-/// dropping a member is what `create_collection` and a future `remove_from_collection` are
-/// for. Rejecting a mismatch here, rather than silently reordering the intersection, is what
+/// `sample_ids` must be exactly the collection's current membership, reordered. Adding or
+/// dropping members has dedicated commands, so a stale reorder cannot quietly make a member
+/// disappear. Rejecting a mismatch here, rather than silently reordering the intersection, is what
 /// keeps a stale drag-and-drop from quietly losing a sample the frontend forgot it was
 /// holding.
 #[tauri::command]
@@ -96,6 +96,65 @@ pub async fn reorder_collection(
 
     db.writer().reorder_collection(collection_id, sample_ids)?;
     get_collection_detail(&db, collection_id)
+}
+
+/// Appends samples to an existing collection in the supplied order.
+///
+/// Repeating an add is safe: current members are preserved and duplicate ids are ignored.
+/// That makes the optimistic-looking “Add selection” affordance honest even when the user
+/// has already put part of that selection in the collection.
+#[tauri::command]
+pub async fn add_to_collection(
+    db: State<'_, Database>,
+    collection_id: i64,
+    sample_ids: Vec<i64>,
+) -> Result<CollectionDetail, AppError> {
+    let conn = db.read()?;
+    queries::collection(&conn, collection_id)?
+        .ok_or_else(|| AppError::not_found("collection", collection_id))?;
+    drop(conn);
+    for &sample_id in &sample_ids {
+        require_sample(&db, sample_id)?;
+    }
+
+    db.writer().add_to_collection(collection_id, sample_ids)?;
+    get_collection_detail(&db, collection_id)
+}
+
+/// Removes a member without deleting the underlying sound.
+#[tauri::command]
+pub async fn remove_from_collection(
+    db: State<'_, Database>,
+    collection_id: i64,
+    sample_id: i64,
+) -> Result<CollectionDetail, AppError> {
+    let conn = db.read()?;
+    queries::collection(&conn, collection_id)?
+        .ok_or_else(|| AppError::not_found("collection", collection_id))?;
+    drop(conn);
+
+    db.writer()
+        .remove_from_collection(collection_id, sample_id)?;
+    get_collection_detail(&db, collection_id)
+}
+
+/// Changes a collection's name without disturbing its saved order.
+#[tauri::command]
+pub async fn rename_collection(
+    db: State<'_, Database>,
+    collection_id: i64,
+    name: String,
+) -> Result<Collection, AppError> {
+    if name.trim().is_empty() {
+        return Err(AppError::invalid("name", "a collection needs a name"));
+    }
+    let conn = db.read()?;
+    queries::collection(&conn, collection_id)?
+        .ok_or_else(|| AppError::not_found("collection", collection_id))?;
+    drop(conn);
+
+    db.writer().rename_collection(collection_id, name)?;
+    collection_by_id(&db, collection_id)
 }
 
 /// Deletes a collection. The samples themselves are untouched.

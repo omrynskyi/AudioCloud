@@ -12,15 +12,18 @@ import { useEffect, useState } from 'react';
 
 import {
   IpcError,
+  addToCollection,
   fetchPeaks,
   getSampleDetail,
   getSimilar,
+  listCollections,
   playSample,
   revealInFinder,
   setTag,
   stopPlayback,
   unsetTag,
   type AppError,
+  type Collection,
   type Neighbor,
   type Peaks,
   type SampleDetail,
@@ -159,6 +162,8 @@ export function Inspector() {
         tags={detail.tags}
         onChange={(tags) => setDetail({ ...detail, tags })}
       />
+
+      <CollectionPicker sampleId={detail.id} />
 
       <button
         type="button"
@@ -302,6 +307,107 @@ function TagEditor({
         />
       </form>
     </div>
+  );
+}
+
+function CollectionPicker({ sampleId }: { sampleId: number }) {
+  const [collections, setCollections] = useState<Collection[] | null>(null);
+  const [value, setValue] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [status, setStatus] = useState<string | null>(null);
+  // A picker belongs to its sample. Reset its transient feedback during render when the
+  // inspector moves, so the next sound never inherits a previous sound's completion state.
+  const [renderedFor, setRenderedFor] = useState(sampleId);
+  if (renderedFor !== sampleId) {
+    setRenderedFor(sampleId);
+    setValue('');
+    setStatus(null);
+  }
+
+  useEffect(() => {
+    let cancelled = false;
+    void listCollections()
+      .then((next) => {
+        if (!cancelled) setCollections(next);
+      })
+      .catch(() => {
+        if (!cancelled) setCollections([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  async function add(collectionId: number) {
+    const collection = collections?.find((item) => item.id === collectionId);
+    if (!collection || saving) return;
+    setValue(String(collectionId));
+    setSaving(true);
+    setStatus(null);
+    try {
+      const next = await addToCollection(collectionId, [sampleId]);
+      setCollections(
+        (current) =>
+          current?.map((item) =>
+            item.id === collectionId
+              ? { ...item, sampleCount: next.members.length }
+              : item,
+          ) ?? null,
+      );
+      setValue('');
+      setStatus(`Added to ${collection.name}`);
+    } catch {
+      setValue('');
+      setStatus('Couldn’t add to collection. Try again.');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const empty = collections?.length === 0;
+
+  return (
+    <section className="space-y-1">
+      <label
+        htmlFor="add-to-collection"
+        className="text-[10px] tracking-wide text-neutral-500 uppercase"
+      >
+        Collections
+      </label>
+      <select
+        id="add-to-collection"
+        value={value}
+        onChange={(event) => {
+          const collectionId = Number(event.target.value);
+          if (Number.isInteger(collectionId) && collectionId > 0) void add(collectionId);
+        }}
+        disabled={collections === null || empty || saving}
+        className="rounded-control w-full border border-neutral-800 bg-neutral-950 px-2 py-1.5 text-xs text-neutral-200 focus:border-neutral-600 focus:outline-none disabled:opacity-40"
+      >
+        <option value="">
+          {collections === null
+            ? 'Loading…'
+            : empty
+              ? 'No collections'
+              : 'Add to collection'}
+        </option>
+        {collections?.map((collection) => (
+          <option key={collection.id} value={collection.id}>
+            {collection.name}
+          </option>
+        ))}
+      </select>
+      {status && (
+        <p
+          role="status"
+          className={`px-1 text-[11px] ${
+            status.startsWith('Added') ? 'text-neutral-500' : 'text-red-400'
+          }`}
+        >
+          {status}
+        </p>
+      )}
+    </section>
   );
 }
 

@@ -641,6 +641,30 @@ pub fn tag(conn: &Connection, id: i64) -> Result<Option<TagRow>, DbError> {
     .map_err(DbError::from)
 }
 
+/// One tag by its display name, using the schema's case-insensitive identity rule.
+///
+/// This lets the command layer reject a conflicting rename as an actionable invalid argument
+/// before it reaches the durable writer, instead of surfacing SQLite's unique-constraint
+/// text to a person trying to tidy their tag vocabulary.
+pub fn tag_named(conn: &Connection, name: &str) -> Result<Option<TagRow>, DbError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT t.id, t.name, t.color, COUNT(st.sample_id)
+         FROM tags t LEFT JOIN sample_tags st ON st.tag_id = t.id
+         WHERE t.name = ?1 COLLATE NOCASE GROUP BY t.id",
+    )?;
+    stmt.query_row([name], |r| {
+        Ok(TagRow {
+            id: r.get(0)?,
+            name: r.get(1)?,
+            color: r.get(2)?,
+            sample_count: r.get(3)?,
+        })
+    })
+    .map(Some)
+    .or_else(no_rows_is_none)
+    .map_err(DbError::from)
+}
+
 /// Every tag, with its usage count, alphabetical.
 ///
 /// `LEFT JOIN` rather than an inner one: a tag the user created and then removed from every

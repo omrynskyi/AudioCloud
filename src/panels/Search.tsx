@@ -7,9 +7,9 @@
  * `query_samples` fetch `Shell.tsx` already runs, rather than issuing a second query for the
  * same ids.
  *
- * It reads as one control now rather than a field with a list stapled under it: the results
- * drop out of the field they came from, over the map, and take their own surface only when
- * there is something to show.
+ * It reads as one control now rather than a field with a list stapled under it: the shell's
+ * existing glass toolbar grows beneath the field to hold the results. There is no nested
+ * result surface to compete with the rest of the toolbar.
  */
 
 import { MagnifyingGlass, X } from '@phosphor-icons/react';
@@ -33,17 +33,18 @@ const LIST_CAP = 50;
 export const SEARCH_INPUT_ID = 'search-input';
 
 export function Search({
-  ids,
-  error,
+  onActivate,
+  className = '',
 }: {
-  ids: Uint32Array | null;
-  error: AppError | null;
+  /** Opens the one shared contextual area when the search field becomes relevant. */
+  onActivate: () => void;
+  className?: string;
 }) {
   const text = useShellStore((s) => s.filterDraft.text);
   const setDraft = useShellStore((s) => s.setDraft);
 
   return (
-    <div className="w-72">
+    <div className={className}>
       <div className="relative">
         <MagnifyingGlass
           size={13}
@@ -52,7 +53,11 @@ export function Search({
         <TextInput
           id={SEARCH_INPUT_ID}
           value={text}
-          onChange={(value) => setDraft({ text: value })}
+          onChange={(value) => {
+            setDraft({ text: value });
+            onActivate();
+          }}
+          onFocus={onActivate}
           placeholder="Search filenames and tags"
           ariaLabel="Search filenames and tags"
           hasLeadingIcon
@@ -68,16 +73,25 @@ export function Search({
           </button>
         )}
       </div>
-      <Results ids={ids} error={error} />
     </div>
   );
 }
 
-function Results({ ids, error }: { ids: Uint32Array | null; error: AppError | null }) {
+/** The search body rendered inside the shared expanding toolbar, never as its own popover. */
+export function SearchResults({
+  ids,
+  error,
+}: {
+  ids: Uint32Array | null;
+  error: AppError | null;
+}) {
   const [rows, setRows] = useState<SampleDetail[] | null>(null);
   const select = useSceneStore((s) => s.select);
   const selected = useSceneStore((s) => s.selectedSampleId);
   const filter = useSceneStore((s) => s.filter);
+  const tags = useShellStore((s) => s.filterDraft.tags);
+  const collectionIds = useShellStore((s) => s.filterDraft.collectionIds);
+  const setDraft = useShellStore((s) => s.setDraft);
 
   useEffect(() => {
     // No reset for the "outside the cap" cases below - the render guards on `ids` directly
@@ -94,11 +108,40 @@ function Results({ ids, error }: { ids: Uint32Array | null; error: AppError | nu
 
   if (!filter) return null;
 
-  const surface = 'glass rise-in rounded-panel mt-1.5 p-2';
+  const activeFilters =
+    tags.length > 0 || collectionIds.length > 0 ? (
+      <div className="mb-1.5 flex flex-wrap gap-1 border-b border-neutral-800 px-1 pb-1.5">
+        {tags.map((tag) => (
+          <button
+            key={tag}
+            type="button"
+            onClick={() => setDraft({ tags: tags.filter((value) => value !== tag) })}
+            className="border-accent/40 bg-accent-muted text-accent rounded-full border px-2 py-0.5 text-[10px] transition-colors hover:bg-neutral-800"
+            aria-label={`Clear ${tag} tag filter`}
+          >
+            {tag} <span aria-hidden="true">×</span>
+          </button>
+        ))}
+        {collectionIds.map((id) => (
+          <button
+            key={id}
+            type="button"
+            onClick={() =>
+              setDraft({ collectionIds: collectionIds.filter((value) => value !== id) })
+            }
+            className="border-accent/40 bg-accent-muted text-accent rounded-full border px-2 py-0.5 text-[10px] transition-colors hover:bg-neutral-800"
+            aria-label="Clear collection filter"
+          >
+            Collection <span aria-hidden="true">×</span>
+          </button>
+        ))}
+      </div>
+    ) : null;
 
   if (error) {
     return (
-      <div className={surface}>
+      <div className="space-y-1">
+        {activeFilters}
         <p className="px-1 py-1 text-xs text-red-400">Search failed. Try again.</p>
       </div>
     );
@@ -108,7 +151,8 @@ function Results({ ids, error }: { ids: Uint32Array | null; error: AppError | nu
 
   if (ids.length === 0) {
     return (
-      <div className={surface}>
+      <div className="space-y-1">
+        {activeFilters}
         <p className="px-1 py-1 text-xs text-neutral-500">Nothing matches.</p>
       </div>
     );
@@ -116,7 +160,8 @@ function Results({ ids, error }: { ids: Uint32Array | null; error: AppError | nu
 
   if (ids.length > LIST_CAP) {
     return (
-      <div className={surface}>
+      <div className="space-y-1">
+        {activeFilters}
         <p className="px-1 py-1 text-xs text-neutral-500">
           <span className="font-mono text-neutral-300">
             {ids.length.toLocaleString()}
@@ -129,34 +174,38 @@ function Results({ ids, error }: { ids: Uint32Array | null; error: AppError | nu
 
   if (!rows) {
     return (
-      <div className={surface}>
+      <div className="space-y-1">
+        {activeFilters}
         <p className="px-1 py-1 font-mono text-xs text-neutral-500">Loading…</p>
       </div>
     );
   }
 
   return (
-    <ul className={`${surface} max-h-72 space-y-0.5 overflow-y-auto`}>
-      {rows.map((row) => (
-        <li key={row.id}>
-          <button
-            type="button"
-            onClick={() => select(row.id)}
-            {...auditionProps(row.id)}
-            className={`rounded-control flex w-full cursor-grab items-baseline justify-between gap-2 px-2 py-1 text-left text-xs transition-colors active:cursor-grabbing ${
-              selected === row.id
-                ? 'bg-accent-muted text-accent'
-                : 'text-neutral-300 hover:bg-neutral-800 hover:text-neutral-100'
-            }`}
-            title={row.relPath}
-          >
-            <span className="truncate">{row.filename}</span>
-            <span className="shrink-0 font-mono text-[10px] opacity-55">
-              {formatMs(row.durationMs)}
-            </span>
-          </button>
-        </li>
-      ))}
-    </ul>
+    <div className="max-h-80 overflow-y-auto">
+      {activeFilters}
+      <ul className="space-y-0.5">
+        {rows.map((row) => (
+          <li key={row.id}>
+            <button
+              type="button"
+              onClick={() => select(row.id)}
+              {...auditionProps(row.id)}
+              className={`rounded-control flex w-full cursor-grab items-baseline justify-between gap-2 px-2 py-1 text-left text-xs transition-colors active:cursor-grabbing ${
+                selected === row.id
+                  ? 'bg-accent-muted text-accent'
+                  : 'text-neutral-300 hover:bg-neutral-800 hover:text-neutral-100'
+              }`}
+              title={row.relPath}
+            >
+              <span className="truncate">{row.filename}</span>
+              <span className="shrink-0 font-mono text-[10px] opacity-55">
+                {formatMs(row.durationMs)}
+              </span>
+            </button>
+          </li>
+        ))}
+      </ul>
+    </div>
   );
 }

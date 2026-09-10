@@ -252,6 +252,46 @@ pub async fn set_tag_color(
     Ok(tag_dto(row))
 }
 
+/// Renames a tag without losing its color or any of its assignments.
+///
+/// A tag name is its identity in the UI, so merging two differently named tags implicitly
+/// would be surprising. A conflicting target is therefore an explicit invalid argument,
+/// leaving a deliberate merge workflow available for a later, clearer interaction.
+#[tauri::command]
+pub async fn rename_tag(
+    db: State<'_, Database>,
+    tag_id: i64,
+    name: String,
+) -> Result<Tag, AppError> {
+    let name = require_tag_name(&name)?;
+    let conn = db.read()?;
+    queries::tag(&conn, tag_id)?.ok_or_else(|| AppError::not_found("tag", tag_id))?;
+    if let Some(existing) = queries::tag_named(&conn, name)? {
+        if existing.id != tag_id {
+            return Err(AppError::invalid(
+                "name",
+                "a tag with that name already exists",
+            ));
+        }
+    }
+    drop(conn);
+
+    db.writer().rename_tag(tag_id, name)?;
+    let conn = db.read()?;
+    let row = queries::tag(&conn, tag_id)?.ok_or_else(|| AppError::not_found("tag", tag_id))?;
+    Ok(tag_dto(row))
+}
+
+/// Removes a tag from the library and every sample carrying it.
+#[tauri::command]
+pub async fn delete_tag(db: State<'_, Database>, tag_id: i64) -> Result<(), AppError> {
+    let conn = db.read()?;
+    queries::tag(&conn, tag_id)?.ok_or_else(|| AppError::not_found("tag", tag_id))?;
+    drop(conn);
+    db.writer().delete_tag(tag_id)?;
+    Ok(())
+}
+
 fn tag_dto(row: queries::TagRow) -> Tag {
     Tag {
         id: row.id,

@@ -1,5 +1,5 @@
 /**
- * The application shell: canvas center, a compact top app bar, and contextual popovers.
+ * The application shell: canvas center and one expanding contextual toolbar.
  *
  * The point-cloud/feature-column/filter fetch effects below are `App.tsx`'s original ones,
  * moved here unchanged — `overview.md` §5.6's boundary (the scene does no IPC, the store
@@ -11,10 +11,11 @@ import {
   ClockCounterClockwise,
   FolderOpen,
   Gear,
+  Palette,
   Stack,
   Tag,
 } from '@phosphor-icons/react';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 import {
   IpcError,
@@ -32,15 +33,14 @@ import { useAudition } from '../audition';
 import { SceneCanvas } from '../scene/SceneCanvas';
 import { useProjectionStore } from '../store/projection';
 import { useSceneStore } from '../store/scene';
-import { useShellStore } from '../store/shell';
 import { Collections } from './Collections';
-import { IconButton, Popover } from './Chrome';
-import { ColorBy } from './ColorBy';
+import { IconButton } from './Chrome';
+import { ColorByPanel } from './ColorBy';
 import { HoverHud } from './HoverHud';
 import { Inspector } from './Inspector';
 import { Library } from './Library';
-import { Search } from './Search';
-import { Settings } from './Settings';
+import { Search, SearchResults } from './Search';
+import { SettingsPanel } from './Settings';
 import { ScrubHistory } from './ScrubHistory';
 import { PanelButton } from './StateViews';
 import { Tags } from './Tags';
@@ -52,6 +52,9 @@ type Load =
   /** Scanned but not projected, or not scanned at all. A real state, not a failure. */
   | { status: 'empty' }
   | { status: 'failed'; error: AppError };
+
+type ContextPanel =
+  'search' | 'color' | 'history' | 'library' | 'tags' | 'collections' | 'settings';
 
 export function Shell() {
   useShortcuts();
@@ -73,10 +76,11 @@ export function Shell() {
     ids: Uint32Array | null;
     error: AppError | null;
   } | null>(null);
+  const [activePanel, setActivePanel] = useState<ContextPanel | null>(null);
+  const contextualRoot = useRef<HTMLDivElement>(null);
 
   const colorBy = useSceneStore((state) => state.colorBy);
   const filter = useSceneStore((state) => state.filter);
-  const openSettings = useShellStore((s) => s.openSettings);
   const lastRefitOutcome = useProjectionStore((s) => s.lastRefitOutcome);
   const selectedSampleId = useSceneStore((state) => state.selectedSampleId);
 
@@ -159,11 +163,39 @@ export function Shell() {
     };
   }, [filter]);
 
+  useEffect(() => {
+    if (activePanel === null) return;
+
+    function onPointerDown(event: PointerEvent) {
+      if (!contextualRoot.current?.contains(event.target as Node)) setActivePanel(null);
+    }
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key !== 'Escape') return;
+      event.stopPropagation();
+      setActivePanel(null);
+    }
+
+    document.addEventListener('pointerdown', onPointerDown);
+    document.addEventListener('keydown', onKeyDown, true);
+    return () => {
+      document.removeEventListener('pointerdown', onPointerDown);
+      document.removeEventListener('keydown', onKeyDown, true);
+    };
+  }, [activePanel]);
+
+  const contextOpen =
+    activePanel !== null && (activePanel !== 'search' || filter !== null);
+  const togglePanel = (panel: Exclude<ContextPanel, 'search'>) => {
+    setActivePanel((current) => (current === panel ? null : panel));
+  };
+
   return (
     <div className="bg-canvas relative h-full w-full overflow-hidden">
       <main className="absolute inset-0 min-w-0">
         {load.status === 'loading' && <Centered>Loading the map…</Centered>}
-        {load.status === 'empty' && <EmptyMap openSettings={openSettings} />}
+        {load.status === 'empty' && (
+          <EmptyMap openSettings={() => setActivePanel('settings')} />
+        )}
         {load.status === 'failed' && <Centered>{describe(load.error)}</Centered>}
         {load.status === 'ready' && (
           <>
@@ -185,36 +217,78 @@ export function Shell() {
         className="title-bar absolute top-0 right-0 left-0 z-10 h-9"
       />
 
-      <div className="glass rounded-panel absolute top-11 left-4 z-10 flex items-start gap-1 p-1">
-        <Search ids={matchedIds} error={current?.error ?? null} />
-        <div className="flex items-start gap-1">
-          <ColorBy />
-          <Popover
-            label="Scrub history"
-            icon={<ClockCounterClockwise />}
-            align="right"
-            width="w-80"
-          >
-            <ScrubHistory />
-          </Popover>
-          <Popover
-            label="Library folders"
-            icon={<FolderOpen />}
-            align="right"
-            width="w-80"
-          >
-            <Library />
-          </Popover>
-          <Popover label="Tags" icon={<Tag />} align="right" width="w-80">
-            <Tags />
-          </Popover>
-          <Popover label="Collections" icon={<Stack />} align="right" width="w-80">
-            <Collections />
-          </Popover>
-          <IconButton label="Settings" onClick={openSettings}>
-            <Gear />
-          </IconButton>
+      <div
+        ref={contextualRoot}
+        className="glass rounded-panel absolute top-11 left-4 z-10 w-[44rem] max-w-[calc(100vw-2rem)] p-1"
+      >
+        <div className="flex w-full items-center gap-1">
+          <Search
+            className="min-w-0 flex-1"
+            onActivate={() => setActivePanel('search')}
+          />
+          <div className="flex shrink-0 items-center gap-1">
+            <IconButton
+              label="Colour the map by"
+              active={activePanel === 'color'}
+              onClick={() => togglePanel('color')}
+            >
+              <Palette />
+            </IconButton>
+            <IconButton
+              label="Scrub history"
+              active={activePanel === 'history'}
+              onClick={() => togglePanel('history')}
+            >
+              <ClockCounterClockwise />
+            </IconButton>
+            <IconButton
+              label="Library folders"
+              active={activePanel === 'library'}
+              onClick={() => togglePanel('library')}
+            >
+              <FolderOpen />
+            </IconButton>
+            <IconButton
+              label="Manage tags"
+              active={activePanel === 'tags'}
+              onClick={() => togglePanel('tags')}
+            >
+              <Tag />
+            </IconButton>
+            <IconButton
+              label="Manage collections"
+              active={activePanel === 'collections'}
+              onClick={() => togglePanel('collections')}
+            >
+              <Stack />
+            </IconButton>
+            <IconButton
+              label="Settings"
+              active={activePanel === 'settings'}
+              onClick={() => togglePanel('settings')}
+            >
+              <Gear />
+            </IconButton>
+          </div>
         </div>
+
+        {contextOpen && (
+          <section className="rise-in mt-1 max-h-[70vh] overflow-y-auto px-2 pt-3 pb-2">
+            {activePanel === 'search' && (
+              <SearchResults ids={matchedIds} error={current?.error ?? null} />
+            )}
+            {activePanel === 'color' && (
+              <ColorByPanel onChoose={() => setActivePanel(null)} />
+            )}
+            {activePanel === 'history' && <ScrubHistory />}
+            {activePanel === 'library' && <Library />}
+            {activePanel === 'tags' && <Tags onBrowse={() => setActivePanel('search')} />}
+            {activePanel === 'collections' && (
+              <Collections onBrowse={() => setActivePanel('search')} />
+            )}
+            {activePanel === 'settings' && <SettingsPanel />}
+          </section>
+        )}
       </div>
 
       {selectedSampleId !== null && (
@@ -224,8 +298,6 @@ export function Shell() {
       )}
 
       <HoverHud />
-
-      <Settings />
     </div>
   );
 }

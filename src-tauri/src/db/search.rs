@@ -329,6 +329,12 @@ pub struct QueryFilter {
     pub root_ids: Vec<i64>,
     /// A sample must carry **all** of these.
     pub tags: Vec<String>,
+    /// A sample must belong to **all** of these saved collections.
+    ///
+    /// Most callers send one id: this makes a collection a browsable view of the library,
+    /// not a list trapped inside its management area. Keeping the same intersection
+    /// semantics as tags makes a future multi-collection control unsurprising.
+    pub collection_ids: Vec<i64>,
     /// Lowercase, without the dot. Empty means every extension.
     pub exts: Vec<String>,
     /// Range constraints, one per feature. Two ranges over the same feature both apply,
@@ -418,6 +424,19 @@ pub fn sample_ids(conn: &Connection, filter: &QueryFilter) -> Result<Vec<i64>, D
                        WHERE st.sample_id = s.id AND t.name = ? COLLATE NOCASE)",
             );
             params.push(Value::Text(tag.clone()));
+        }
+    }
+
+    if !filter.collection_ids.is_empty() {
+        if filter.collection_ids.len() > MAX_IN_LIST {
+            return Err(too_many("collectionIds", filter.collection_ids.len()));
+        }
+        for collection_id in &filter.collection_ids {
+            sql.push_str(
+                "\n           AND EXISTS (SELECT 1 FROM collection_members cm
+                       WHERE cm.sample_id = s.id AND cm.collection_id = ?)",
+            );
+            params.push(Value::Integer(*collection_id));
         }
     }
 

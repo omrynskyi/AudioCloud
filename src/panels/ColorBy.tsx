@@ -14,11 +14,9 @@
  * producer would actually reach for, under the names they would look for them by.
  */
 
-import { Palette } from '@phosphor-icons/react';
-
 import type { Feature } from '../ipc';
 import { useSceneStore } from '../store/scene';
-import { ChoiceRow, PanelHeading, Popover } from './Chrome';
+import { ChoiceRow, PanelHeading } from './Chrome';
 
 interface Choice {
   /** `null` restores the colours the projection fit produced. */
@@ -39,19 +37,23 @@ const CHOICES: readonly Choice[] = [
   { feature: 'durationMs', label: 'Length', hint: 'short to long' },
 ];
 
-export function ColorBy() {
+/** Content for the shell's shared contextual area. */
+export function ColorByPanel({ onChoose }: { onChoose?: () => void }) {
   const colorBy = useSceneStore((s) => s.colorBy);
   const setColorBy = useSceneStore((s) => s.setColorBy);
 
   return (
-    <Popover label="Colour the map by" icon={<Palette />} width="w-56">
+    <section>
       <PanelHeading>Colour by</PanelHeading>
       <div className="space-y-0.5">
         {CHOICES.map((choice) => (
           <ChoiceRow
             key={choice.label}
             selected={colorBy === choice.feature}
-            onClick={() => setColorBy(choice.feature)}
+            onClick={() => {
+              setColorBy(choice.feature);
+              onChoose?.();
+            }}
           >
             <span>{choice.label}</span>
             {/* Inherits the row's colour rather than setting its own, so the hint stays
@@ -60,6 +62,6 @@ export function ColorBy() {
           </ChoiceRow>
         ))}
       </div>
-    </Popover>
+    </section>
   );
 }
