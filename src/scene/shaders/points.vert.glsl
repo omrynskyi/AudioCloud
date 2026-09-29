@@ -41,8 +41,14 @@ uniform float uFarSizeScale;
 // `aId` of the hovered and selected points, or 0.0 for none.
 uniform float uHoverId;
 uniform float uSelectedId;
+// Points the cursor has just left, and how far through its fade each is (0 fresh, 1 gone).
+// Zero id = empty slot. The size must match `TRAIL_SLOTS` in `scene/trail.ts`.
+uniform float uTrailIds[16];
+uniform float uTrailAges[16];
 // How much larger an emphasized point is drawn.
 uniform float uEmphasisScale;
+// How far the ring reaches beyond the emphasized core, as a multiple of the core's radius.
+uniform float uRingReach;
 
 // Global multiplier on every radius, so a UI slider does not have to rewrite 50,000 floats.
 uniform float uSizeMultiplier;
@@ -56,6 +62,8 @@ varying float vEmphasis;
 // The unclamped pixel diameter, so the fragment stage can discard sub-pixel sprites and
 // compensate the ones just above the threshold.
 varying float vPointSize;
+// Remaining strength of a trailing ring: 1 just after the cursor leaves, 0 when it is gone.
+varying float vTrail;
 
 void main() {
   vec4 viewPosition = modelViewMatrix * vec4(position, 1.0);
@@ -76,9 +84,22 @@ void main() {
     emphasis = 1.0;
   }
 
+  // A point that is neither selected nor hovered may still be fading out from a recent hover.
+  float trail = 0.0;
+  if (emphasis < 0.5) {
+    for (int i = 0; i < 16; i++) {
+      if (uTrailIds[i] > 0.5 && abs(aId - uTrailIds[i]) < 0.5) {
+        trail = 1.0 - uTrailAges[i];
+      }
+    }
+  }
+
   float radius = aSize * uSizeMultiplier * mix(1.0, uFarSizeScale, recede);
-  if (emphasis > 0.5) {
-    radius *= uEmphasisScale;
+  if (emphasis > 0.5 || trail > 0.0) {
+    // The sprite is grown by the ring's reach so the ring has room outside the core. The
+    // fragment stage shrinks the core back down inside it, so the core does not change size
+    // when a ring fades out.
+    radius *= uEmphasisScale * uRingReach;
   }
 
   float pixels = radius * uSizeScale / depth;
@@ -88,4 +109,5 @@ void main() {
   vColor = aColor;
   vAlpha = mix(1.0, uFarAlpha, recede);
   vEmphasis = emphasis;
+  vTrail = trail;
 }

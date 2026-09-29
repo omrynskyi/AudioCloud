@@ -54,10 +54,12 @@ import {
   createCloudMaterials,
   pixelsPerWorldUnit,
   type CloudMaterials,
+  type DisplayUniforms,
   type SharedUniforms,
 } from './materials';
 import { HoverGate, NO_PICK, Picker } from './picking';
 import { prefetchQueue } from './prefetchQueue';
+import { HoverTrail } from './trail';
 import { allSamplesByDistance, visibleSamples } from './visibility';
 
 /** What the harness in `scene/profile.ts` and the app shell get to hold. */
@@ -126,7 +128,7 @@ const HOVER_PICK_HZ = 120;
 const ZOOM_SPEED = 0.0015;
 
 /**
- * Debounce before a hover fetches and highlights similar samples.
+ * Debounce before a hover fetches similar samples to prefetch.
  *
  * Audition plays immediately on every hover (see below); this one stays debounced because it
  * guards a different cost -- `get_similar`'s tens-of-milliseconds linear scan, not the
@@ -135,14 +137,11 @@ const ZOOM_SPEED = 0.0015;
  */
 const HOVER_SIMILARITY_DEBOUNCE_MS = 120;
 
-/** How many nearest neighbors light up when a sample is hovered. */
-const SIMILAR_HIGHLIGHT_K = 15;
-
 /**
- * How many of those neighbors get their PCM warmed in the background while the cursor sits on
- * the current one. Small and sequential (see the prefetch loop below) on purpose: a point-cloud
+ * How many nearest neighbors get their PCM warmed in the background while the cursor sits on
+ * the current sample. Small and sequential (see the prefetch loop below) on purpose: a point-cloud
  * browsing session tends to drift to a *nearby* point next, so warming a few is most of the
- * benefit, and warming all fifteen would queue that much decode work behind the single decoder
+ * benefit, and warming many more would queue that much decode work behind the single decoder
  * lock `audio/mod.rs` deliberately keeps -- exactly what would make the next *real* hover slower
  * instead of faster.
  */
@@ -200,6 +199,7 @@ export function PointCloud({
   );
   const materials = useMemo(() => createCloudMaterials(caps), [caps]);
   const picker = useMemo(() => new Picker(), []);
+  const trail = useMemo(() => new HoverTrail(), []);
   const hoverGate = useMemo(() => new HoverGate(HOVER_PICK_HZ), []);
 
   const points = useMemo(() => {
@@ -223,13 +223,14 @@ export function PointCloud({
   // hatch for exactly this, and routing through one says out loud that these objects live
   // outside React's model.
   const shared = useRef<SharedUniforms | null>(null);
+  const display = useRef<DisplayUniforms | null>(null);
   useEffect(() => {
     shared.current = materials.shared;
+    display.current = materials.display;
   }, [materials]);
   const controlsRef = useRef<ComponentRef<typeof OrbitControls>>(null);
   const colorScratch = useRef<Float32Array | null>(null);
   const maskScratch = useRef<Uint8Array | null>(null);
-  const highlightScratch = useRef<Uint8Array | null>(null);
   const pointerDownAt = useRef<{ x: number; y: number } | null>(null);
   const fileDrag = useRef<{
     pointerId: number;
@@ -249,7 +250,8 @@ export function PointCloud({
   // between here and a setup effect.
   useFrame(() => {
     const uniforms = shared.current;
-    if (!uniforms) return;
+    const displayUniforms = display.current;
+    if (!uniforms || !displayUniforms) return;
     // Clip planes first: they gate whether anything below is visible at all, and they have
     // to track the *live* camera distance, not the one from when the cloud was last framed —
     // see `updateClipPlanes`'s doc comment for the "zoom in and the whole cloud vanishes" bug
@@ -259,6 +261,12 @@ export function PointCloud({
     uniforms.uSizeScale.value = pixelsPerWorldUnit(camera.fov, drawingBuffer.current.y);
     uniforms.uFadeNear.value = FADE_DISABLED_NEAR;
     uniforms.uFadeFar.value = FADE_DISABLED_FAR;
+
+    // Advance the hover trail, and keep frames coming (the canvas is demand-driven) until
+    // every ring has finished fading.
+    if (trail.update(performance.now())) invalidate();
+    displayUniforms.uTrailIds.value.set(trail.ids);
+    displayUniforms.uTrailAges.value.set(trail.ages);
   });
 
   // ── Framing ───────────────────────────────────────────────────────────────────
@@ -355,12 +363,14 @@ export function PointCloud({
         (state) => state.hoveredSampleId,
         (sampleId) => {
           const index = sampleId === null ? -1 : buffers.indexOfSample(sampleId);
+          // The point being left starts its fade; `useFrame` below advances it.
+          trail.push(materials.display.uHoverId.value, performance.now());
           materials.display.uHoverId.value = index + 1;
           invalidate();
         },
         { fireImmediately: true },
       ),
-    [buffers, materials, invalidate],
+    [buffers, materials, trail, invalidate],
   );
 
   useEffect(
@@ -384,13 +394,13 @@ export function PointCloud({
   // and the rail's sample lists alike. `onPointerMove`'s `HOVER_PICK_HZ` gate is what bounds
   // how many auditions a sweep across the map can fire per second.
 
-  // ── Similar-sound highlight ───────────────────────────────────────────────────
+  // ── Neighbor prefetch ─────────────────────────────────────────────────────────
   //
-  // Dims every point except the hovered sample and its nearest neighbors by embedding
-  // similarity, so "what does this sound like" is a glance rather than a click into the
-  // inspector. Debounced, unlike audition above -- a cursor sweeping across a dense cluster
-  // must not fire one `get_similar` scan per point it crosses -- and the fetch is discarded
-  // if the hover has already moved on by the time it resolves.
+  // Hovering no longer highlights similar samples on the map; the nearest neighbors' PCM is
+  // still warmed, since they are the most likely next stop as the cursor drifts through a
+  // cluster. Debounced for the same reason the highlight was -- a cursor sweeping across a
+  // dense cluster must not fire one `get_similar` scan per point it crosses -- and the fetch
+  // is discarded if the hover has already moved on by the time it resolves.
 
   useEffect(() => {
     let pending: ReturnType<typeof setTimeout> | null = null;
@@ -405,41 +415,15 @@ export function PointCloud({
       (state) => state.hoveredSampleId,
       (sampleId) => {
         clearPending();
-        if (sampleId === null) {
-          buffers.setHighlight(null);
-          invalidate();
-          return;
-        }
+        if (sampleId === null) return;
         pending = setTimeout(() => {
-          getSimilar(sampleId, SIMILAR_HIGHLIGHT_K)
+          getSimilar(sampleId, PREFETCH_NEIGHBOR_COUNT)
             .then((neighbors) => {
-              // Stale if the cursor has moved to a different sample, or off the cloud, since
-              // this fetch started -- applying it now would highlight the wrong neighborhood.
               if (useSceneStore.getState().hoveredSampleId !== sampleId) return;
-              if (highlightScratch.current?.length !== buffers.count) {
-                highlightScratch.current = new Uint8Array(buffers.count);
-              }
-              const highlight = highlightScratch.current;
-              highlight.fill(0);
-              const focusIndex = buffers.indexOfSample(sampleId);
-              if (focusIndex !== -1) highlight[focusIndex] = 1;
-              for (const neighbor of neighbors) {
-                const index = buffers.indexOfSample(neighbor.sampleId);
-                if (index !== -1) highlight[index] = 1;
-              }
-              buffers.setHighlight(highlight);
-              invalidate();
-
-              // Warm the nearest few neighbors' decode cache while the cursor is here -- the
-              // most likely next stop as the cursor keeps drifting through this cluster.
               // `prefetchQueue` supersedes this with whatever the *next* hover or viewport
               // settle asks for, so there is nothing to abort here even if the cursor has
               // already moved on by the time this resolves.
-              prefetchQueue.replacePriority(
-                neighbors
-                  .slice(0, PREFETCH_NEIGHBOR_COUNT)
-                  .map((neighbor) => neighbor.sampleId),
-              );
+              prefetchQueue.replacePriority(neighbors.map((neighbor) => neighbor.sampleId));
             })
             .catch(() => {});
         }, HOVER_SIMILARITY_DEBOUNCE_MS);
@@ -450,7 +434,7 @@ export function PointCloud({
       clearPending();
       unsubscribe();
     };
-  }, [buffers, invalidate]);
+  }, []);
 
   // ── Picking ───────────────────────────────────────────────────────────────────
 

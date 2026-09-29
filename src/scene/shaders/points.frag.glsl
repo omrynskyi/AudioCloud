@@ -12,15 +12,18 @@ varying vec3 vColor;
 varying float vAlpha;
 varying float vEmphasis;
 varying float vPointSize;
+varying float vTrail;
 
 // Sprites smaller than this many framebuffer pixels are discarded outright. The LOD floor:
 // below about a pixel a sprite is aliasing, not information.
 uniform float uMinPointSize;
 // Where the sprite's core ends and its falloff begins, in units of the sprite radius.
 uniform float uCoreRadius;
-// The ring drawn around a hovered or selected point, in the same units.
+// The ring drawn around a hovered, selected or fading point, in units of the core's radius
+// (so it lies outside the core, at >1). `uRingReach` is where the sprite ends in those units.
 uniform float uRingInner;
 uniform float uRingOuter;
+uniform float uRingReach;
 uniform vec3 uHoverColor;
 uniform vec3 uSelectColor;
 
@@ -35,6 +38,9 @@ void main() {
   float radiusSquared = dot(offset, offset);
   if (radiusSquared > 1.0) discard;
   float radius = sqrt(radiusSquared);
+  // Emphasized and fading points are drawn on a larger sprite: measure from the core outward
+  // so the core is the same full size and the ring sits clear of it.
+  if (vEmphasis > 0.5 || vTrail > 0.0) radius *= uRingReach;
 
   float core = 1.0 - smoothstep(uCoreRadius, 1.0, radius);
   vec3 color = vColor;
@@ -48,6 +54,16 @@ void main() {
     vec3 ringColor = vEmphasis > 1.5 ? uSelectColor : uHoverColor;
     color = mix(color, ringColor, clamp(ring * 1.5, 0.0, 1.0));
     alpha = clamp(alpha + ring, 0.0, 1.0);
+  } else if (vTrail > 0.0) {
+    // The cursor has left: the ring settles into the point's own colour, then fades out.
+    // The colour change finishes early (by the time 30% of the fade has passed) so most of
+    // the trail reads as the point's colour dissolving rather than as a white flash.
+    float ring = smoothstep(uRingInner, uRingInner + 0.06, radius) *
+                 (1.0 - smoothstep(uRingOuter - 0.06, uRingOuter, radius));
+    vec3 ringColor = mix(vColor, uHoverColor, smoothstep(0.7, 1.0, vTrail));
+    float strength = ring * vTrail;
+    color = mix(color, ringColor, clamp(strength * 1.5, 0.0, 1.0));
+    alpha = clamp(alpha + strength, 0.0, 1.0);
   }
 
   // Fade a sprite out as it approaches the discard threshold, rather than letting it wink

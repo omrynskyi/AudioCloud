@@ -73,7 +73,7 @@ const DEFAULTS = {
   // This is a real fill-rate cost at 50,000 overlapping sprites (`overview.md` §7's 60 fps
   // target) and the cost is quadratic in this number, not linear — re-check `npm run
   // profile` after moving it again.
-  radiusFraction: 1 / 140,
+  radiusFraction: 1 / 70,
   filteredScale: 0.42,
   filteredSaturation: 0.12,
   filteredBrightness: 0.3,

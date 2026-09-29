@@ -30,6 +30,7 @@ import {
 } from 'three';
 
 import type { GlCaps } from './caps';
+import { TRAIL_SLOTS } from './trail';
 import pickFragmentSource from './shaders/pick.frag.glsl?raw';
 import pickVertexSource from './shaders/pick.vert.glsl?raw';
 import pointsFragmentSource from './shaders/points.frag.glsl?raw';
@@ -54,7 +55,11 @@ export interface DisplayUniforms {
   uFarAlpha: IUniform<number>;
   uHoverId: IUniform<number>;
   uSelectedId: IUniform<number>;
+  /** `aId` and fade progress (0 fresh, 1 gone) of the recently-left points; see `trail.ts`. */
+  uTrailIds: IUniform<Float32Array>;
+  uTrailAges: IUniform<Float32Array>;
   uEmphasisScale: IUniform<number>;
+  uRingReach: IUniform<number>;
   uCoreRadius: IUniform<number>;
   uRingInner: IUniform<number>;
   uRingOuter: IUniform<number>;
@@ -81,6 +86,9 @@ export interface MaterialOptions {
   emphasisScale?: number;
 }
 
+/** Sprite radius of an emphasized point as a multiple of its core radius; the ring lives in the gap. */
+const RING_REACH = 1.4;
+
 const DEFAULTS = {
   // Under a pixel. High enough that a sprite the rasterizer would only alias is dropped, low
   // enough that zooming out does not thin the corpus into a different shape.
@@ -102,7 +110,7 @@ const DEFAULTS = {
   // rather than as absence.
   farAlpha: 0.34,
   farSizeScale: 0.66,
-  emphasisScale: 1.9,
+  emphasisScale: 1,
 } as const;
 
 export function createCloudMaterials(
@@ -127,7 +135,10 @@ export function createCloudMaterials(
     uFarAlpha: { value: settings.farAlpha },
     uHoverId: { value: 0 },
     uSelectedId: { value: 0 },
+    uTrailIds: { value: new Float32Array(TRAIL_SLOTS) },
+    uTrailAges: { value: new Float32Array(TRAIL_SLOTS) },
     uEmphasisScale: { value: settings.emphasisScale },
+    uRingReach: { value: RING_REACH },
     // Fraction of the sprite's radius that reads as solid before `points.frag.glsl`'s
     // falloff begins. 0.35 spent most of a small sprite's few pixels on soft edge and almost
     // none on solid colour, which reads as a smudge rather than a point; 0.5 gave it a
@@ -135,8 +146,8 @@ export function createCloudMaterials(
     // lighter background a wide soft falloff is what makes a dot look like a blur, so most
     // of the sprite is now core and only its outer third is edge.
     uCoreRadius: { value: 0.62 },
-    uRingInner: { value: 0.62 },
-    uRingOuter: { value: 0.92 },
+    uRingInner: { value: 0.98 },
+    uRingOuter: { value: 1.3 },
     uHoverColor: { value: new Color(0.98, 0.98, 1.0) },
     uSelectColor: { value: new Color(1.0, 0.78, 0.35) },
   };
