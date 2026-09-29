@@ -93,7 +93,7 @@ pub fn extract(samples: &[f32], mel: &[f32], truncated: bool) -> [f32; FEATURE_D
     let floor = real.iter().copied().fold(f32::NEG_INFINITY, f32::max) - TOP_DB;
     let mut sum = [0.0f64; MFCC_COEFFS];
     let mut sum_sq = [0.0f64; MFCC_COEFFS];
-    for frame in real.chunks_exact(MEL_BINS) {
+    for frame in real.as_chunks::<MEL_BINS>().0 {
         for (k, basis) in table.iter().enumerate() {
             let c: f64 = basis
                 .iter()
@@ -205,7 +205,7 @@ impl MfccEmbedder {
 impl Embed for MfccEmbedder {
     fn embed_batch(&self, features: &[f32], count: usize) -> Result<Vec<f32>, EmbedError> {
         let mut out = Vec::with_capacity(count * FEATURE_DIM);
-        for raw in features.chunks_exact(FEATURE_DIM).take(count) {
+        for raw in features.as_chunks::<FEATURE_DIM>().0.iter().take(count) {
             out.extend(standardize(raw));
         }
         if out.len() != count * FEATURE_DIM {

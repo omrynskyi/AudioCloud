@@ -423,7 +423,9 @@ export function PointCloud({
               // `prefetchQueue` supersedes this with whatever the *next* hover or viewport
               // settle asks for, so there is nothing to abort here even if the cursor has
               // already moved on by the time this resolves.
-              prefetchQueue.replacePriority(neighbors.map((neighbor) => neighbor.sampleId));
+              prefetchQueue.replacePriority(
+                neighbors.map((neighbor) => neighbor.sampleId),
+              );
             })
             .catch(() => {});
         }, HOVER_SIMILARITY_DEBOUNCE_MS);
