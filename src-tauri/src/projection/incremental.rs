@@ -2,7 +2,7 @@
 //!
 //! A user who drags twelve files into their library must not watch their entire map rotate.
 //! So below [`super::refit::INCREMENTAL_THRESHOLD`] of the corpus, nothing is re-fitted:
-//! each new sample is placed at the similarity-weighted barycenter of its nearest already-
+//! each new sample is placed at the distance-weighted barycenter of its nearest already-
 //! projected neighbors, and **not one existing point moves** -- not approximately, not after
 //! alignment, at all. The rows for existing samples are never written.
 //!
@@ -192,8 +192,13 @@ fn place_all(
                 if matrix.row_into(*loc, &mut row).is_err() || row.len() != dim {
                     continue;
                 }
+                // Nearest by Euclidean distance -- the geometry t-SNE fitted the map in --
+                // computed as `q.r - |r|^2 / 2`, which orders anchors exactly as `|q - r|`
+                // does (the `|q|^2` term is the same for every anchor) while keeping the
+                // lane-split dot product. `|r|^2` is paid once per anchor, not per query.
+                let half_norm = 0.5 * dot(&row, &row);
                 for (query, best) in queries.iter().zip(best.iter_mut()) {
-                    best.offer(dot(query, &row), *point);
+                    best.offer(dot(query, &row) - half_norm, *point);
                 }
             }
             Ok(best)
@@ -208,18 +213,25 @@ fn place_all(
     }
 
     let mut placements = Vec::with_capacity(newcomers.len());
-    for ((sample_id, _), best) in newcomers.iter().zip(merged.iter()) {
-        if let Some(point) = barycenter(&best.entries) {
+    for (((sample_id, _), query), best) in newcomers.iter().zip(&queries).zip(merged.iter()) {
+        // Scores back to distances: `|q - r|^2 = |q|^2 - 2 * (q.r - |r|^2 / 2)`.
+        let query_sq = dot(query, query);
+        let nearest: Vec<(f32, Point3)> = best
+            .entries
+            .iter()
+            .map(|(score, point)| ((query_sq - 2.0 * score).max(0.0).sqrt(), *point))
+            .collect();
+        if let Some(point) = barycenter(&nearest) {
             placements.push((*sample_id, jitter(point, *sample_id, extent)));
         }
     }
     Ok(placements)
 }
 
-/// Cosine similarity between two stored vectors.
+/// The dot product of two stored vectors.
 ///
-/// A dot product, with no norm to divide by: every vector in the store is L2-normalized on
-/// receipt (Phase 4), so there is no place for a forgotten normalization to hide.
+/// Stored vectors are standardized features and are **not** unit length, so this is not a
+/// cosine; [`place_all`] uses it to compute Euclidean distances.
 ///
 /// **The eight accumulators are the point.** Floating-point addition is not associative, so
 /// a plain `zip().map().sum()` is a serial dependency chain that LLVM is not permitted to
@@ -291,29 +303,31 @@ impl TopK {
     }
 }
 
-/// The similarity-weighted mean of some neighbors' positions.
+/// The inverse-distance-weighted mean of some neighbors' positions.
 ///
-/// Weights are similarities shifted into `[0, 2]` -- cosine runs to -1, and a negative
-/// weight would push a point *away* from its neighbor and out of the convex hull of the
-/// cloud entirely. Shifting keeps the placement inside the region its neighbors occupy,
-/// which is the only claim this method makes.
+/// Each neighbor is `(distance to the new sample, position)`. Weights are `1 / (d + eps)`:
+/// always positive, so the placement stays inside the region its neighbors occupy -- the
+/// only claim this method makes -- and an exact duplicate (`d = 0`) pulls hard without
+/// dividing by zero.
 fn barycenter(neighbors: &[(f32, Point3)]) -> Option<Point3> {
+    /// Keeps a zero distance finite and bounds how much one exact twin can dominate.
+    const EPS: f64 = 1e-3;
+
     if neighbors.is_empty() {
         return None;
     }
     let mut total = 0.0f64;
     let mut acc = [0.0f64; 3];
-    for (similarity, point) in neighbors {
-        let w = f64::from(similarity + 1.0);
+    for (distance, point) in neighbors {
+        let w = 1.0 / (f64::from(*distance).max(0.0) + EPS);
         total += w;
         for axis in 0..3 {
             acc[axis] += w * f64::from(point[axis]);
         }
     }
     if total <= 0.0 || !total.is_finite() {
-        // Every neighbor exactly anti-similar. Fall back to the unweighted mean rather than
-        // dividing by zero: it is still inside the neighbors' hull, which is the property
-        // that matters.
+        // Non-finite distances. Fall back to the unweighted mean rather than dividing by
+        // zero: it is still inside the neighbors' hull, which is the property that matters.
         let n = neighbors.len() as f64;
         let mut mean = [0.0f32; 3];
         for (_, point) in neighbors {
@@ -369,8 +383,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_placement_lands_between_its_neighbors_and_nearer_the_similar_one() {
-        let neighbors = vec![(0.9f32, [0.0, 0.0, 0.0]), (0.1, [10.0, 0.0, 0.0])];
+    fn a_placement_lands_between_its_neighbors_and_nearer_the_closer_one() {
+        let neighbors = vec![(1.0f32, [0.0, 0.0, 0.0]), (9.0, [10.0, 0.0, 0.0])];
         let point = barycenter(&neighbors).unwrap();
 
         assert!(
@@ -379,17 +393,19 @@ mod tests {
         );
         assert!(
             point[0] < 5.0,
-            "the more similar neighbor did not pull harder: {point:?}"
+            "the closer neighbor did not pull harder: {point:?}"
         );
     }
 
-    /// Cosine runs to -1. An unshifted weight would be negative and push the point outside
-    /// its neighbors entirely, which is the opposite of what a barycenter is for.
+    /// An exact duplicate is at distance zero. It must dominate without a division by zero
+    /// or a placement outside its neighbors.
     #[test]
-    fn an_anti_similar_neighbor_does_not_push_the_point_out_of_the_hull() {
-        let neighbors = vec![(-0.95f32, [0.0, 0.0, 0.0]), (0.95, [10.0, 0.0, 0.0])];
+    fn an_exact_twin_pulls_hard_and_stays_finite() {
+        let neighbors = vec![(0.0f32, [0.0, 0.0, 0.0]), (2.0, [10.0, 0.0, 0.0])];
         let point = barycenter(&neighbors).unwrap();
+        assert!(point.iter().all(|v| v.is_finite()));
         assert!((0.0..=10.0).contains(&point[0]), "left the hull: {point:?}");
+        assert!(point[0] < 0.1, "the twin did not dominate: {point:?}");
     }
 
     #[test]
