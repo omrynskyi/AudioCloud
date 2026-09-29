@@ -1,7 +1,7 @@
 /**
  * Welcome → add a library root → scan.
  *
- * Scanning uses AudioCloud's built-in fingerprint embedder and needs no model download.
+ * Scanning uses AudioCloud's built-in MFCC embedder and needs no model download.
  */
 
 import { open as openDialog } from '@tauri-apps/plugin-dialog';

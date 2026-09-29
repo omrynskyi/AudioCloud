@@ -1,12 +1,12 @@
 //! Embedding: the batching accumulator over one shared embedder.
 //!
-//! Batching keeps the spectrogram-to-vector stage bounded and lets the active embedder
+//! Batching keeps the feature-to-vector stage bounded and lets the active embedder
 //! process several samples at a time.
 //!
 //! Two things this module does *not* do, both deliberate:
 //!
 //! - It talks only to the [`Embed`] trait, keeping the batching logic independent of the
-//!   concrete fingerprint implementation.
+//!   concrete embedder.
 //! - **It does not decide what a batch means for the database.** It attaches vectors to
 //!   rows and passes them on; `pipeline::persist_stage` owns `embeddings.bin` and the
 //!   `samples` update.
@@ -20,18 +20,17 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 
 use crate::pipeline::{
     decode::{BufferPool, PooledBuffer},
-    mel::{MEL_BINS, MEL_FRAMES},
+    mfcc_embed::FEATURE_DIM,
 };
 
-/// Values in one log-mel spectrogram: 1001 frames x 64 bands, 256 KB of f32.
-pub const MEL_VALUES: usize = MEL_FRAMES * MEL_BINS;
+/// Values in one embed-stage input: the raw feature vector the process stage extracts from
+/// a decoded sound ([`crate::pipeline::mfcc_embed::extract`]). 180 bytes of f32.
+pub const INPUT_LEN: usize = FEATURE_DIM;
 
-/// Depth of the mel -> embed queue (`overview.md` §3).
+/// Depth of the process -> embed queue.
 ///
-/// 64 mel tensors is 16 MB in flight. This is the queue that bounds peak RSS during a
-/// scan: inference is the slowest stage, so this is the one that is actually full, and
-/// backpressure from it is what stops the decoders -- and through them the walker -- from
-/// running ahead of the model.
+/// Inputs are tiny, so this is no longer what bounds peak RSS; it only has to be deep
+/// enough that the decoders are not stalled waiting for a batch to fill.
 pub const EMBED_QUEUE_DEPTH: usize = 64;
 
 /// How a batch is filled and when it is given up on.
@@ -65,7 +64,7 @@ impl BatchConfig {
     }
 }
 
-/// A batch of mel spectrograms, and the vectors that come back.
+/// A batch of raw feature vectors, and the vectors that come back.
 ///
 /// The narrowest possible view of inference, for two reasons. It keeps `ort` behind
 /// [`crate::model::session`] (cross-cutting rule 7), and it makes the accumulator testable
@@ -73,11 +72,12 @@ impl BatchConfig {
 /// how many spectrograms each `run` received, which is the property the batcher exists to
 /// have and the one a real session would make almost impossible to observe.
 pub trait Embed: Send + Sync {
-    /// Embeds `count` concatenated [`MEL_VALUES`]-value spectrograms, returning
-    /// `count * dim` L2-normalized floats.
-    fn embed_batch(&self, mels: &[f32], count: usize) -> Result<Vec<f32>, EmbedError>;
+    /// Embeds `count` concatenated [`INPUT_LEN`]-value raw feature vectors, returning
+    /// `count * dim` floats. The output is **not** promised to be unit length: stored vectors
+    /// are standardized features, and consumers must not assume otherwise.
+    fn embed_batch(&self, inputs: &[f32], count: usize) -> Result<Vec<f32>, EmbedError>;
 
-    /// Width of one vector. Checked against [`crate::EMBEDDING_DIM`] at session init.
+    /// Width of one vector; the pipeline expects it to equal [`crate::EMBEDDING_DIM`].
     fn embedding_dim(&self) -> usize;
 }
 
@@ -92,25 +92,21 @@ pub enum EmbedError {
     },
 }
 
-/// A pool of mel buffers, sized for the queue between the mel and embed stages.
-///
-/// 256 KB each (`overview.md` §3.6). Per-file allocation of these across a 50,000-file
-/// scan is 12 GB of churn for a buffer whose size is a compile-time constant.
+/// A pool of feature buffers, sized for the queue between the process and embed stages.
 ///
 /// `max_held` covers the steady state rather than the high-water mark: buffers are taken
 /// by `rayon` workers one at a time and released by the embed stage a whole batch at a
 /// time, so the free list swings by a batch. Sized under that and every release past the
-/// cap is a free followed immediately by a fresh 256 KB allocation, which is the churn the
-/// pool exists to avoid.
-pub fn mel_pool(batch: BatchConfig) -> Arc<BufferPool> {
+/// cap is a free followed immediately by a fresh allocation.
+pub fn input_pool(batch: BatchConfig) -> Arc<BufferPool> {
     let cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
-    BufferPool::new(MEL_VALUES, cores * 2 + batch.size * 2)
+    BufferPool::new(INPUT_LEN, cores * 2 + batch.size * 2)
 }
 
 /// One item on its way through the embed stage: a payload of the caller's choosing, and
-/// optionally a spectrogram to embed.
+/// optionally a raw feature vector to embed.
 ///
 /// Generic over the payload so this module never has to know what a `samples` row is. The
 /// pipeline passes its `Analyzed`; the tests pass an integer.
@@ -119,7 +115,7 @@ pub struct Pending<T> {
     pub payload: T,
     /// `None` for anything that does not need inference -- a quarantined file, a duplicate
     /// borrowing its twin's vector, or any row at all when no session is available.
-    pub mel: Option<PooledBuffer>,
+    pub input: Option<PooledBuffer>,
 }
 
 /// What came back for one item.
@@ -158,9 +154,9 @@ pub fn embed_stage<T, E: Embed + ?Sized>(
 ) -> (u64, u64) {
     let dim = model.embedding_dim();
     let mut payloads: Vec<T> = Vec::with_capacity(config.size);
-    let mut mels: Vec<PooledBuffer> = Vec::with_capacity(config.size);
+    let mut inputs: Vec<PooledBuffer> = Vec::with_capacity(config.size);
     let mut wants: Vec<bool> = Vec::with_capacity(config.size);
-    let mut staging: Vec<f32> = Vec::with_capacity(config.size * MEL_VALUES);
+    let mut staging: Vec<f32> = Vec::with_capacity(config.size * INPUT_LEN);
     let (mut ran, mut runs) = (0u64, 0u64);
 
     // `None` until the batch has its first member: a deadline that starts ticking on an
@@ -178,18 +174,18 @@ pub fn embed_stage<T, E: Embed + ?Sized>(
                 if deadline.is_none() {
                     deadline = Some(Instant::now() + config.timeout);
                 }
-                wants.push(item.mel.is_some());
-                if let Some(mel) = item.mel {
-                    mels.push(mel);
+                wants.push(item.input.is_some());
+                if let Some(buffer) = item.input {
+                    inputs.push(buffer);
                 }
                 payloads.push(item.payload);
 
-                if mels.len() >= config.size {
+                if inputs.len() >= config.size {
                     run_batch(
                         model,
                         dim,
                         &mut payloads,
-                        &mut mels,
+                        &mut inputs,
                         &mut wants,
                         &mut staging,
                         out,
@@ -208,7 +204,7 @@ pub fn embed_stage<T, E: Embed + ?Sized>(
                         model,
                         dim,
                         &mut payloads,
-                        &mut mels,
+                        &mut inputs,
                         &mut wants,
                         &mut staging,
                         out,
@@ -235,7 +231,7 @@ pub fn embed_stage<T, E: Embed + ?Sized>(
             model,
             dim,
             &mut payloads,
-            &mut mels,
+            &mut inputs,
             &mut wants,
             &mut staging,
             out,
@@ -258,7 +254,7 @@ fn run_batch<T, E: Embed + ?Sized>(
     model: &Arc<E>,
     dim: usize,
     payloads: &mut Vec<T>,
-    mels: &mut Vec<PooledBuffer>,
+    inputs: &mut Vec<PooledBuffer>,
     wants: &mut Vec<bool>,
     staging: &mut Vec<f32>,
     out: &Sender<Embedded<T>>,
@@ -266,13 +262,13 @@ fn run_batch<T, E: Embed + ?Sized>(
     ran: &mut u64,
     runs: &mut u64,
 ) {
-    let count = mels.len();
+    let count = inputs.len();
     let vectors = if count == 0 {
         Vec::new()
     } else {
         staging.clear();
-        for mel in mels.iter() {
-            staging.extend_from_slice(mel);
+        for input in inputs.iter() {
+            staging.extend_from_slice(input);
         }
         *runs += 1;
         *ran += count as u64;
@@ -295,10 +291,9 @@ fn run_batch<T, E: Embed + ?Sized>(
         }
     };
 
-    // Release the mel buffers before the rows go into a queue 1024 deep. They are 256 KB
-    // each and nothing downstream wants them; holding them to the end of the send loop
-    // would put a batch's worth of spectrograms behind the persist queue's backpressure.
-    mels.clear();
+    // Release the input buffers before the rows go into a queue 1024 deep: nothing
+    // downstream wants them.
+    inputs.clear();
 
     let mut taken = 0usize;
     for (payload, wanted) in payloads.drain(..).zip(wants.drain(..)) {
@@ -348,10 +343,10 @@ mod tests {
     }
 
     impl Embed for CountingModel {
-        fn embed_batch(&self, mels: &[f32], count: usize) -> Result<Vec<f32>, EmbedError> {
+        fn embed_batch(&self, inputs: &[f32], count: usize) -> Result<Vec<f32>, EmbedError> {
             assert_eq!(
-                mels.len(),
-                count * MEL_VALUES,
+                inputs.len(),
+                count * INPUT_LEN,
                 "ragged batch reached the model"
             );
             self.batches.lock().unwrap().push(count);
@@ -364,9 +359,9 @@ mod tests {
             }
             let mut out = vec![0.0f32; count * DIM];
             for (i, row) in out.chunks_mut(DIM).enumerate() {
-                // The tag is the first mel value of the i-th spectrogram, so a
+                // The tag is the first value of the i-th input, so a
                 // mis-strided stack shows up here rather than nowhere.
-                row[0] = mels[i * MEL_VALUES];
+                row[0] = inputs[i * INPUT_LEN];
             }
             Ok(out)
         }
@@ -376,17 +371,17 @@ mod tests {
         }
     }
 
-    fn mel_tagged(pool: &Arc<BufferPool>, tag: f32) -> PooledBuffer {
+    fn input_tagged(pool: &Arc<BufferPool>, tag: f32) -> PooledBuffer {
         let mut buf = pool.take();
         let v = buf.buffer_mut();
         v.clear();
-        v.resize(MEL_VALUES, tag);
+        v.resize(INPUT_LEN, tag);
         buf
     }
 
     /// Runs `n` tagged items through the stage and returns what came out.
     fn run_stage(model: Arc<CountingModel>, config: BatchConfig, n: usize) -> Vec<Embedded<usize>> {
-        let pool = mel_pool(config);
+        let pool = input_pool(config);
         let (tx, rx) = bounded(EMBED_QUEUE_DEPTH);
         let (out_tx, out_rx) = bounded(1024);
         let counter = AtomicU64::new(0);
@@ -397,7 +392,7 @@ mod tests {
                 for i in 0..n {
                     tx.send(Pending {
                         payload: i,
-                        mel: Some(mel_tagged(&pool, i as f32)),
+                        input: Some(input_tagged(&pool, i as f32)),
                     })
                     .unwrap();
                 }
@@ -445,7 +440,7 @@ mod tests {
             size: 16,
             timeout: Duration::from_millis(30),
         };
-        let pool = mel_pool(config);
+        let pool = input_pool(config);
         let (tx, rx) = bounded::<Pending<usize>>(EMBED_QUEUE_DEPTH);
         let (out_tx, out_rx) = bounded(64);
         let counter = AtomicU64::new(0);
@@ -459,7 +454,7 @@ mod tests {
             for i in 0..9 {
                 tx.send(Pending {
                     payload: i,
-                    mel: Some(mel_tagged(&pool, i as f32)),
+                    input: Some(input_tagged(&pool, i as f32)),
                 })
                 .unwrap();
             }
@@ -484,7 +479,7 @@ mod tests {
     fn items_with_no_spectrogram_pass_through_in_order() {
         let model = Arc::new(CountingModel::default());
         let config = BatchConfig::of_size(4);
-        let pool = mel_pool(config);
+        let pool = input_pool(config);
         let (tx, rx) = bounded::<Pending<usize>>(64);
         let (out_tx, out_rx) = bounded(64);
         let counter = AtomicU64::new(0);
@@ -493,8 +488,8 @@ mod tests {
         let out: Vec<_> = std::thread::scope(|scope| {
             scope.spawn(|| {
                 for i in 0..8 {
-                    let mel = (i % 2 == 0).then(|| mel_tagged(&pool, i as f32));
-                    tx.send(Pending { payload: i, mel }).unwrap();
+                    let input = (i % 2 == 0).then(|| input_tagged(&pool, i as f32));
+                    tx.send(Pending { payload: i, input }).unwrap();
                 }
                 drop(tx);
             });
@@ -510,7 +505,7 @@ mod tests {
         }
         assert_eq!(counter.load(Ordering::Relaxed), 4, "counted the passengers");
         // Four spectrograms at a batch size of four is one run, and the four items with no
-        // mel must not have inflated it.
+        // input must not have inflated it.
         assert_eq!(*model.batches.lock().unwrap(), vec![4]);
     }
 

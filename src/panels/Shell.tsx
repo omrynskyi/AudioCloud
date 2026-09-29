@@ -315,7 +315,7 @@ function Readout({ count }: { count: number }) {
 }
 
 /**
- * `scan_library` always embeds now — every sample gets a fingerprint at scan time, no model
+ * `scan_library` always embeds now — every sample gets an embedding at scan time, no model
  * download involved (`commands::library::scan_library`'s doc) — so "no map yet" has one
  * cause: nothing has been scanned and built into a map yet.
  */

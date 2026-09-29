@@ -21,10 +21,7 @@ use crate::{
         events::{ScanEvent, ScanOutcome},
         types::LibraryRoot,
     },
-    pipeline::{
-        fingerprint_embed::FingerprintEmbedder, mel::Padding, scan_root_with, ScanOptions,
-        ScanProgress,
-    },
+    pipeline::{mel::Padding, mfcc_embed::MfccEmbedder, scan_root_with, ScanOptions, ScanProgress},
 };
 
 /// Registers a folder as a library root. Idempotent: an existing path returns its row.
@@ -110,8 +107,8 @@ pub async fn set_root_enabled(
 /// exists, which is one `INSERT`, so the UI gets an id to cancel with without waiting for a
 /// walk of 50,000 files.
 ///
-/// Always embeds with [`crate::pipeline::fingerprint_embed::FingerprintEmbedder`], a
-/// downsampled log-mel image with no external model or download.
+/// Always embeds with [`crate::pipeline::mfcc_embed::MfccEmbedder`]: MFCC and envelope
+/// statistics of the whole sound, with no external model or download.
 #[tauri::command]
 pub async fn scan_library<R: tauri::Runtime>(
     app: AppHandle<R>,
@@ -150,12 +147,12 @@ pub async fn scan_library<R: tauri::Runtime>(
 
         let mut options = ScanOptions::new(&cancel)
             .on_start(on_start)
-            .with_embedder(Arc::new(FingerprintEmbedder::new()))
-            // `ZeroPad`, not the mel front-end's `RepeatPad` default: this embedder reads
-            // an attack-and-early-decay shape from the front of the buffer, and repeat-padding
-            // a short one-shot would tile a second copy of it into that same window
+            .with_embedder(Arc::new(MfccEmbedder::new()))
+            // `ZeroPad`, not the mel front-end's `RepeatPad` default: this embedder measures
+            // the sound's own length and envelope from the real frames, and repeat-padding a
+            // short one-shot would tile copies of it into the window
             // (`pipeline::mod::ScanOptions::with_padding`'s doc has the fuller version of
-            // this reasoning, stated for `DspEmbedder`, which needs it for the same reason).
+            // this reasoning).
             .with_padding(Padding::ZeroPad)
             .with_progress({
                 let channel = on_progress.clone();

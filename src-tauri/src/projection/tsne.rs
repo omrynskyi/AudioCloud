@@ -25,7 +25,7 @@ use crate::{
 const MIN_SAMPLES: usize = 4;
 
 /// PCA dimensions t-SNE actually sees: enough to keep the real structure of a
-/// high-dimensional fingerprint or embedding, small enough that the affinity computation is
+/// high-dimensional embedding, small enough that the affinity computation is
 /// still cheap.
 const INITIAL_DIMS: usize = 30;
 

@@ -127,6 +127,10 @@ pub async fn get_similar(
 
     let mut query = Vec::new();
     matrix.row_into(target, &mut query)?;
+    // Stored vectors are standardized features, not unit vectors, so similarity is a true
+    // cosine: divide by both norms. (Standardized vectors are centered, so this is also the
+    // correlation between the two sounds' feature profiles.)
+    let query_norm = query.iter().map(|v| v * v).sum::<f32>().sqrt();
 
     let mut scored: Vec<(f32, &queries::EmbeddedSample)> = Vec::with_capacity(samples.len());
     let mut row = Vec::new();
@@ -140,7 +144,10 @@ pub async fn get_similar(
         if matrix.row_into(sample.loc, &mut row).is_err() {
             continue;
         }
-        let similarity: f32 = query.iter().zip(row.iter()).map(|(a, b)| a * b).sum();
+        let dot: f32 = query.iter().zip(row.iter()).map(|(a, b)| a * b).sum();
+        let norm = query_norm * row.iter().map(|v| v * v).sum::<f32>().sqrt();
+        // A zero vector (a sound with no spread from the corpus mean) is similar to nothing.
+        let similarity = if norm > 0.0 { dot / norm } else { 0.0 };
         scored.push((similarity, sample));
     }
 
@@ -161,7 +168,9 @@ pub async fn get_similar(
                 .to_string(),
             rel_path: sample.rel_path.clone(),
             duration_ms: sample.duration_ms,
-            similarity,
+            // The ranking uses the signed cosine; what the UI shows as a percentage cannot
+            // be negative.
+            similarity: similarity.max(0.0),
         })
         .collect())
 }

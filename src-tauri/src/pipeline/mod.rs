@@ -9,18 +9,17 @@
 //! §3 draws them as separate stages with a 256-deep queue between them, and then
 //! immediately notes that a decoded window is 1.92 MB and that "decode output is actually
 //! handed over as mel frames wherever possible". This is that: one `rayon` worker decodes,
-//! analyzes and computes the spectrogram for a file, and what crosses the next channel is
-//! the 256 KB mel tensor rather than the 1.92 MB window. The 1.92 MB buffer goes straight
+//! analyzes and computes the spectrogram and its feature vector for a file, and what
+//! crosses the next channel is a 45-number vector rather than the 1.92 MB window. The 1.92 MB buffer goes straight
 //! back to its pool, so the number of them in existence is bounded by the number of cores
 //! rather than by a queue depth.
 //!
 //! What that leaves is three queues:
 //!
 //! - **walk -> process**, 4096 deep. A path and a few integers.
-//! - **process -> embed**, 64 deep ([`embed::EMBED_QUEUE_DEPTH`]). 256 KB each, 16 MB in
-//!   flight. This is the queue that is actually full during a scan, because inference is
-//!   the slowest stage, and it is therefore the one that bounds memory.
-//! - **embed -> persist**, 1024 deep. A metadata struct plus a 512-float vector.
+//! - **process -> embed**, 64 deep ([`embed::EMBED_QUEUE_DEPTH`]). A 45-float feature vector
+//!   each, so this queue no longer bounds memory.
+//! - **embed -> persist**, 1024 deep. A metadata struct plus a 45-float vector.
 //!
 //! A scan with no inference session is a first-class configuration, not a degraded one:
 //! the model is a 200 MB download that may not have happened yet, and a library is worth
@@ -29,11 +28,11 @@
 //! what stops the fast-skip from skipping exactly the files that still owe a vector.
 
 pub mod decode;
-pub mod dsp_embed;
 pub mod embed;
 pub mod features;
-pub mod fingerprint_embed;
 pub mod mel;
+pub mod mfcc_embed;
+pub mod mfcc_stats;
 pub mod progress;
 pub mod walk;
 
@@ -424,17 +423,17 @@ struct ScanState<'a> {
     cancel: &'a CancellationToken,
     progress: &'a ScanProgress,
     pool: Arc<BufferPool>,
-    /// The 256 KB spectrogram buffers. `None` when there is no session, in which case no
-    /// mel is computed at all -- the front-end is a third of the per-file cost and there is
+    /// The feature-vector buffers. `None` when there is no embedder, in which case no mel
+    /// is computed at all -- the front-end is a third of the per-file cost and there is
     /// nothing downstream that would read it.
-    mel_pool: Option<Arc<BufferPool>>,
+    input_pool: Option<Arc<BufferPool>>,
     padding: Padding,
     twins: TwinTable,
 }
 
 impl ScanState<'_> {
     fn embedding_required(&self) -> bool {
-        self.mel_pool.is_some()
+        self.input_pool.is_some()
     }
 }
 
@@ -444,6 +443,9 @@ struct Worker {
     decoder: Decoder,
     analyzer: features::Analyzer,
     front_end: mel::FrontEnd,
+    /// The log-mel window, reused for every file this worker handles: the MFCC extractor
+    /// reads it and nothing else does, so it never crosses a channel.
+    mel: Vec<f32>,
 }
 
 /// Scans every enabled library root, decoding but not embedding.
@@ -623,7 +625,7 @@ fn run_stages(
         cancel,
         progress,
         pool: BufferPool::for_decode(),
-        mel_pool: embedder.as_ref().map(|_| embed::mel_pool(batch)),
+        input_pool: embedder.as_ref().map(|_| embed::input_pool(batch)),
         padding,
         twins: TwinTable::default(),
     };
@@ -743,6 +745,7 @@ fn process_stage(
             decoder: Decoder::new(Arc::clone(&state.pool)),
             analyzer: features::Analyzer::new(),
             front_end: mel::FrontEnd::with_padding(state.padding),
+            mel: Vec::with_capacity(mel::MEL_FRAMES * mel::MEL_BINS),
         },
         |worker, file| {
             // Draining rather than breaking: `par_bridge` has no early exit, so a cancelled
@@ -803,14 +806,19 @@ fn process_one(
 
     let analysis = worker.analyzer.analyze(&decoded.samples);
 
-    // The spectrogram, computed here rather than in a stage of its own so that the 1.92 MB
-    // window can be released now instead of crossing another channel. It also reuses this
-    // worker's FFT plan, which `analyze` has already paid for.
-    let mel = state.mel_pool.as_ref().map(|pool| {
-        let mut buf = pool.take();
+    // The log-mel, and from it the raw feature vector, computed here rather than in a stage
+    // of its own so that the 1.92 MB window can be released now instead of crossing another
+    // channel. It also reuses this worker's FFT plan, which `analyze` has already paid for.
+    // Only the 45-number feature vector leaves this function.
+    let input = state.input_pool.as_ref().map(|pool| {
         worker
             .front_end
-            .compute(&decoded.samples, &mut worker.analyzer, buf.buffer_mut());
+            .compute(&decoded.samples, &mut worker.analyzer, &mut worker.mel);
+        let raw = mfcc_embed::extract(&decoded.samples, &worker.mel, decoded.truncated);
+        let mut buf = pool.take();
+        let out = buf.buffer_mut();
+        out.clear();
+        out.extend_from_slice(&raw);
         buf
     });
 
@@ -827,14 +835,14 @@ fn process_one(
     };
 
     // Release the 1.92 MB buffer before the row goes into a queue: what crosses it is the
-    // 256 KB spectrogram, which is the whole reason decode and mel share a stage.
+    // 180-byte feature vector, which is the whole reason decode and mel share a stage.
     drop(decoded);
 
     if let Some(claim) = claim {
         claim.publish(twin.clone());
     }
 
-    let embed = if mel.is_some() {
+    let embed = if input.is_some() {
         EmbedPlan::Compute
     } else {
         EmbedPlan::None
@@ -854,7 +862,7 @@ fn process_one(
             error: None,
             embed,
         },
-        mel,
+        input,
     }
 }
 
@@ -892,7 +900,7 @@ fn copy_of_twin(
             error: None,
             embed,
         },
-        mel: None,
+        input: None,
     }
 }
 
@@ -931,7 +939,7 @@ fn quarantine(
             error: Some(error),
             embed: EmbedPlan::None,
         },
-        mel: None,
+        input: None,
     }
 }
 

@@ -26,9 +26,9 @@ use crate::{
 
 /// Dimensionality of the stored per-sample vector.
 ///
-/// [`pipeline::fingerprint_embed::FINGERPRINT_DIM`] -- the active embedder and the width
+/// [`pipeline::mfcc_embed::FEATURE_DIM`] -- the active embedder and the width
 /// `embeddings.bin` is opened at.
-pub const EMBEDDING_DIM: usize = pipeline::fingerprint_embed::FINGERPRINT_DIM;
+pub const EMBEDDING_DIM: usize = pipeline::mfcc_embed::FEATURE_DIM;
 
 /// The command surface (`overview.md` §6.1).
 ///

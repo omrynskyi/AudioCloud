@@ -131,8 +131,8 @@ pub struct Neighbor {
     pub rel_path: String,
     pub filename: String,
     pub duration_ms: Option<i64>,
-    /// Cosine similarity in `[-1, 1]`. Every stored vector is L2-normalized, so this is a
-    /// dot product.
+    /// Cosine similarity of the two sounds' standardized feature vectors, floored at 0 for
+    /// display.
     pub similarity: f32,
 }
 

@@ -503,8 +503,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            applied_first, 8,
-            "V1 through V8 should be the only migrations so far"
+            applied_first, 9,
+            "V1 through V9 should be the only migrations so far"
         );
         assert_eq!(
             applied_first, applied_second,
@@ -545,7 +545,7 @@ mod tests {
                 content = '',
                 tokenize = \"unicode61 remove_diacritics 2\"
             );
-            DELETE FROM refinery_schema_history WHERE version = 8;
+            DELETE FROM refinery_schema_history WHERE version >= 8;
             UPDATE refinery_schema_history
             SET checksum = '11538323785542997172'
             WHERE version = 7;

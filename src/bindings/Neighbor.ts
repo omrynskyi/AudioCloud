@@ -5,7 +5,7 @@
  */
 export type Neighbor = { sampleId: number, relPath: string, filename: string, durationMs: number | null, 
 /**
- * Cosine similarity in `[-1, 1]`. Every stored vector is L2-normalized, so this is a
- * dot product.
+ * Cosine similarity of the two sounds' standardized feature vectors, floored at 0 for
+ * display.
  */
 similarity: number, };

@@ -19,6 +19,8 @@ use std::{
 use audiocloud_lib::{
     db::{queries, Database, SampleStatus},
     pipeline::{
+        mel::Padding,
+        mfcc_embed::{MfccEmbedder, CLIP},
         scan_root, scan_root_with, CancellationToken, ScanOptions, ScanProgress, ScanReport,
     },
     EMBEDDING_DIM,
@@ -650,4 +652,54 @@ fn filenames_with_awkward_characters_round_trip() {
     for name in names {
         assert_eq!(fx.row(&format!("pack/{name}")).status, "decoded", "{name}");
     }
+}
+
+/// The real embedder, end to end: decode -> log-mel -> MFCC/envelope features -> standardize
+/// -> `embeddings.bin`. No other test attaches an embedder.
+#[test]
+fn a_scan_with_the_mfcc_embedder_stores_standardized_vectors() {
+    let fx = Fixture::new();
+    write_sine(&fx.path("pack/tick.wav"), 440.0, 0.15);
+    write_sine(&fx.path("pack/pad.wav"), 440.0, 4.0);
+    // Byte-identical to `tick.wav`: must share its vector, not re-embed.
+    std::fs::copy(fx.path("pack/tick.wav"), fx.path("pack/tick copy.wav")).unwrap();
+
+    let cancel = CancellationToken::new();
+    let mut options = ScanOptions::new(&cancel)
+        .with_embedder(Arc::new(MfccEmbedder::new()))
+        .with_padding(Padding::ZeroPad);
+    let report = scan_root_with(&fx.db, fx.root_id, &mut options).unwrap();
+    assert_eq!(report.counts.files_failed, 0, "{report:?}");
+    assert_eq!(report.deduped, 1, "{report:?}");
+
+    let vector = |rel: &str| -> Vec<f32> {
+        let row = fx.row(rel);
+        assert_eq!(row.status, "embedded", "{rel}");
+        let conn = fx.db.read().unwrap();
+        let loc = queries::embedding_loc(&conn, row.id)
+            .unwrap()
+            .expect("a location");
+        assert_eq!(loc.dims as usize, EMBEDDING_DIM);
+        fx.db.embeddings().lock().unwrap().read(loc).unwrap()
+    };
+    let tick = vector("pack/tick.wav");
+    let pad = vector("pack/pad.wav");
+    let twin = vector("pack/tick copy.wav");
+
+    assert_eq!(tick.len(), EMBEDDING_DIM);
+    assert!(
+        tick.iter()
+            .chain(&pad)
+            .all(|v| v.is_finite() && v.abs() <= CLIP + 0.01),
+        "stored vectors must be finite z-scores within the clip"
+    );
+    assert_eq!(tick, twin, "a duplicate must share its twin's vector");
+    assert_ne!(tick, pad);
+    // Dimension 43 is log10(length): the four-second pad must sit above the 150 ms tick.
+    assert!(
+        pad[43] > tick[43] + 0.5,
+        "length dim: {} vs {}",
+        pad[43],
+        tick[43]
+    );
 }
