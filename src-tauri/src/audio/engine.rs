@@ -35,7 +35,7 @@ use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
     ErrorKind, SupportedStreamConfig, SupportedStreamConfigRange,
 };
-use tokio::sync::{Mutex as AsyncMutex, Notify};
+use tokio::sync::{oneshot, Mutex as AsyncMutex, Notify};
 
 use crate::{
     audio::{
@@ -580,6 +580,35 @@ impl Engine {
     /// meant paying that for a scheduling hop, on a path whose whole budget is a few tens of
     /// milliseconds. A clip short enough to fit the ring outright never needs the task at all.
     pub async fn play_pcm(self: &Arc<Self>, pcm: Arc<Vec<f32>>, gain: f32) -> u64 {
+        self.start_clip(pcm, gain, None).await
+    }
+
+    /// Starts a new generation from the opening of a clip whose remainder will follow.
+    ///
+    /// Returns the generation and a sender for the rest of the clip, which must continue
+    /// exactly where `head` ends. Sending the tail queues it behind the head; dropping the
+    /// sender without sending ends the clip after the head. Until one of those happens a
+    /// callback that has drained the head sees an underrun (silence), not an ending.
+    ///
+    /// This is what lets a long file start sounding after decoding a fraction of a second
+    /// instead of after decoding its whole preview window. One push task owns the whole
+    /// clip -- head, then tail -- so the two can never interleave in the ring.
+    pub async fn play_pcm_head(
+        self: &Arc<Self>,
+        head: Arc<Vec<f32>>,
+        gain: f32,
+    ) -> (u64, oneshot::Sender<Arc<Vec<f32>>>) {
+        let (tx, rx) = oneshot::channel();
+        let generation = self.start_clip(head, gain, Some(rx)).await;
+        (generation, tx)
+    }
+
+    async fn start_clip(
+        self: &Arc<Self>,
+        pcm: Arc<Vec<f32>>,
+        gain: f32,
+        tail: Option<oneshot::Receiver<Arc<Vec<f32>>>>,
+    ) -> u64 {
         let gain = gain.clamp(*GAIN_RANGE.start(), *GAIN_RANGE.end());
 
         // Held across the whole hand-off: the boundary this generation starts at is
@@ -616,7 +645,7 @@ impl Engine {
             .store(boundary + primed as u64, Ordering::Relaxed);
         drop(producer);
 
-        if primed >= pcm.len() {
+        if primed >= pcm.len() && tail.is_none() {
             // The whole clip is queued; there is nothing for a push task to do, and marking it
             // finished here is what lets `render` end it rather than treating the drained ring
             // as an underrun forever.
@@ -625,7 +654,7 @@ impl Engine {
                 .store(generation, Ordering::Relaxed);
         } else {
             let engine = Arc::clone(self);
-            tokio::spawn(async move { engine.push_pcm(generation, pcm, primed).await });
+            tokio::spawn(async move { engine.push_clip(generation, pcm, primed, tail).await });
         }
         generation
     }
@@ -657,10 +686,37 @@ impl Engine {
         self.epoch.elapsed().as_nanos() as u64
     }
 
-    /// Pushes the rest of `pcm` from `from` into the ring in whatever chunks it accepts,
-    /// stopping early if superseded or stopped. Marks `generation` finished once every frame
-    /// has been handed over -- not once every frame has been *played*, which is [`render`]'s
-    /// job to notice by draining the ring.
+    /// Pushes the rest of a clip -- `pcm` from `from`, then the tail if one was promised --
+    /// into the ring in whatever chunks it accepts, stopping early if superseded or stopped.
+    /// Marks `generation` finished once every frame has been handed over -- not once every
+    /// frame has been *played*, which is [`render`]'s job to notice by draining the ring.
+    async fn push_clip(
+        self: Arc<Self>,
+        generation: u64,
+        pcm: Arc<Vec<f32>>,
+        from: usize,
+        tail: Option<oneshot::Receiver<Arc<Vec<f32>>>>,
+    ) {
+        if !self.push_span(generation, &pcm, from).await {
+            return;
+        }
+        if let Some(rx) = tail {
+            // A dropped sender means "no more audio", the same as an empty tail.
+            if let Ok(tail) = rx.await {
+                if !self.push_span(generation, &tail, 0).await {
+                    return;
+                }
+            }
+        }
+        if self.transport.generation.load(Ordering::Relaxed) == generation {
+            self.transport
+                .finished_generation
+                .store(generation, Ordering::Relaxed);
+        }
+    }
+
+    /// Pushes `pcm[from..]` for `generation`. Returns `false` if a newer play or a stop took
+    /// over before it finished, in which case nothing further should be pushed.
     ///
     /// The producer lock is **released around the backoff sleep**, not held across it. Holding
     /// it was the older choice and it cost a retrigger up to a whole [`PUSH_BACKOFF`] before it
@@ -668,7 +724,7 @@ impl Engine {
     /// lock this task is sitting on is the one thing standing between a hover and its first
     /// audible sample. Re-checking the generation after every re-acquire is what keeps the
     /// hand-off safe: a task that lost the ring to a newer clip notices before it pushes.
-    async fn push_pcm(self: Arc<Self>, generation: u64, pcm: Arc<Vec<f32>>, from: usize) {
+    async fn push_span(&self, generation: u64, pcm: &[f32], from: usize) -> bool {
         let mut offset = from;
         while offset < pcm.len() {
             {
@@ -676,7 +732,7 @@ impl Engine {
                 if self.transport.generation.load(Ordering::Relaxed) != generation
                     || !self.transport.want_playing.load(Ordering::Relaxed)
                 {
-                    return;
+                    return false;
                 }
                 let pushed = producer.push_slice(&pcm[offset..]);
                 offset += pushed;
@@ -690,11 +746,7 @@ impl Engine {
                 tokio::time::sleep(PUSH_BACKOFF).await;
             }
         }
-        if self.transport.generation.load(Ordering::Relaxed) == generation {
-            self.transport
-                .finished_generation
-                .store(generation, Ordering::Relaxed);
-        }
+        true
     }
 
     async fn rebuild_stream(self: &Arc<Self>) {

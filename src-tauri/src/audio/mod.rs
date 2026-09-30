@@ -33,7 +33,7 @@ use rubato::{audioadapter_buffers::direct::InterleavedSlice, Async, FixedAsync, 
 use crate::{
     db::{queries, Database, DbError},
     pipeline::{
-        decode::{sinc_parameters, DecodeError, TARGET_SAMPLE_RATE},
+        decode::{sinc_parameters, DecodeError, MAX_OUTPUT_SAMPLES, TARGET_SAMPLE_RATE},
         BufferPool, Decoder,
     },
 };
@@ -54,6 +54,26 @@ const RESAMPLE_CHUNK: usize = 1024;
 /// typical setup; sized safely for the high end, it lets a pro interface's cache balloon past
 /// what was actually budgeted. A byte budget means what it says regardless of the device.
 const PCM_CACHE_BYTE_BUDGET: usize = 1024 * 1024 * 1024;
+
+/// How much of a file a cold play decodes before it starts sounding: 1 s at
+/// [`TARGET_SAMPLE_RATE`]. Decode and both resamples scale with the samples produced, so this
+/// is what makes a long file start about as fast as a one-shot; the rest of the preview window
+/// is decoded while the head is already playing.
+///
+/// The head has to outlast the tail decode or the clip goes silent between the two. Measured
+/// tail decode is ~40 ms in release and ~150 ms in a dev build (dependencies optimized), so 1 s
+/// leaves a 6x margin even in dev, for ~5-16 ms of head decode. 0.5 s left only ~3x in dev and
+/// none at all when dependencies were unoptimized.
+const HEAD_SAMPLES: usize = TARGET_SAMPLE_RATE as usize;
+
+/// Frames dropped from the end of the head at the seam with the tail, at the device rate.
+///
+/// A resampler run over a short input has edge effects in its last few dozen output frames
+/// that the same audio, resampled as part of the whole window, does not. The head is trimmed by
+/// this much and the tail is taken from the full-window render starting at the trim point, so
+/// the two halves join where both renders agree. 2048 frames is ~43 ms at 48 kHz, far more
+/// than the ~100 frames the sinc filter's edge can reach even at 192 kHz.
+const SEAM_GUARD_FRAMES: usize = 2048;
 
 /// What can go wrong turning a `sample_id` into sound.
 #[derive(Debug, thiserror::Error)]
@@ -177,8 +197,11 @@ impl LazyEngine {
 /// are two rather than one shared lock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Lane {
-    /// A hover or a click: someone is waiting to hear this.
+    /// The opening of a hover or a click: someone is waiting to hear this.
     Play,
+    /// The rest of a preview window whose opening is already sounding. Its own lane so that
+    /// finishing one clip can never make the next hover's opening wait on this decode.
+    Tail,
     /// Warming the cache for something nobody has asked for yet.
     Prefetch,
 }
@@ -202,6 +225,9 @@ pub struct AudioPlayer {
     /// second decoder (one more pooled window, ~1.9 MB) is a cheaper way to guarantee that
     /// than any priority scheme over a single lock.
     prefetch_decoder: Mutex<Decoder>,
+    /// A third lane for the full-window decode that follows a head-first start. See [`Lane::Tail`].
+    tail_decoder: Mutex<Decoder>,
+    tail_resampler: Mutex<Option<(u32, Async<f32>)>>,
     /// One cached resampler, keyed by the device rate it was built for. A single slot rather
     /// than a map like `Decoder`'s: the device's output rate does not vary per file the way a
     /// library's source rates do, so there is only ever one rate worth caching against. One
@@ -230,6 +256,8 @@ impl AudioPlayer {
             lazy: LazyEngine::new(),
             decoder: Mutex::new(Decoder::new(BufferPool::for_decode())),
             prefetch_decoder: Mutex::new(Decoder::new(BufferPool::for_decode())),
+            tail_decoder: Mutex::new(Decoder::new(BufferPool::for_decode())),
+            tail_resampler: Mutex::new(None),
             resampler: Mutex::new(None),
             prefetch_resampler: Mutex::new(None),
             cache: Mutex::new(PcmCache::default()),
@@ -269,30 +297,65 @@ impl AudioPlayer {
             .ok()
             .and_then(|c| c.get(sample_id, format.epoch));
 
-        let pcm = match cached {
-            Some(pcm) => pcm,
-            None => {
-                // Cold: now the row is genuinely needed. A bad id is the common shape of "the
-                // frontend is holding a stale selection," and this is where it surfaces.
-                let conn = db.read()?;
-                let row = queries::sample_row(&conn, sample_id)?
-                    .ok_or(PlaybackError::NotFound(sample_id))?;
-                drop(conn);
-                self.decode_for(row, format, Lane::Play).await?
+        if let Some(pcm) = cached {
+            if self.request_seq.load(Ordering::Acquire) != my_seq {
+                return Ok(());
             }
-        };
-
-        // A later call already claimed a higher sequence number while this one was decoding
-        // (or even just doing the DB lookup): that later call is what the user is actually
-        // hovering now, and it will already have played or is about to. Playing this one too
-        // would either glitch over it or, worse, win the engine's own generation race and
-        // replace the sound the user expects with a stale one.
-        if self.request_seq.load(Ordering::Acquire) != my_seq {
+            let generation = engine.play_pcm(pcm, gain).await;
+            log_latency(&engine, generation, sample_id);
             return Ok(());
         }
 
-        let generation = engine.play_pcm(pcm, gain).await;
+        // Cold: now the row is genuinely needed. A bad id is the common shape of "the
+        // frontend is holding a stale selection," and this is where it surfaces.
+        let conn = db.read()?;
+        let row =
+            queries::sample_row(&conn, sample_id)?.ok_or(PlaybackError::NotFound(sample_id))?;
+        drop(conn);
+
+        // Decode only the opening first, so a long file starts sounding as fast as a one-shot.
+        let Some(head) = self
+            .decode_uncached(&row, format, Lane::Play, HEAD_SAMPLES, Some(my_seq))
+            .await?
+        else {
+            return Ok(());
+        };
+
+        let channels = usize::from(format.channels.max(1));
+        let keep = head.pcm.len().saturating_sub(SEAM_GUARD_FRAMES * channels);
+        if !head.truncated || keep == 0 {
+            // The head is the whole file (the common one-shot case), or too short to be worth
+            // splitting: play it whole and cache it, exactly as a full decode would have.
+            let pcm = Arc::new(head.pcm);
+            self.cache_pcm(sample_id, format.epoch, &pcm);
+            if self.request_seq.load(Ordering::Acquire) != my_seq {
+                return Ok(());
+            }
+            let generation = engine.play_pcm(pcm, gain).await;
+            log_latency(&engine, generation, sample_id);
+            return Ok(());
+        }
+
+        if self.request_seq.load(Ordering::Acquire) != my_seq {
+            return Ok(());
+        }
+        let opening = Arc::new(head.pcm[..keep].to_vec());
+        let (generation, tail_tx) = engine.play_pcm_head(opening, gain).await;
         log_latency(&engine, generation, sample_id);
+
+        // The rest of the window, decoded while the opening plays. A dropped `tail_tx` -- on
+        // supersession or error -- ends the clip after the opening.
+        let Some(full) = self
+            .decode_uncached(&row, format, Lane::Tail, MAX_OUTPUT_SAMPLES, Some(my_seq))
+            .await?
+        else {
+            return Ok(());
+        };
+        let full = Arc::new(full.pcm);
+        self.cache_pcm(sample_id, format.epoch, &full);
+        if full.len() > keep {
+            let _ = tail_tx.send(Arc::new(full[keep..].to_vec()));
+        }
         Ok(())
     }
 
@@ -353,39 +416,76 @@ impl AudioPlayer {
         self.lazy.set_preferred(name);
     }
 
-    /// Decodes, resamples and caches an already-fetched sample row for `format`, off the async
-    /// runtime's worker threads: decode is real CPU work over a file, and `overview.md` §2
-    /// forbids sustained CPU work on the `tokio` pool exactly as it forbids it on the main
-    /// thread.
+    /// Decodes, resamples and caches an already-fetched sample row for `format`. The prefetch
+    /// path: never superseded, always the whole window.
     async fn decode_for(
         self: &Arc<Self>,
         row: queries::SampleRow,
         format: DeviceFormat,
         lane: Lane,
     ) -> Result<Arc<Vec<f32>>, PlaybackError> {
-        let sample_id = row.id;
+        let formatted = self
+            .decode_uncached(&row, format, lane, MAX_OUTPUT_SAMPLES, None)
+            .await?
+            .ok_or_else(|| {
+                PlaybackError::Device(AudioError::Stream(
+                    "an unsupersedable decode was skipped".into(),
+                ))
+            })?;
+        let pcm = Arc::new(formatted.pcm);
+        self.cache_pcm(row.id, format.epoch, &pcm);
+        Ok(pcm)
+    }
+
+    fn cache_pcm(&self, sample_id: i64, epoch: u64, pcm: &Arc<Vec<f32>>) {
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.insert(sample_id, epoch, Arc::clone(pcm));
+        }
+    }
+
+    /// Decodes the first `max_output` samples of `row`'s file and formats them for the device,
+    /// off the async runtime's worker threads: decode is real CPU work over a file, and
+    /// `overview.md` §2 forbids sustained CPU work on the `tokio` pool exactly as it forbids it
+    /// on the main thread.
+    ///
+    /// `superseded_by` is the [`request_seq`](Self::request_seq) this work was started for.
+    /// If a later play has claimed a higher one by the time the decoder lock is won, the work
+    /// is skipped and `None` comes back: during a fast sweep every hover queues behind the last
+    /// on its lane, and decoding audio for dots the cursor has already left would delay the one
+    /// it is on.
+    async fn decode_uncached(
+        self: &Arc<Self>,
+        row: &queries::SampleRow,
+        format: DeviceFormat,
+        lane: Lane,
+        max_output: usize,
+        superseded_by: Option<u64>,
+    ) -> Result<Option<Formatted>, PlaybackError> {
         let path = row.absolute_path();
         let ext = row.ext.clone();
         let rel_path = row.rel_path.clone();
 
         let this = Arc::clone(self);
-        let pcm = tokio::task::spawn_blocking(move || {
-            this.decode_and_format(&path, &ext, &rel_path, format, lane)
+        tokio::task::spawn_blocking(move || {
+            this.decode_and_format(
+                &path,
+                &ext,
+                &rel_path,
+                format,
+                lane,
+                max_output,
+                superseded_by,
+            )
         })
         .await
         .map_err(|e| {
             PlaybackError::Device(AudioError::Stream(format!("the decode task panicked: {e}")))
-        })??;
-
-        let pcm = Arc::new(pcm);
-        if let Ok(mut cache) = self.cache.lock() {
-            cache.insert(sample_id, format.epoch, Arc::clone(&pcm));
-        }
-        Ok(pcm)
+        })?
     }
 
-    /// The blocking half: decode the file's analysis window, then resample and interleave it
-    /// to `format`. Runs on a `spawn_blocking` thread, never on an async worker.
+    /// The blocking half: decode the file's window, then resample and interleave it to
+    /// `format`. Runs on a `spawn_blocking` thread, never on an async worker.
+    #[allow(clippy::too_many_arguments)]
     fn decode_and_format(
         &self,
         path: &Path,
@@ -393,9 +493,12 @@ impl AudioPlayer {
         rel_path: &str,
         format: DeviceFormat,
         lane: Lane,
-    ) -> Result<Vec<f32>, PlaybackError> {
+        max_output: usize,
+        superseded_by: Option<u64>,
+    ) -> Result<Option<Formatted>, PlaybackError> {
         let (decoder, resampler) = match lane {
             Lane::Play => (&self.decoder, &self.resampler),
+            Lane::Tail => (&self.tail_decoder, &self.tail_resampler),
             Lane::Prefetch => (&self.prefetch_decoder, &self.prefetch_resampler),
         };
 
@@ -403,16 +506,30 @@ impl AudioPlayer {
             let mut decoder = decoder.lock().map_err(|_| {
                 PlaybackError::Device(AudioError::Stream("the decoder is poisoned".into()))
             })?;
+            // Checked after the lock is won, not before: the wait for the lock is where a
+            // sweep's stale requests pile up.
+            if superseded_by.is_some_and(|seq| self.request_seq.load(Ordering::Acquire) != seq) {
+                return Ok(None);
+            }
             decoder
-                .decode(path, ext)
+                .decode_limited(path, ext, max_output)
                 .map_err(|e| decode_error(rel_path, e))?
         };
+        let truncated = decoded.truncated;
 
         let mut resampler = resampler.lock().map_err(|_| {
             PlaybackError::Device(AudioError::Stream("the resampler is poisoned".into()))
         })?;
-        to_device_format(&decoded.samples, format, &mut resampler)
+        let pcm = to_device_format(&decoded.samples, format, &mut resampler)?;
+        Ok(Some(Formatted { pcm, truncated }))
     }
+}
+
+/// Device-format PCM plus whether the decoder stopped at its limit rather than at the end of
+/// the file.
+struct Formatted {
+    pcm: Vec<f32>,
+    truncated: bool,
 }
 
 impl std::fmt::Debug for AudioPlayer {
@@ -603,6 +720,36 @@ mod tests {
         // Every output frame's two channels must agree -- duplication, not a real stereo mix.
         for pair in out.chunks_exact(2) {
             assert_eq!(pair[0], pair[1]);
+        }
+    }
+
+    /// The head-first start plays the head's render up to the seam guard and the full window's
+    /// render after it, so the two renders must agree everywhere before the guard -- at every
+    /// device rate a real interface reports -- or the join clicks.
+    #[test]
+    fn a_head_renders_identically_to_the_full_window_up_to_the_seam_guard() {
+        let full_mono: Vec<f32> = (0..MAX_OUTPUT_SAMPLES)
+            .map(|i| {
+                let t = i as f32 / TARGET_SAMPLE_RATE as f32;
+                0.4 * (2.0 * std::f32::consts::PI * 330.0 * t).sin()
+                    + 0.2 * (2.0 * std::f32::consts::PI * 5_000.0 * t).sin()
+            })
+            .collect();
+
+        for rate in [44_100u32, 48_000, 88_200, 96_000, 192_000] {
+            let fmt = format(rate, 2);
+            let mut r_head = None;
+            let mut r_full = None;
+            let head = to_device_format(&full_mono[..HEAD_SAMPLES], fmt, &mut r_head).unwrap();
+            let full = to_device_format(&full_mono, fmt, &mut r_full).unwrap();
+
+            let keep = head.len() - SEAM_GUARD_FRAMES * 2;
+            let worst = head[..keep]
+                .iter()
+                .zip(&full[..keep])
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(worst < 1e-4, "{rate} Hz: head and full disagree by {worst}");
         }
     }
 

@@ -254,6 +254,23 @@ impl Decoder {
     /// `ext` is passed to the probe as a hint. It is a hint only: a `.wav` that is really a
     /// FLAC still decodes, because `symphonia` falls back to content sniffing.
     pub fn decode(&mut self, path: &Path, ext: &str) -> Result<Decoded, DecodeError> {
+        self.decode_limited(path, ext, MAX_OUTPUT_SAMPLES)
+    }
+
+    /// Like [`decode`](Self::decode), but stops after `max_output` mono samples at
+    /// [`TARGET_SAMPLE_RATE`] (clamped to [`MAX_OUTPUT_SAMPLES`]).
+    ///
+    /// This is what lets preview start playing a long file from its first few hundred
+    /// milliseconds instead of waiting on the whole window: decode and resample cost scale
+    /// with the samples produced, not with the file. [`Decoded::truncated`] is relative to
+    /// the limit asked for.
+    pub fn decode_limited(
+        &mut self,
+        path: &Path,
+        ext: &str,
+        max_output: usize,
+    ) -> Result<Decoded, DecodeError> {
+        let max_output = max_output.clamp(1, MAX_OUTPUT_SAMPLES);
         let file = File::open(path).map_err(DecodeError::Open)?;
         let mss = MediaSourceStream::new(Box::new(file), MediaSourceStreamOptions::default());
 
@@ -296,12 +313,12 @@ impl Decoder {
 
         // How many source-rate frames are needed to fill the window after resampling. Ceil,
         // plus a hair, so a rounding shortfall never leaves the last few milliseconds off.
-        let needed = (MAX_OUTPUT_SAMPLES as u64 * u64::from(source_rate))
+        let needed = (max_output as u64 * u64::from(source_rate))
             .div_ceil(u64::from(TARGET_SAMPLE_RATE)) as usize
             + 1;
 
         self.mono.clear();
-        self.mono.reserve(needed.min(MAX_OUTPUT_SAMPLES * 4));
+        self.mono.reserve(needed.min(max_output * 4));
 
         let mut channels = 0u16;
         let mut truncated = false;
@@ -349,7 +366,8 @@ impl Decoder {
 
         // Only a file whose content genuinely ran past the window counts as truncated: a
         // 3-second one-shot that filled `needed` exactly did not.
-        truncated &= duration_ms.is_none_or(|d| d > (WINDOW_SECONDS as i64) * 1000);
+        let limit_ms = (max_output as u64 * 1000 / u64::from(TARGET_SAMPLE_RATE)) as i64;
+        truncated &= duration_ms.is_none_or(|d| d > limit_ms);
 
         let mut samples = self.pool.take();
         if source_rate == TARGET_SAMPLE_RATE {
@@ -357,7 +375,7 @@ impl Decoder {
         } else {
             self.resample_into(source_rate, &mut samples)?;
         }
-        samples.buffer_mut().truncate(MAX_OUTPUT_SAMPLES);
+        samples.buffer_mut().truncate(max_output);
 
         Ok(Decoded {
             samples,
