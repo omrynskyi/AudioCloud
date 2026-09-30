@@ -106,6 +106,13 @@ tauri = { version = "2.11.5", features = ["test"] }
 # -- see `model::download`'s tests for why it is hand-rolled.
 tokio = { version = "1.49.0", features = ["fs", "io-util", "macros", "rt", "sync", "time"] }
 
+# `npm run tauri dev` builds this profile. Unoptimized `symphonia` and `rubato` decode a
+# 10 s preview window about 25x slower than release (~1.1 s vs ~40 ms), which is long enough
+# for a head-first preview start to finish its opening and go silent before the rest arrives.
+# Dependencies are optimized; this crate stays at debug for fast incremental rebuilds.
+[profile.dev.package."*"]
+opt-level = 3
+
 [profile.release]
 codegen-units = 1
 lto = true
